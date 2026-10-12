@@ -141,6 +141,14 @@ Only features verified in the codebase are documented below:
 - Dismissable via "Close" button, background overlay click, or pressing the `Escape` keyboard key.
 - Includes loading state, error display, and empty state handling.
 
+### 2.9 GitHub Actions CI (`.github/workflows/ci.yml`)
+- **Triggers:** `push` and `pull_request` targeting `main`.
+- **Permissions:** `contents: read` (minimum required).
+- **Backend tests job:** `ubuntu-latest`, Python 3.14, pip dependency caching (via `backend/requirements.txt`), installs from `requirements.txt`, runs `python -m pytest -v`.
+- **Frontend checks job:** `ubuntu-latest`, Node.js 22, npm dependency caching (via `frontend/package-lock.json`), runs from `frontend/` working directory, executes `npm ci`, `npm run lint`, `npm run build`.
+- Both jobs run independently (no inter-job dependencies). Lint warnings are **not** suppressed — `npm run lint` exits 0 with 2 pre-existing warnings.
+- Local equivalents of all CI checks pass (see §4). GitHub Actions execution is pending first CI run on GitHub.
+
 ---
 
 ## 3. Current Architecture
@@ -268,6 +276,11 @@ it live with `git status` / `git log` and on the GitHub repository page.
 | `1ad4582` | `feat: add SSH authentication ingestion and brute-force detection` |
 | `928d855` | `chore: initialize Greywatch SIEM API` |
 
+### In-progress work
+- **`chore/github-ci`** branch — PR [#2](https://github.com/AnuragR3k/greywatch/pull/2) adds
+  `.github/workflows/ci.yml`. Commit `ec102eb` on this branch introduces the CI
+  workflow. Not yet merged into `main`.
+
 ---
 
 ## 7. Next Priorities
@@ -311,6 +324,7 @@ These rules govern multi-agent collaboration across ChatGPT, Freebuff, Poolside,
 - **Run and report verification before claiming completion:**
   - Backend changes: Execute and report `.venv/bin/python -m pytest -v`.
   - Frontend changes: Execute and report `npm run lint` and `npm run build`.
+  - CI changes: Ensure the new workflow runs on GitHub Actions; do not claim a "passing CI" badge until GitHub has actually executed the workflow successfully.
   - Report exact test counts, warning messages, and output summaries.
 - **Update documentation:** Always update `docs/PROJECT_STATE.md` after completing a feature milestone.
 - **Safeguards & Security:**
