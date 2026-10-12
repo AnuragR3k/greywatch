@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 from backend.app.siem import (
     close_alert,
+    get_alert_detail,
     ingest_lines,
     list_alerts,
     list_events,
@@ -62,6 +63,14 @@ def get_alerts(
 ):
     alerts = list_alerts(status=status, limit=limit)
     return {"count": len(alerts), "alerts": alerts}
+
+
+@app.get("/api/v1/alerts/{alert_id}", tags=["alerts"])
+def get_alert(alert_id: int):
+    result = get_alert_detail(alert_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    return result
 
 
 @app.post("/api/v1/alerts/{alert_id}/close", tags=["alerts"])

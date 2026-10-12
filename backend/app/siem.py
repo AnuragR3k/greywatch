@@ -67,6 +67,31 @@ def _connection():
         connection.close()
 
 
+def _migrate_alerts_table(connection: sqlite3.Connection) -> None:
+    """Add columns missing from an alerts table created by an older release.
+
+    SQLite has no "ADD COLUMN IF NOT EXISTS", so the existing columns are
+    inspected first. Existing rows are backfilled from created_at so the
+    evidence window behaves like it did before the column existed.
+    """
+    columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(alerts)").fetchall()
+    }
+    if "last_triggered_at" not in columns:
+        connection.execute(
+            "ALTER TABLE alerts ADD COLUMN last_triggered_at TEXT"
+        )
+
+    connection.execute(
+        """
+        UPDATE alerts
+        SET last_triggered_at = created_at
+        WHERE last_triggered_at IS NULL
+        """
+    )
+
+
 def initialize_database() -> None:
     """Create Greywatch's event and alert tables if they do not exist."""
     with _connection() as connection:
@@ -96,13 +121,15 @@ def initialize_database() -> None:
                 description TEXT NOT NULL,
                 event_count INTEGER NOT NULL,
                 status TEXT NOT NULL DEFAULT 'open',
-                closed_at TEXT
+                closed_at TEXT,
+                last_triggered_at TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_alerts_status
                 ON alerts(status, created_at);
             """
         )
+        _migrate_alerts_table(connection)
 
 
 def _normalize_timestamp(value: str | None, *, syslog: bool = False) -> str:
@@ -283,14 +310,18 @@ def ingest_lines(lines: list[str]) -> dict:
             )
 
             # Update an existing alert instead of creating duplicates.
+            # last_triggered_at records when the count was last recalculated
+            # so the evidence window grows with the alert instead of staying
+            # anchored to created_at.
             if existing:
                 connection.execute(
                     """
                     UPDATE alerts
-                    SET description = ?, event_count = ?
+                    SET description = ?, event_count = ?,
+                        last_triggered_at = ?
                     WHERE id = ?
                     """,
-                    (description, count, existing["id"]),
+                    (description, count, now_text, existing["id"]),
                 )
                 continue
 
@@ -298,8 +329,9 @@ def ingest_lines(lines: list[str]) -> dict:
                 """
                 INSERT INTO alerts (
                     created_at, rule_id, title, severity,
-                    source_ip, description, event_count, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open')
+                    source_ip, description, event_count, status,
+                    last_triggered_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)
                 """,
                 (
                     now_text,
@@ -309,6 +341,7 @@ def ingest_lines(lines: list[str]) -> dict:
                     source_ip,
                     description,
                     count,
+                    now_text,
                 ),
             )
 
@@ -323,6 +356,7 @@ def ingest_lines(lines: list[str]) -> dict:
                     "description": description,
                     "event_count": count,
                     "status": "open",
+                    "last_triggered_at": now_text,
                 }
             )
 
@@ -385,3 +419,54 @@ def close_alert(alert_id: int) -> bool:
         )
 
     return cursor.rowcount > 0
+
+
+def get_alert_detail(alert_id: int) -> dict | None:
+    """Return an alert and the failed SSH events in its evidence window.
+
+    The window ends at the alert's last trigger time — updated whenever the
+    detection count is recalculated — so the returned events stay consistent
+    with the alert's event_count as new failures arrive. Alerts migrated from
+    an older schema fall back to created_at.
+    """
+    initialize_database()
+
+    with _connection() as connection:
+        row = connection.execute(
+            "SELECT * FROM alerts WHERE id = ?",
+            (alert_id,),
+        ).fetchone()
+
+        if row is None:
+            return None
+
+        alert = dict(row)
+        window_end = datetime.fromisoformat(
+            alert.get("last_triggered_at") or alert["created_at"]
+        )
+        start = (
+            window_end - timedelta(minutes=BRUTE_FORCE_WINDOW_MINUTES)
+        ).astimezone(timezone.utc).isoformat(timespec="seconds")
+        end = window_end.astimezone(timezone.utc).isoformat(
+            timespec="seconds"
+        )
+
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM events
+            WHERE source_ip = ?
+              AND event_type = 'ssh_login_failed'
+              AND timestamp >= ?
+              AND timestamp <= ?
+            ORDER BY timestamp ASC
+            """,
+            (alert["source_ip"], start, end),
+        ).fetchall()
+
+    return {
+        "alert": alert,
+        "evidence_window_start": start,
+        "evidence_window_end": end,
+        "evidence_events": [dict(event) for event in rows],
+    }
