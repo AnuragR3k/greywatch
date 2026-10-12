@@ -275,16 +275,24 @@ def ingest_lines(lines: list[str]) -> dict:
                 (source_ip,),
             ).fetchone()
 
-            # Keep one open alert per source IP and rule to reduce duplicates.
-            if existing:
-                continue
-
             description = (
                 f"Observed {count} failed SSH login attempts from {source_ip} "
                 f"within {BRUTE_FORCE_WINDOW_MINUTES} minutes. "
                 "Investigate the source, targeted accounts, and any related "
                 "successful logins."
             )
+
+            # Update an existing alert instead of creating duplicates.
+            if existing:
+                connection.execute(
+                    """
+                    UPDATE alerts
+                    SET description = ?, event_count = ?
+                    WHERE id = ?
+                    """,
+                    (description, count, existing["id"]),
+                )
+                continue
 
             cursor = connection.execute(
                 """
