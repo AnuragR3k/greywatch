@@ -70,7 +70,55 @@ function EventTable({ events }) {
   )
 }
 
-function AlertList({ alerts, onClose, closingId }) {
+function EvidenceTable({ events }) {
+  if (!events.length) {
+    return (
+      <div className="empty-state">
+        <strong>No matching evidence events</strong>
+        <p>No failed-login records were found in the alert's original time window.</p>
+      </div>
+    )
+  }
+
+  return (
+    <div className="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>TIME</th>
+            <th>HOST</th>
+            <th>EVENT TYPE</th>
+            <th>USERNAME</th>
+            <th>SOURCE IP</th>
+            <th>SEVERITY</th>
+            <th>RAW LOG MESSAGE</th>
+          </tr>
+        </thead>
+        <tbody>
+          {events.map((event) => (
+            <tr key={event.id}>
+              <td className="mono">{event.id}</td>
+              <td className="muted">{formatTime(event.timestamp)}</td>
+              <td>{event.host || '—'}</td>
+              <td>{label(event.event_type)}</td>
+              <td>{event.username || '—'}</td>
+              <td className="mono">{event.source_ip || '—'}</td>
+              <td>
+                <span className={`severity ${event.severity}`}>
+                  {event.severity || 'unknown'}
+                </span>
+              </td>
+              <td className="raw-message">{event.raw_message}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+function AlertList({ alerts, onClose, closingId, onView }) {
   if (!alerts.length) {
     return (
       <div className="empty-state">
@@ -108,17 +156,97 @@ function AlertList({ alerts, onClose, closingId }) {
             </div>
           </div>
 
-          {alert.status === 'open' && (
+          <div className="alert-actions">
             <button
-              className="button button-subtle resolve-button"
-              disabled={closingId === alert.id}
-              onClick={() => onClose(alert.id)}
+              className="button button-subtle view-evidence-button"
+              onClick={() => onView(alert.id)}
             >
-              {closingId === alert.id ? 'Saving…' : 'Resolve'}
+              View evidence
             </button>
-          )}
+            {alert.status === 'open' && (
+              <button
+                className="button button-subtle resolve-button"
+                disabled={closingId === alert.id}
+                onClick={() => onClose(alert.id)}
+              >
+                {closingId === alert.id ? 'Saving…' : 'Resolve'}
+              </button>
+            )}
+          </div>
         </article>
       ))}
+    </div>
+  )
+}
+
+function AlertEvidencePanel({ evidence, loading, error, onClose }) {
+  return (
+    <div className="evidence-overlay" onClick={onClose}>
+      <div className="evidence-panel" onClick={(event) => event.stopPropagation()}>
+        <div className="evidence-header">
+          <h2>Alert evidence</h2>
+          <button
+            className="button button-subtle evidence-close"
+            onClick={onClose}
+          >
+            Close
+          </button>
+        </div>
+
+        {loading && (
+          <div className="loading-state">Loading alert evidence…</div>
+        )}
+
+        {error && (
+          <div className="error-banner">{error}</div>
+        )}
+
+        {!loading && !error && evidence && (
+          <div className="evidence-content">
+            <div className="evidence-detail">
+              <div className="evidence-detail-row">
+                <span className={`severity ${evidence.alert.severity}`}>
+                  {evidence.alert.severity}
+                </span>
+                <span className="mono alert-rule">{evidence.alert.rule_id}</span>
+                <span className={`status ${evidence.alert.status}`}>
+                  {evidence.alert.status}
+                </span>
+              </div>
+
+              <h3 className="evidence-title">{evidence.alert.title}</h3>
+
+              <div className="evidence-meta">
+                <span>Source: <b className="mono">{evidence.alert.source_ip}</b></span>
+                <span>Created: <b>{formatTime(evidence.alert.created_at)}</b></span>
+                <span>Total events: <b>{evidence.alert.event_count}</b></span>
+              </div>
+
+              <div className="evidence-window">
+                <span>Window: <b className="mono">{formatTime(evidence.evidence_window_start)}</b> → <b className="mono">{formatTime(evidence.evidence_window_end)}</b></span>
+                <span>Matching evidence: <b>{evidence.evidence_events.length}</b></span>
+              </div>
+            </div>
+
+            <div className="evidence-section">
+              <div className="panel-heading">
+                <div>
+                  <h3>Matching evidence events</h3>
+                  <p>{evidence.evidence_events.length} {evidence.evidence_events.length === 1 ? 'event' : 'events'} found in the detection window</p>
+                </div>
+              </div>
+              <EvidenceTable events={evidence.evidence_events} />
+            </div>
+          </div>
+        )}
+
+        {!loading && !error && !evidence && (
+          <div className="empty-state">
+            <strong>No evidence available</strong>
+            <p>Could not retrieve evidence for this alert.</p>
+          </div>
+        )}
+      </div>
     </div>
   )
 }
@@ -135,6 +263,10 @@ function App() {
   const [activeView, setActiveView] = useState('overview')
   const [lastUpdated, setLastUpdated] = useState(null)
   const [closingId, setClosingId] = useState(null)
+  const [viewingAlertId, setViewingAlertId] = useState(null)
+  const [evidence, setEvidence] = useState(null)
+  const [evidenceLoading, setEvidenceLoading] = useState(false)
+  const [evidenceError, setEvidenceError] = useState('')
 
   const refresh = useCallback(async () => {
     try {
@@ -255,6 +387,48 @@ function App() {
       setClosingId(null)
     }
   }
+
+  async function viewEvidence(id) {
+    setViewingAlertId(id)
+    setEvidence(null)
+    setEvidenceError('')
+    setEvidenceLoading(true)
+
+    try {
+      const response = await fetch(`/api/v1/alerts/${id}`)
+
+      if (!response.ok) {
+        if (response.status === 404) {
+          throw new Error('Alert not found.')
+        }
+        throw new Error('Could not load alert evidence.')
+      }
+
+      const payload = await response.json()
+      setEvidence(payload)
+    } catch (err) {
+      setEvidenceError(err.message || 'Failed to load alert evidence.')
+    } finally {
+      setEvidenceLoading(false)
+    }
+  }
+
+  function closeEvidencePanel() {
+    setViewingAlertId(null)
+    setEvidence(null)
+    setEvidenceError('')
+  }
+
+  useEffect(() => {
+    function onKeyDown(event) {
+      if (event.key === 'Escape' && viewingAlertId !== null) {
+        closeEvidencePanel()
+      }
+    }
+
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [viewingAlertId])
 
   const connected = data.health?.status === 'ok'
 
@@ -465,6 +639,7 @@ function App() {
                   alerts={openAlerts.slice(0, 4)}
                   onClose={closeAlert}
                   closingId={closingId}
+                  onView={viewEvidence}
                 />
               </section>
             </div>
@@ -494,6 +669,7 @@ function App() {
                 alerts={filteredAlerts}
                 onClose={closeAlert}
                 closingId={closingId}
+                onView={viewEvidence}
               />
             </section>
           )}
@@ -526,6 +702,15 @@ function App() {
           </footer>
         </section>
       </main>
+
+      {viewingAlertId !== null && (
+        <AlertEvidencePanel
+          evidence={evidence}
+          loading={evidenceLoading}
+          error={evidenceError}
+          onClose={closeEvidencePanel}
+        />
+      )}
     </div>
   )
 }

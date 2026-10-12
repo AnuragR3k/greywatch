@@ -385,3 +385,46 @@ def close_alert(alert_id: int) -> bool:
         )
 
     return cursor.rowcount > 0
+
+
+def get_alert_detail(alert_id: int) -> dict | None:
+    """Return an alert and the failed SSH events around its creation."""
+    initialize_database()
+
+    with _connection() as connection:
+        row = connection.execute(
+            "SELECT * FROM alerts WHERE id = ?",
+            (alert_id,),
+        ).fetchone()
+
+        if row is None:
+            return None
+
+        alert = dict(row)
+        opened_at = datetime.fromisoformat(alert["created_at"])
+        start = (
+            opened_at - timedelta(minutes=BRUTE_FORCE_WINDOW_MINUTES)
+        ).astimezone(timezone.utc).isoformat(timespec="seconds")
+        end = opened_at.astimezone(timezone.utc).isoformat(
+            timespec="seconds"
+        )
+
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM events
+            WHERE source_ip = ?
+              AND event_type = 'ssh_login_failed'
+              AND timestamp >= ?
+              AND timestamp <= ?
+            ORDER BY timestamp ASC
+            """,
+            (alert["source_ip"], start, end),
+        ).fetchall()
+
+    return {
+        "alert": alert,
+        "evidence_window_start": start,
+        "evidence_window_end": end,
+        "evidence_events": [dict(event) for event in rows],
+    }
