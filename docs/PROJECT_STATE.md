@@ -2,8 +2,7 @@
 
 > **Status:** Under active development. This document is a verified snapshot of the repository as of the date below. Update it after every completed feature.
 
-- **Last updated:** 2026-10-12
-- **Git branch:** `main` (in sync with `origin/main`)
+- **Last verified:** 2026-10-12 (the three commands in §4 were re-run on this date; rows marked NOT RERUN were not re-executed and may be stale)
 - **Python:** 3.14.3 (.venv) · **Node:** 22.23.1 · **npm:** 10.9.8
 - **Backend:** FastAPI 0.143.0 · Uvicorn 0.54.0 · Starlette 1.7.0 · httpx 0.28.1 · SQLite3 (stdlib) · pytest 9.1.1
 - **Frontend:** React 19.3.0 · Vite 8.3.4 · @vitejs/plugin-react 6.1.2 · Oxlint 1.87.0
@@ -31,10 +30,10 @@ greywatch/
 │   ├── app/
 │   │   ├── __init__.py
 │   │   ├── main.py          # FastAPI application & REST endpoints (84 lines)
-│   │   └── siem.py          # Log parsing, normalization, detection, DB layer (430 lines)
+│   │   └── siem.py          # Log parsing, normalization, detection, DB layer (472 lines)
 │   ├── requirements.txt     # fastapi, uvicorn[standard], httpx, pytest
 │   └── tests/
-│       └── test_siem.py     # 9 test cases (parsing, ingestion, alerts, evidence) (259 lines)
+│       └── test_siem.py     # 11 test cases (parsing, ingestion, alerts, evidence, migration) (382 lines)
 ├── frontend/                # React + Vite SOC dashboard
 │   ├── index.html           # HTML template
 │   ├── package.json         # React 19, Vite 8, Oxlint scripts and dependencies
@@ -80,7 +79,8 @@ Only features verified in the codebase are documented below:
   - Configurable database path via `GREYWATCH_DB` environment variable (defaults to `data/greywatch.db`).
 - Tables created on initialization (`initialize_database()`):
   - `events`: `id` (INTEGER PK AUTOINCREMENT), `timestamp` (TEXT ISO 8601), `host` (TEXT), `event_type` (TEXT), `username` (TEXT), `source_ip` (TEXT), `severity` (TEXT), `raw_message` (TEXT).
-  - `alerts`: `id` (INTEGER PK AUTOINCREMENT), `created_at` (TEXT ISO 8601), `rule_id` (TEXT), `title` (TEXT), `severity` (TEXT), `source_ip` (TEXT), `description` (TEXT), `event_count` (INTEGER), `status` (TEXT DEFAULT 'open'), `closed_at` (TEXT).
+  - `alerts`: `id` (INTEGER PK AUTOINCREMENT), `created_at` (TEXT ISO 8601), `rule_id` (TEXT), `title` (TEXT), `severity` (TEXT), `source_ip` (TEXT), `description` (TEXT), `event_count` (INTEGER), `status` (TEXT DEFAULT 'open'), `closed_at` (TEXT), `last_triggered_at` (TEXT ISO 8601, nullable).
+- Schema migration: `initialize_database()` runs `_migrate_alerts_table()`, which adds `last_triggered_at` to databases created before the column existed (`ALTER TABLE` guarded by `PRAGMA table_info`) and backfills it from `created_at`, so pre-existing alerts keep their old evidence-window behavior.
 - Indexes:
   - `idx_events_ip_time` on `events(source_ip, timestamp)`
   - `idx_alerts_status` on `alerts(status, created_at)`
@@ -105,7 +105,7 @@ Only features verified in the codebase are documented below:
   - **Grouping:** Per `source_ip`.
 - Alert state handling:
   - When threshold is first exceeded for a source IP, creates a new alert (`status: open`, `severity: high`, `title: Repeated SSH authentication failures`).
-  - On subsequent ingestions within the window while the alert is still `open`, updates the existing alert's `event_count` and `description` rather than creating duplicate open alerts.
+  - On subsequent ingestions within the window while the alert is still `open`, updates the existing alert's `event_count`, `description`, and `last_triggered_at` (set to the recalculation time) rather than creating duplicate open alerts.
 
 ### 2.5 Event and Alert APIs (`backend/app/main.py`)
 - `POST /api/v1/events/ingest` — Ingests a batch of raw log strings, parses lines, saves events to SQLite, runs detection rules, and returns `{received, parsed, ignored, events, alerts}`.
@@ -195,24 +195,27 @@ Only features verified in the codebase are documented below:
 ### Investigation & Evidence Lifecycle
 1. **Trigger:** The analyst clicks "View evidence" on an alert in the React dashboard.
 2. **Fetch:** Frontend calls `GET /api/v1/alerts/{alert_id}`.
-3. **Query:** `get_alert_detail` retrieves the alert row, calculates `[created_at - 5m, created_at]`, and queries `events` for `ssh_login_failed` matching the alert's `source_ip` within the exact window.
+3. **Query:** `get_alert_detail` retrieves the alert row, calculates `[last_triggered_at - 5m, last_triggered_at]` (falling back to `created_at` for rows backfilled by the migration), and queries `events` for `ssh_login_failed` matching the alert's `source_ip` within that window — keeping the returned evidence consistent with the alert's live `event_count` as new failures arrive.
 4. **Presentation:** The frontend renders the alert metadata and evidence events table with full raw log messages inside the modal.
 
 ---
 
 ## 4. Verification Status
 
-Verified directly on the host system:
+Commands re-run on **2026-10-12** on the host system, with exit codes
+preserved. Rows marked **NOT RERUN** were executed during an earlier session
+and were **not** repeated for this snapshot — treat them as stale until
+re-verified.
 
-| Verification Target | Command | Status | Result / Details |
-|---------------------|---------|--------|------------------|
-| **Backend Tests** | `.venv/bin/python -m pytest -v` | **PASSING** | 9 passed, 1 warning in 0.39s (all 9 unit/integration tests passed).<br>*Warning: StarletteDeprecationWarning regarding httpx with testclient.* |
-| **System Python Pytest** | `python -m pytest -v` | **FAILING** | System `/usr/bin/python` does not contain `pytest`; virtualenv `.venv` must be used. |
-| **Frontend Lint** | `npm run lint` (in `frontend/`) | **PASSING (with 2 warnings)** | 0 errors, 2 warnings (Oxlint 1.87.0).<br>1. `eslint(no-unused-vars)` in `App.jsx:294` (`catch (err)` unused).<br>2. `react(set-state-in-effect)` in `App.jsx:304` (`refresh()` called synchronously in `useEffect`). |
-| **Frontend Production Build** | `npm run build` (in `frontend/`) | **PASSING** | Vite 8.3.4 built production bundle in 229ms.<br>Output: `dist/index.html` (0.45 kB), `dist/assets/index-*.css` (12.92 kB), `dist/assets/index-*.js` (235.97 kB). |
-| **Live Backend API** | `curl -s http://127.0.0.1:8000/health` | **PASSING** | Returned HTTP 200: `{"status":"ok","service":"greywatch-api","version":"0.1.0"}`. |
-| **Live Alert Evidence API** | `curl -s http://127.0.0.1:8000/api/v1/alerts/1` | **PASSING** | Returned HTTP 200 with alert metadata, evidence window, and 5 evidence events. |
-| **Live Frontend Dev Server** | `curl -I -s http://localhost:5173/` | **PASSING** | Returned HTTP 200; Vite dev proxy successfully forwards `/health` and `/api` requests to backend on port 8000. |
+| Verification Target | Command | Rerun? | Status | Result / Details |
+|---------------------|---------|--------|--------|------------------|
+| **Backend Tests** | `.venv/bin/python -m pytest -v` | Rerun 2026-10-12 | **PASSING** | `11 passed, 1 warning in 1.48s`, exit code 0.<br>*Warning: StarletteDeprecationWarning regarding httpx with testclient (pre-existing).* |
+| **Frontend Lint** | `npm run lint` (in `frontend/`) | Rerun 2026-10-12 | **PASSING (2 warnings)** | `Found 2 warnings and 0 errors`, exit code 0 (Oxlint 1.87.0).<br>1. `eslint(no-unused-vars)` in `App.jsx:294` (`catch (err)` unused).<br>2. `react(set-state-in-effect)` in `App.jsx:304` (`refresh()` called synchronously in `useEffect`). |
+| **Frontend Production Build** | `npm run build` (in `frontend/`) | Rerun 2026-10-12 | **PASSING** | Vite 8.3.4, `✓ 17 modules transformed`, built in 266ms, exit code 0.<br>Output: `dist/index.html` (0.45 kB), `dist/assets/index-*.css` (12.92 kB), `dist/assets/index-*.js` (235.97 kB). |
+| **System Python Pytest** | `python -m pytest -v` | **NOT RERUN** | Unknown this session | Earlier finding (unverified now): system `/usr/bin/python` lacks `pytest`; the virtualenv `.venv` must be used. |
+| **Live Backend API** | `curl -s http://127.0.0.1:8000/health` | **NOT RERUN** | Unknown this session | Earlier result was HTTP 200 with `{"status":"ok",...}`; live server state was not re-checked. |
+| **Live Alert Evidence API** | `curl -s http://127.0.0.1:8000/api/v1/alerts/1` | **NOT RERUN** | Unknown this session | Earlier result was HTTP 200 with evidence events; not re-checked. |
+| **Live Frontend Dev Server** | `curl -I -s http://localhost:5173/` | **NOT RERUN** | Unknown this session | Earlier result was HTTP 200 through the Vite proxy; not re-checked. |
 
 ---
 
@@ -226,17 +229,15 @@ Verified directly on the host system:
    - All backend API routes (`/api/v1/*`, `/health`) are unauthenticated. Anyone with network access can ingest logs, read alerts, or resolve alerts.
 3. **Duplicate untracked `vite.config.js`:**
    - An untracked `vite.config.js` exists at the root of the project with a slightly different proxy syntax than `frontend/vite.config.js`.
-4. **Untracked files and directories in working directory:**
-   - `.freebuff/` (tool configuration) and `docs/` are currently untracked in Git.
-5. **Generic HTML title:**
+4. **Generic HTML title:**
    - `frontend/index.html` contains `<title>frontend</title>` instead of `<title>Greywatch</title>`.
-6. **Unpinned backend dependencies:**
+5. **Unpinned backend dependencies:**
    - `backend/requirements.txt` lists package names without versions (`fastapi`, `uvicorn[standard]`, `httpx`, `pytest`).
-7. **Rule-specific evidence querying coupling:**
+6. **Rule-specific evidence querying coupling:**
    - `get_alert_detail()` hardcodes `event_type = 'ssh_login_failed'`. When additional detection rules are introduced (e.g. web attacks, privilege escalation), this query must be generalized or delegated to rule-specific handlers.
-8. **Frontend linter warnings:**
+7. **Frontend linter warnings:**
    - Two minor warnings exist in `frontend/src/App.jsx` regarding `catch (err)` and synchronous `setState` in `useEffect`.
-9. **Environment requirement:**
+8. **Environment requirement:**
    - Backend tests and commands must be executed using `.venv` (`.venv/bin/python` or after activating the venv), as the system Python lacks the required dependencies.
 
 ### Items Needing Further Investigation
@@ -247,34 +248,25 @@ Verified directly on the host system:
 
 ## 6. Git and Release Status
 
-- **Current branch:** `main`
-- **Upstream status:** In sync with `origin/main` (`https://github.com/AnuragR3k/greywatch.git`)
-- **Open pull requests:** 0 open pull requests (verified via GitHub API query to `https://api.github.com/repos/AnuragR3k/greywatch/pulls`)
-- **Release tags:** None created
+This section records durable facts only. Transient state — the currently
+checked-out branch, open pull-request counts, and uncommitted working-tree
+changes — changes constantly and is deliberately **not** recorded here; read
+it live with `git status` / `git log` and on the GitHub repository page.
 
-### Recent Commits
-| Commit | Author Date | Commit Message |
-|--------|-------------|----------------|
-| `90cd35b` | 2026-10-12 | `fix: update existing SSH brute-force alert counts` |
-| `f4b0242` | 2026-10-12 | `feat: add Greywatch security operations dashboard` |
-| `1ad4582` | 2026-10-12 | `feat: add SSH authentication ingestion and brute-force detection` |
-| `928d855` | 2026-10-12 | `chore: initialize Greywatch SIEM API` |
+- **Remote:** `https://github.com/AnuragR3k/greywatch.git`
+- **Workflow:** changes land on feature branches and are merged via pull
+  requests (see §8); `main` is never pushed to directly.
+- **Release tags / published releases:** none as of 2026-10-12.
 
-### Uncommitted Working Tree Changes
-The working tree contains uncommitted changes across 6 tracked files and 3 untracked items:
+### Core history (fixed snapshot, 2026-10-12 — run `git log` for current)
 
-**Modified Tracked Files:**
-- `backend/app/main.py`: Added `GET /api/v1/alerts/{alert_id}` endpoint.
-- `backend/app/siem.py`: Implemented `get_alert_detail()` for evidence extraction within the 5-minute detection window.
-- `backend/tests/test_siem.py`: Added 5 alert evidence test cases (`test_alert_detail_returns_details_and_evidence`, `test_evidence_events_include_raw_messages`, `test_unknown_alert_returns_404`, `test_alert_no_matching_evidence`, `test_events_outside_evidence_window_excluded`).
-- `frontend/src/App.jsx`: Implemented `AlertEvidencePanel` modal, `EvidenceTable`, `View evidence` button, `Escape` key listener, and detail fetch logic.
-- `frontend/src/App.css`: Added styling for evidence overlay, modal layout, evidence tables, raw log message blocks, and responsive rules.
-- `frontend/vite.config.js`: Added dev server proxy configuration targeting `http://127.0.0.1:8000`.
-
-**Untracked Files:**
-- `docs/PROJECT_STATE.md`: Permanent project state tracking documentation.
-- `vite.config.js`: Duplicate root config file.
-- `.freebuff/`: Freebuff agent identifier.
+| Commit | Message |
+|--------|---------|
+| `74fe146` | `feat: add alert evidence investigation` |
+| `90cd35b` | `fix: update existing SSH brute-force alert counts` |
+| `f4b0242` | `feat: add Greywatch security operations dashboard` |
+| `1ad4582` | `feat: add SSH authentication ingestion and brute-force detection` |
+| `928d855` | `chore: initialize Greywatch SIEM API` |
 
 ---
 
@@ -282,9 +274,9 @@ The working tree contains uncommitted changes across 6 tracked files and 3 untra
 
 A prioritized list of near-term engineering tasks:
 
-1. **Clean up root configuration & track documentation:**
-   - Remove redundant root `vite.config.js`.
-   - Stage and commit `docs/PROJECT_STATE.md` and feature branch changes via pull request.
+1. **Clean up repository configuration:**
+   - Remove the redundant root `vite.config.js` (duplicate of `frontend/vite.config.js`).
+   - Decide whether `.freebuff/` should be gitignored or tracked deliberately.
 2. **Pin backend dependencies:**
    - Freeze versions in `backend/requirements.txt` to guarantee reproducible installations across environments.
 3. **Fix frontend warnings & metadata:**
