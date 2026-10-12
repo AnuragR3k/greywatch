@@ -1,3 +1,5 @@
+import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
@@ -257,3 +259,124 @@ def test_events_outside_evidence_window_excluded(tmp_path, monkeypatch):
     raw_messages = [event["raw_message"] for event in events]
     assert before_msg not in raw_messages
     assert after_msg not in raw_messages
+
+
+def test_evidence_matches_updated_event_count(tmp_path, monkeypatch):
+    """After more failures arrive, event_count and evidence must agree.
+
+    Regression test: the evidence window used to end at created_at, so
+    failures ingested after the alert was created were counted on the alert
+    but never returned as evidence.
+    """
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "test.db"))
+    alert = create_brute_force_alert()
+    assert alert["event_count"] == 5
+
+    # Cross a second boundary so created_at and last_triggered_at differ;
+    # otherwise the old window end (created_at) would coincide with the new
+    # one and mask the bug.
+    time.sleep(1.1)
+
+    # Two more failures from the same IP while the alert is still open.
+    extra = [
+        f"sshd[420{i}]: Failed password for later{i} "
+        f"from 203.0.113.10 port {56000 + i} ssh2"
+        for i in range(2)
+    ]
+    response = client.post("/api/v1/events/ingest", json={"lines": extra})
+    assert response.status_code == 200
+    payload = response.json()
+
+    # The existing alert was updated, not duplicated.
+    assert payload["alerts"] == []
+    assert payload["parsed"] == 2
+
+    detail = client.get(f"/api/v1/alerts/{alert['id']}")
+    assert detail.status_code == 200
+    body = detail.json()
+
+    # The alert now reports 7 failed logins...
+    assert body["alert"]["event_count"] == 7
+
+    # ...and the evidence window ends at the last trigger, not created_at,
+    # so the returned evidence agrees with the displayed count.
+    last_triggered = body["alert"]["last_triggered_at"]
+    assert last_triggered > body["alert"]["created_at"]
+    assert body["evidence_window_end"] == last_triggered
+    assert len(body["evidence_events"]) == body["alert"]["event_count"] == 7
+
+    # Every returned event falls inside the window that produced the count.
+    window_start = datetime.fromisoformat(body["evidence_window_start"])
+    window_end = datetime.fromisoformat(body["evidence_window_end"])
+    for event in body["evidence_events"]:
+        timestamp = datetime.fromisoformat(event["timestamp"])
+        assert window_start <= timestamp <= window_end
+        assert event["source_ip"] == "203.0.113.10"
+        assert event["event_type"] == "ssh_login_failed"
+
+    # Both ingestion batches are represented in the evidence.
+    raw_messages = "\n".join(
+        event["raw_message"] for event in body["evidence_events"]
+    )
+    assert "Failed password for user0" in raw_messages
+    assert "Failed password for later0" in raw_messages
+
+
+def test_migration_backfills_last_triggered_at(tmp_path, monkeypatch):
+    """A database created before the column existed gains it safely."""
+    db_path = tmp_path / "legacy.db"
+    monkeypatch.setenv("GREYWATCH_DB", str(db_path))
+
+    legacy = sqlite3.connect(db_path)
+    legacy.executescript(
+        """
+        CREATE TABLE alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            rule_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            source_ip TEXT NOT NULL,
+            description TEXT NOT NULL,
+            event_count INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            closed_at TEXT
+        );
+        """
+    )
+    legacy.execute(
+        """
+        INSERT INTO alerts (
+            created_at, rule_id, title, severity,
+            source_ip, description, event_count, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open')
+        """,
+        (
+            "2026-10-12T10:00:00+00:00",
+            "SSH_BRUTE_FORCE",
+            "Repeated SSH authentication failures",
+            "high",
+            "203.0.113.10",
+            "Legacy alert",
+            5,
+        ),
+    )
+    legacy.commit()
+    legacy.close()
+
+    initialize_database()
+
+    with _connection() as conn:
+        row = conn.execute(
+            "SELECT created_at, last_triggered_at FROM alerts WHERE id = 1"
+        ).fetchone()
+
+    # Backfilled from created_at so the window behaves as before the change.
+    assert row["last_triggered_at"] == row["created_at"]
+
+    # And the migrated alert serves evidence without errors.
+    response = client.get("/api/v1/alerts/1")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["evidence_window_end"] == "2026-10-12T10:00:00+00:00"
+    assert body["evidence_events"] == []
