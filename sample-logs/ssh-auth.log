@@ -1,0 +1,6 @@
+sshd[4101]: Failed password for invalid user admin from 203.0.113.10 port 54001 ssh2
+sshd[4102]: Failed password for root from 203.0.113.10 port 54002 ssh2
+sshd[4103]: Failed password for ubuntu from 203.0.113.10 port 54003 ssh2
+sshd[4104]: Failed password for test from 203.0.113.10 port 54004 ssh2
+sshd[4105]: Failed password for deploy from 203.0.113.10 port 54005 ssh2
+sshd[4106]: Accepted publickey for demo from 192.0.2.20 port 54006 ssh2
