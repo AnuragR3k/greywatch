@@ -141,6 +141,14 @@ Only features verified in the codebase are documented below:
 - Dismissable via "Close" button, background overlay click, or pressing the `Escape` keyboard key.
 - Includes loading state, error display, and empty state handling.
 
+### 2.9 GitHub Actions CI (`.github/workflows/ci.yml`)
+- **Triggers:** `push` and `pull_request` targeting `main`.
+- **Permissions:** `contents: read` (minimum required).
+- **Backend tests job:** `ubuntu-latest`, Python 3.14, pip dependency caching (via `backend/requirements.txt`), installs from `requirements.txt`, runs `python -m pytest -v`.
+- **Frontend checks job:** `ubuntu-latest`, Node.js 22, npm dependency caching (via `frontend/package-lock.json`), runs from `frontend/` working directory, executes `npm ci`, `npm run lint`, `npm run build`.
+- Both jobs run independently (no inter-job dependencies). Lint warnings are **not** suppressed — `npm run lint` exits 0 with 2 pre-existing warnings.
+- Local equivalents of all CI checks pass (see §4). GitHub Actions has executed successfully on PR #2 — both the **Backend tests** and **Frontend checks** jobs passed on the latest commit (`e251926`). [Successful workflow run](https://github.com/AnuragR3k/greywatch/actions/runs/38286017323).
+
 ---
 
 ## 3. Current Architecture
@@ -212,6 +220,7 @@ re-verified.
 | **Backend Tests** | `.venv/bin/python -m pytest -v` | Rerun 2026-10-12 | **PASSING** | `11 passed, 1 warning in 1.48s`, exit code 0.<br>*Warning: StarletteDeprecationWarning regarding httpx with testclient (pre-existing).* |
 | **Frontend Lint** | `npm run lint` (in `frontend/`) | Rerun 2026-10-12 | **PASSING (2 warnings)** | `Found 2 warnings and 0 errors`, exit code 0 (Oxlint 1.87.0).<br>1. `eslint(no-unused-vars)` in `App.jsx:294` (`catch (err)` unused).<br>2. `react(set-state-in-effect)` in `App.jsx:304` (`refresh()` called synchronously in `useEffect`). |
 | **Frontend Production Build** | `npm run build` (in `frontend/`) | Rerun 2026-10-12 | **PASSING** | Vite 8.3.4, `✓ 17 modules transformed`, built in 266ms, exit code 0.<br>Output: `dist/index.html` (0.45 kB), `dist/assets/index-*.css` (12.92 kB), `dist/assets/index-*.js` (235.97 kB). |
+| **GitHub Actions CI** | Workflow run #38286017323 on PR #2 | Verified 2026-10-12 | **PASSING** | Both **Backend tests** and **Frontend checks** jobs passed on `chore/github-ci` commit `e251926`. [View run](https://github.com/AnuragR3k/greywatch/actions/runs/38286017323). |
 | **System Python Pytest** | `python -m pytest -v` | **NOT RERUN** | Unknown this session | Earlier finding (unverified now): system `/usr/bin/python` lacks `pytest`; the virtualenv `.venv` must be used. |
 | **Live Backend API** | `curl -s http://127.0.0.1:8000/health` | **NOT RERUN** | Unknown this session | Earlier result was HTTP 200 with `{"status":"ok",...}`; live server state was not re-checked. |
 | **Live Alert Evidence API** | `curl -s http://127.0.0.1:8000/api/v1/alerts/1` | **NOT RERUN** | Unknown this session | Earlier result was HTTP 200 with evidence events; not re-checked. |
@@ -268,6 +277,12 @@ it live with `git status` / `git log` and on the GitHub repository page.
 | `1ad4582` | `feat: add SSH authentication ingestion and brute-force detection` |
 | `928d855` | `chore: initialize Greywatch SIEM API` |
 
+### In-progress work
+- **`chore/github-ci`** branch — PR [#2](https://github.com/AnuragR3k/greywatch/pull/2) adds
+  `.github/workflows/ci.yml`. Commits `ec102eb` (workflow) and `e251926` (docs) on this
+  branch. GitHub Actions has **passed** on both jobs (run [#38286017323](https://github.com/AnuragR3k/greywatch/actions/runs/38286017323)).
+  Not yet merged into `main`.
+
 ---
 
 ## 7. Next Priorities
@@ -311,6 +326,7 @@ These rules govern multi-agent collaboration across ChatGPT, Freebuff, Poolside,
 - **Run and report verification before claiming completion:**
   - Backend changes: Execute and report `.venv/bin/python -m pytest -v`.
   - Frontend changes: Execute and report `npm run lint` and `npm run build`.
+  - CI changes: Ensure the new workflow runs on GitHub Actions; do not claim a "passing CI" badge until GitHub has actually executed the workflow successfully.
   - Report exact test counts, warning messages, and output summaries.
 - **Update documentation:** Always update `docs/PROJECT_STATE.md` after completing a feature milestone.
 - **Safeguards & Security:**
