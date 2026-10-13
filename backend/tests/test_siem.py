@@ -98,6 +98,30 @@ def test_repeated_failures_create_alert(tmp_path, monkeypatch):
     assert alert_response.status_code == 200
     assert alert_response.json()["count"] == 1
 
+def test_timestamped_failed_ssh_events_create_alert(tmp_path, monkeypatch):
+    """Five timestamped failures within five minutes trigger an alert."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "timestamped.db"))
+
+    # Traditional syslog timestamps are interpreted in the system's local timezone.
+    now = datetime.now().astimezone().replace(microsecond=0)
+    lines = [
+        (
+            f"{(now - timedelta(seconds=40 * (4 - i))).strftime('%b %d %H:%M:%S')} "
+            f"lab-host sshd[510{i}]: Failed password for testuser "
+            f"from 198.51.100.77 port {52000 + i} ssh2"
+        )
+        for i in range(5)
+    ]
+
+    response = client.post("/api/v1/events/ingest", json={"lines": lines})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["parsed"] == 5
+    assert len(payload["alerts"]) == 1
+    assert payload["alerts"][0]["rule_id"] == "SSH_BRUTE_FORCE"
+    assert payload["alerts"][0]["event_count"] == 5
+
 
 def test_alert_detail_returns_details_and_evidence(tmp_path, monkeypatch):
     """An existing brute-force alert returns its details and evidence events."""
@@ -321,6 +345,17 @@ def test_evidence_matches_updated_event_count(tmp_path, monkeypatch):
     assert "Failed password for user0" in raw_messages
     assert "Failed password for later0" in raw_messages
 
+def test_iso_timestamp_is_normalized_to_utc():
+    line = (
+        "2026-10-13T12:00:00+05:30 lab-host "
+        "sshd[1234]: Failed password for demo "
+        "from 198.51.100.20 port 54001 ssh2"
+    )
+
+    event = parse_auth_line(line)
+
+    assert event is not None
+    assert event["timestamp"] == "2026-10-13T06:30:00+00:00"
 
 def test_migration_backfills_last_triggered_at(tmp_path, monkeypatch):
     """A database created before the column existed gains it safely."""

@@ -5,14 +5,14 @@ from typing import Literal
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from backend.app.siem import (
+from .siem import (
     close_alert,
     get_alert_detail,
     ingest_lines,
     list_alerts,
     list_events,
 )
-from backend.app import collector
+from . import collector
 
 app = FastAPI(
     title="Greywatch API",

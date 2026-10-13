@@ -45,8 +45,8 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-from backend.app import siem
-from backend.app.siem import (
+from . import siem
+from .siem import (
     FAILED_LOGIN,
     INVALID_USER,
     SUCCESSFUL_LOGIN,
