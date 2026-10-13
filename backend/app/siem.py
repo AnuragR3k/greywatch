@@ -92,6 +92,22 @@ def _migrate_alerts_table(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_events_table(connection: sqlite3.Connection) -> None:
+    """Add provenance columns missing from an events table created by an older
+    release.
+
+    `source` records where an event originated (e.g. ``journal`` for genuine
+    systemd-journal events, ``test`` for synthetic records). Existing rows are
+    left as NULL (unknown/legacy) so they stay queryable without guessing.
+    """
+    columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(events)").fetchall()
+    }
+    if "source" not in columns:
+        connection.execute("ALTER TABLE events ADD COLUMN source TEXT")
+
+
 def initialize_database() -> None:
     """Create Greywatch's event and alert tables if they do not exist."""
     with _connection() as connection:
@@ -105,11 +121,17 @@ def initialize_database() -> None:
                 username TEXT,
                 source_ip TEXT,
                 severity TEXT NOT NULL,
-                raw_message TEXT NOT NULL
+                raw_message TEXT NOT NULL,
+                source TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_events_ip_time
                 ON events(source_ip, timestamp);
+
+            CREATE TABLE IF NOT EXISTS collector_state (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
 
             CREATE TABLE IF NOT EXISTS alerts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -130,6 +152,7 @@ def initialize_database() -> None:
             """
         )
         _migrate_alerts_table(connection)
+        _migrate_events_table(connection)
 
 
 def _normalize_timestamp(value: str | None, *, syslog: bool = False) -> str:
@@ -225,140 +248,158 @@ def parse_auth_line(line: str) -> dict | None:
     }
 
 
-def ingest_lines(lines: list[str]) -> dict:
-    """Parse and persist events, then evaluate the SSH brute-force rule."""
-    initialize_database()
+def _store_events_and_detect(
+    events: list[dict], connection: sqlite3.Connection
+) -> tuple[list[dict], list[dict]]:
+    """Persist normalized events and evaluate the SSH brute-force rule.
 
-    events = []
-    for line in lines:
-        event = parse_auth_line(line)
-        if event is not None:
-            events.append(event)
-
+    Events must already be in the shape produced by ``parse_auth_line`` (or the
+    journal collector's ``parse_journal_record``). Detection runs inside the
+    caller's transaction so the failed-login count reflects the rows just
+    inserted. Returns ``(inserted_events, new_alerts)``.
+    """
     inserted_events = []
     new_alerts = []
 
+    for event in events:
+        cursor = connection.execute(
+            """
+            INSERT INTO events (
+                timestamp, host, event_type, username,
+                source_ip, severity, raw_message, source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event["timestamp"],
+                event["host"],
+                event["event_type"],
+                event["username"],
+                event["source_ip"],
+                event["severity"],
+                event["raw_message"],
+                event.get("source"),
+            ),
+        )
+        inserted_events.append({"id": cursor.lastrowid, **event})
+
+    # Count failed logins only. Invalid-user messages can accompany a
+    # failed-login message, so counting both could inflate the threshold.
+    source_ips = {
+        event["source_ip"]
+        for event in events
+        if event["event_type"] == "ssh_login_failed"
+        and event["source_ip"]
+    }
+
+    now = datetime.now(timezone.utc)
+    now_text = now.isoformat(timespec="seconds")
+    cutoff_text = (
+        now - timedelta(minutes=BRUTE_FORCE_WINDOW_MINUTES)
+    ).isoformat(timespec="seconds")
+
+    for source_ip in sorted(source_ips):
+        count = connection.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM events
+            WHERE event_type = 'ssh_login_failed'
+              AND source_ip = ?
+              AND timestamp >= ?
+              AND timestamp <= ?
+            """,
+            (source_ip, cutoff_text, now_text),
+        ).fetchone()["total"]
+
+        if count < BRUTE_FORCE_THRESHOLD:
+            continue
+
+        existing = connection.execute(
+            """
+            SELECT id
+            FROM alerts
+            WHERE rule_id = 'SSH_BRUTE_FORCE'
+              AND source_ip = ?
+              AND status = 'open'
+            LIMIT 1
+            """,
+            (source_ip,),
+        ).fetchone()
+
+        description = (
+            f"Observed {count} failed SSH login attempts from {source_ip} "
+            f"within {BRUTE_FORCE_WINDOW_MINUTES} minutes. "
+            "Investigate the source, targeted accounts, and any related "
+            "successful logins."
+        )
+
+        # Update an existing alert instead of creating duplicates.
+        # last_triggered_at records when the count was last recalculated
+        # so the evidence window grows with the alert instead of staying
+        # anchored to created_at.
+        if existing:
+            connection.execute(
+                """
+                UPDATE alerts
+                SET description = ?, event_count = ?,
+                    last_triggered_at = ?
+                WHERE id = ?
+                """,
+                (description, count, now_text, existing["id"]),
+            )
+            continue
+
+        cursor = connection.execute(
+            """
+            INSERT INTO alerts (
+                created_at, rule_id, title, severity,
+                source_ip, description, event_count, status,
+                last_triggered_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)
+            """,
+            (
+                now_text,
+                "SSH_BRUTE_FORCE",
+                "Repeated SSH authentication failures",
+                "high",
+                source_ip,
+                description,
+                count,
+                now_text,
+            ),
+        )
+
+        new_alerts.append(
+            {
+                "id": cursor.lastrowid,
+                "created_at": now_text,
+                "rule_id": "SSH_BRUTE_FORCE",
+                "title": "Repeated SSH authentication failures",
+                "severity": "high",
+                "source_ip": source_ip,
+                "description": description,
+                "event_count": count,
+                "status": "open",
+                "last_triggered_at": now_text,
+            }
+        )
+
+    return inserted_events, new_alerts
+
+
+def ingest_lines(lines: list[str]) -> dict:
+    """Parse and persist event lines, then evaluate the SSH brute-force rule.
+
+    Behavior is unchanged from the original line-based ingestion path: each
+    line is run through ``parse_auth_line`` and unrecognized lines are ignored.
+    """
+    initialize_database()
+
+    events = [event for line in lines if (event := parse_auth_line(line))]
+
     with _connection() as connection:
-        for event in events:
-            cursor = connection.execute(
-                """
-                INSERT INTO events (
-                    timestamp, host, event_type, username,
-                    source_ip, severity, raw_message
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event["timestamp"],
-                    event["host"],
-                    event["event_type"],
-                    event["username"],
-                    event["source_ip"],
-                    event["severity"],
-                    event["raw_message"],
-                ),
-            )
-            inserted_events.append({"id": cursor.lastrowid, **event})
-
-        # Count failed logins only. Invalid-user messages can accompany a
-        # failed-login message, so counting both could inflate the threshold.
-        source_ips = {
-            event["source_ip"]
-            for event in events
-            if event["event_type"] == "ssh_login_failed"
-            and event["source_ip"]
-        }
-
-        now = datetime.now(timezone.utc)
-        now_text = now.isoformat(timespec="seconds")
-        cutoff_text = (
-            now - timedelta(minutes=BRUTE_FORCE_WINDOW_MINUTES)
-        ).isoformat(timespec="seconds")
-
-        for source_ip in sorted(source_ips):
-            count = connection.execute(
-                """
-                SELECT COUNT(*) AS total
-                FROM events
-                WHERE event_type = 'ssh_login_failed'
-                  AND source_ip = ?
-                  AND timestamp >= ?
-                  AND timestamp <= ?
-                """,
-                (source_ip, cutoff_text, now_text),
-            ).fetchone()["total"]
-
-            if count < BRUTE_FORCE_THRESHOLD:
-                continue
-
-            existing = connection.execute(
-                """
-                SELECT id
-                FROM alerts
-                WHERE rule_id = 'SSH_BRUTE_FORCE'
-                  AND source_ip = ?
-                  AND status = 'open'
-                LIMIT 1
-                """,
-                (source_ip,),
-            ).fetchone()
-
-            description = (
-                f"Observed {count} failed SSH login attempts from {source_ip} "
-                f"within {BRUTE_FORCE_WINDOW_MINUTES} minutes. "
-                "Investigate the source, targeted accounts, and any related "
-                "successful logins."
-            )
-
-            # Update an existing alert instead of creating duplicates.
-            # last_triggered_at records when the count was last recalculated
-            # so the evidence window grows with the alert instead of staying
-            # anchored to created_at.
-            if existing:
-                connection.execute(
-                    """
-                    UPDATE alerts
-                    SET description = ?, event_count = ?,
-                        last_triggered_at = ?
-                    WHERE id = ?
-                    """,
-                    (description, count, now_text, existing["id"]),
-                )
-                continue
-
-            cursor = connection.execute(
-                """
-                INSERT INTO alerts (
-                    created_at, rule_id, title, severity,
-                    source_ip, description, event_count, status,
-                    last_triggered_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)
-                """,
-                (
-                    now_text,
-                    "SSH_BRUTE_FORCE",
-                    "Repeated SSH authentication failures",
-                    "high",
-                    source_ip,
-                    description,
-                    count,
-                    now_text,
-                ),
-            )
-
-            new_alerts.append(
-                {
-                    "id": cursor.lastrowid,
-                    "created_at": now_text,
-                    "rule_id": "SSH_BRUTE_FORCE",
-                    "title": "Repeated SSH authentication failures",
-                    "severity": "high",
-                    "source_ip": source_ip,
-                    "description": description,
-                    "event_count": count,
-                    "status": "open",
-                    "last_triggered_at": now_text,
-                }
-            )
+        inserted_events, new_alerts = _store_events_and_detect(
+            events, connection
+        )
 
     return {
         "received": len(lines),
@@ -367,6 +408,57 @@ def ingest_lines(lines: list[str]) -> dict:
         "events": inserted_events,
         "alerts": new_alerts,
     }
+
+
+def ingest_events(events: list[dict]) -> dict:
+    """Persist already-normalized events and evaluate detection rules.
+
+    This is the structured-events entry point used by the journal collector.
+    Unlike ``ingest_lines``, callers pass normalized event dicts (the shape
+    produced by ``parse_auth_line`` or ``collector.parse_journal_record``)
+    directly, so structured journal fields such as exact timestamps and
+    provenance survive ingestion without a round-trip through text parsing.
+    """
+    initialize_database()
+
+    with _connection() as connection:
+        inserted_events, new_alerts = _store_events_and_detect(
+            events, connection
+        )
+
+    parsed = len(inserted_events)
+    return {
+        "received": parsed,
+        "parsed": parsed,
+        "ignored": 0,
+        "events": inserted_events,
+        "alerts": new_alerts,
+    }
+
+
+def get_collector_setting(key: str, default: str | None = None) -> str | None:
+    """Read a key/value pair from the collector_state table."""
+    initialize_database()
+    with _connection() as connection:
+        row = connection.execute(
+            "SELECT value FROM collector_state WHERE key = ?",
+            (key,),
+        ).fetchone()
+    return row["value"] if row is not None else default
+
+
+def set_collector_setting(key: str, value: str | None) -> None:
+    """Upsert a key/value pair into the collector_state table."""
+    initialize_database()
+    with _connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO collector_state (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
 
 
 def list_events(limit: int = 100) -> list[dict]:
