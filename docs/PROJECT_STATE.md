@@ -29,11 +29,13 @@ greywatch/
 ├── backend/
 │   ├── app/
 │   │   ├── __init__.py
-│   │   ├── main.py          # FastAPI application & REST endpoints (84 lines)
-│   │   └── siem.py          # Log parsing, normalization, detection, DB layer (472 lines)
+│   │   ├── main.py          # FastAPI application & REST endpoints (85 lines)
+│   │   ├── siem.py          # Log parsing, normalization, detection, DB layer (~340 lines)
+│   │   └── collector.py     # systemd-journal auth collector + CLI (new)
 │   ├── requirements.txt     # fastapi, uvicorn[standard], httpx, pytest
 │   └── tests/
-│       └── test_siem.py     # 11 test cases (parsing, ingestion, alerts, evidence, migration) (382 lines)
+│       ├── test_siem.py     # 11 test cases (parsing, ingestion, alerts, evidence, migration)
+│       └── test_collector.py # 34 test cases: parsing, checkpoint recovery, dedup, malformed, SSH brute-force regression (new)
 ├── frontend/                # React + Vite SOC dashboard
 │   ├── index.html           # HTML template
 │   ├── package.json         # React 19, Vite 8, Oxlint scripts and dependencies
@@ -47,7 +49,8 @@ greywatch/
 ├── data/
 │   └── greywatch.db         # SQLite database file (local only, gitignored)
 ├── docs/
-│   └── PROJECT_STATE.md     # Permanent verified project state document
+│   ├── PROJECT_STATE.md     # Permanent verified project state document
+│   └── JOURNAL_COLLECTOR.md # Journal collection guide (install, config, verify) (new)
 ├── rules/
 │   └── .gitkeep             # Placeholder for modular detection rules
 ├── sample-logs/
@@ -149,6 +152,19 @@ Only features verified in the codebase are documented below:
 - Both jobs run independently (no inter-job dependencies). Lint warnings are **not** suppressed — `npm run lint` exits 0 with 2 pre-existing warnings.
 - Local equivalents of all CI checks pass (see §4). GitHub Actions has executed successfully on PR #2 — both the **Backend tests** and **Frontend checks** jobs passed on the latest commit (`e251926`). [Successful workflow run](https://github.com/AnuragR3k/greywatch/actions/runs/38286017323).
 
+### 2.10 Linux Authentication Journal Collector (`backend/app/collector.py`)
+- **Native systemd-journal collection.** A new optional collector reads structured PAM/SSH/sudo events from the local journal with `journalctl -o json` (developed and verified on Fedora 44 / systemd 259) and normalizes them into the same event shape as the line-based parser, so journal-sourced SSH failures still trigger the `SSH_BRUTE_FORCE` rule with identical behavior.
+- **Structured fields.** Uses `journalctl --output=json` to read `__CURSOR` (checkpoint), `__REALTIME_TIMESTAMP` (µs-since-epoch → UTC ISO 8601), `_HOSTNAME`, `MESSAGE` (raw message preserved verbatim), and `SYSLOG_IDENTIFIER`.
+- **Incremental + safe restart.** The cursor is persisted in a new `collector_state` table and advanced **inside the same transaction** as the event inserts, so a crash never leaves events stored with an un-advanced cursor. The next cycle uses `journalctl --after-cursor`.
+- **Duplicate protection.** Within-batch de-duplication by journal cursor; plus a `--since` fallback (triggered automatically when a cursor becomes invalid after journal rotation) that re-reads a recent window and de-duplicates against already-stored events.
+- **Supported event types:** `ssh_login_failed`, `ssh_login_success`, `ssh_invalid_user` (SSH); `sudo_session_opened`, `sudo_session_closed`, `sudo_command`, `pam_auth_failed`.
+- **Provenance / genuine-vs-synthetic distinction.** A new `events.source` column records where an event came from: `journal` for genuine journal records (those carrying a `__CURSOR`), `test` for synthetic records, and `NULL` for legacy line-based ingestion. Added via an additive `ALTER TABLE` migration (`_migrate_events_table`), so existing databases keep working.
+- **Optional & configurable** (off by default; `GREYWATCH_JOURNAL_ENABLED=1`). Configurable: poll interval, lookback window, per-cycle max records, identifier filter (`-t`), journalctl binary path, and `GREYWATCH_DB`.
+- **Least privilege.** Reads the journal via `journalctl` (no root required for the collection path); the API is not required to run as root and is not needed at all for collection. Does **not** start, enable, or reconfigure SSH.
+- **Operational endpoints:** `GET /api/v1/journal/status` (checkpoint/lag) and `POST /api/v1/journal/collect` (trigger one cycle).
+- **CLI:** `python -m backend.app.collector [--once|--status]` or a continuous loop (example systemd unit in `docs/JOURNAL_COLLECTOR.md`).
+- Documented in `docs/JOURNAL_COLLECTOR.md` (install, permissions, config, startup, troubleshooting, verify-real-events on Fedora).
+
 ---
 
 ## 3. Current Architecture
@@ -161,14 +177,26 @@ Only features verified in the codebase are documented below:
                      │          FastAPI HTTP Service           │
                      │          (backend/app/main.py)          │
                      │  - REST Endpoints (/events, /alerts)    │
+                     │  - /journal/status + /journal/collect   │
                      │  - Ingest & Alert Resolution Controls   │
+                     └────────────────────┬────────────────────┘
+                                          │
+        (optional, see §2.10)             │
+        ┌─────────────────────────────────┘
+        ▼
+                     ┌─────────────────────────────────────────┐
+                     │   Journal Auth Collector                │
+                     │   (backend/app/collector.py)            │
+                     │  - journalctl -o json (cursor checkpt)  │
+                     │  - parse_journal_record() PAM/SSH/sudo   │
+                     │  - collect_once() dedup + ingest_events  │
                      └────────────────────┬────────────────────┘
                                           │
                                           ▼
                      ┌─────────────────────────────────────────┐
                      │          SIEM Detection Engine          │
                      │          (backend/app/siem.py)          │
-                     │  - parse_auth_line(): regex extraction  │
+                     │  - parse_auth_line() / ingest_events()  │
                      │  - _normalize_timestamp(): UTC standard │
                      │  - SSH_BRUTE_FORCE sliding window rule  │
                      │  - get_alert_detail(): evidence query   │
@@ -178,8 +206,9 @@ Only features verified in the codebase are documented below:
                      ┌─────────────────────────────────────────┐
                      │           SQLite Storage Layer          │
                      │            (data/greywatch.db)          │
-                     │  - events: indexed on (source_ip, time) │
-                     │  - alerts: indexed on (status, created) │
+                     │  - events(+source): (source_ip, time)  │
+                     │  - alerts: (status, created)           │
+                     │  - collector_state: checkpoint cursor   │
                      └────────────────────▲────────────────────┘
                                           │
                             API Requests  │  Responses
@@ -194,11 +223,12 @@ Only features verified in the codebase are documented below:
 ```
 
 ### Ingestion & Detection Lifecycle
-1. **Ingest:** A client POSTs raw log strings to `/api/v1/events/ingest`.
-2. **Normalization:** `parse_auth_line` matches each line against regex rules. Timestamps are converted to UTC ISO 8601 strings.
-3. **Storage:** Normalized events are written to the `events` table in SQLite.
-4. **Detection:** The engine queries `events` for failed logins (`ssh_login_failed`) from the same source IP in the preceding 5-minute rolling window.
-5. **Alerting:** If the count reaches 5 or more, an alert is inserted into `alerts` (or updated if an open alert already exists for that source IP).
+1. **Ingest (lines):** A client POSTs raw log strings to `/api/v1/events/ingest` → `ingest_lines` → `parse_auth_line`.
+2. **Ingest (journal):** The journal collector reads `journalctl -o json` incrementally (cursor from `collector_state`), classifies records with `parse_journal_record`, de-duplicates, and persists them via `siem.ingest_events` — reusing the **same** SSH regexes so `ssh_login_failed` events flow into the identical detection path.
+3. **Normalization:** `parse_auth_line` (lines) / `parse_journal_record` (journal) extract event fields; timestamps are converted to UTC ISO 8601. Every event carries a `source` provenance tag.
+4. **Storage:** Normalized events are written to the `events` table in SQLite; the journal cursor is advanced in the same transaction.
+5. **Detection:** The engine queries `events` for failed logins (`ssh_login_failed`) from the same source IP in the preceding 5-minute rolling window.
+6. **Alerting:** If the count reaches 5 or more, an alert is inserted into `alerts` (or updated if an open alert already exists for that source IP).
 
 ### Investigation & Evidence Lifecycle
 1. **Trigger:** The analyst clicks "View evidence" on an alert in the React dashboard.
@@ -217,7 +247,8 @@ re-verified.
 
 | Verification Target | Command | Rerun? | Status | Result / Details |
 |---------------------|---------|--------|--------|------------------|
-| **Backend Tests** | `.venv/bin/python -m pytest -v` | Rerun 2026-10-12 | **PASSING** | `11 passed, 1 warning in 1.48s`, exit code 0.<br>*Warning: StarletteDeprecationWarning regarding httpx with testclient (pre-existing).* |
+| **Backend Tests** | `.venv/bin/python -m pytest -v` | Rerun 2026-10-13 | **PASSING** | `45 passed, 1 warning in 1.56s`, exit code 0 (11 existing `test_siem.py` + 34 new `test_collector.py`). No regressions; the line-based SSH brute-force tests are unchanged and still green.<br>*Warning: StarletteDeprecationWarning regarding httpx with testclient (pre-existing).* |
+| **Journal Collector (real Fedora journal)** | `logger -t sudo …` → `python -m backend.app.collector --once` → `curl /api/v1/events`+`/api/v1/alerts` | Rerun 2026-10-13 | **PASSING** | A controlled `sudo` session event injected with `logger` was collected by real `journalctl --output=json` and returned via the API with `source=journal`, correct UTC timestamp, and host. 5 `sshd` failures from one IP raised `SSH_BRUTE_FORCE`. A second `--once` reported `records_seen=0 ingested=0` (cursor-based restart safety; no duplicates). |
 | **Frontend Lint** | `npm run lint` (in `frontend/`) | Rerun 2026-10-12 | **PASSING (2 warnings)** | `Found 2 warnings and 0 errors`, exit code 0 (Oxlint 1.87.0).<br>1. `eslint(no-unused-vars)` in `App.jsx:294` (`catch (err)` unused).<br>2. `react(set-state-in-effect)` in `App.jsx:304` (`refresh()` called synchronously in `useEffect`). |
 | **Frontend Production Build** | `npm run build` (in `frontend/`) | Rerun 2026-10-12 | **PASSING** | Vite 8.3.4, `✓ 17 modules transformed`, built in 266ms, exit code 0.<br>Output: `dist/index.html` (0.45 kB), `dist/assets/index-*.css` (12.92 kB), `dist/assets/index-*.js` (235.97 kB). |
 | **GitHub Actions CI** | Workflow run #38286017323 on PR #2 | Verified 2026-10-12 | **PASSING** | Both **Backend tests** and **Frontend checks** jobs passed on `chore/github-ci` commit `e251926`. [View run](https://github.com/AnuragR3k/greywatch/actions/runs/38286017323). |
@@ -251,7 +282,7 @@ re-verified.
 
 ### Items Needing Further Investigation
 - **Production deployment strategy:** There is currently no configured production server setup (e.g., Nginx config or FastAPI static file mounting) for serving the frontend `dist/` bundle alongside the API.
-- **Log file watcher / ingestion daemon:** Ingestion currently only happens via manual HTTP POST requests. No syslog forwarder agent, file watcher (`watchfiles`/`inotify`), or systemd service exists to stream logs continuously from host files (`/var/log/auth.log` or `/var/log/secure`).
+- **Log file watcher / ingestion daemon:** Ingestion via manual HTTP POST is the legacy path. Continuous collection is now provided by the native **journal collector** (`backend/app/collector.py`, §2.10) reading `journalctl -o json`; it does not tail `/var/log/auth.log` or `/var/log/secure`, which is acceptable on journald-based hosts (Fedora) but a syslog-file tailer would still be needed for non-journald systems.
 
 ---
 
@@ -304,7 +335,7 @@ A prioritized list of near-term engineering tasks:
 6. **Containerization:**
    - Add a `Dockerfile` and `docker-compose.yml` that builds the React frontend, packages the FastAPI backend, and serves them together.
 7. **Continuous log streaming / collector:**
-   - Add a lightweight collector script (or CLI utility) that tails local `/var/log/auth.log` or reads from `journalctl` and sends lines to `/api/v1/events/ingest`.
+   - **DONE (2026-10-13).** Added `backend/app/collector.py` — a native systemd-journal reader (`journalctl -o json`) with cursor-based incremental collection, safe restart, duplicate protection, and `sudo`/PAM/SSH event parsing. See §2.10 and `docs/JOURNAL_COLLECTOR.md`. The line-based `/api/v1/events/ingest` path is unchanged.
 
 ---
 
