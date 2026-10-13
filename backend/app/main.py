@@ -12,6 +12,7 @@ from backend.app.siem import (
     list_alerts,
     list_events,
 )
+from backend.app import collector
 
 app = FastAPI(
     title="Greywatch API",
@@ -82,3 +83,28 @@ def resolve_alert(alert_id: int):
         )
 
     return {"id": alert_id, "status": "closed"}
+
+
+@app.get("/api/v1/journal/status", tags=["journal"])
+def journal_status():
+    """Report journal-collection checkpoint state and enabled flag."""
+    return collector.status()
+
+
+@app.post("/api/v1/journal/collect", tags=["journal"])
+def journal_collect():
+    """Trigger a single journal collection cycle.
+
+    Useful for manual collection and verification. Collection is also
+    controlled by ``GREYWATCH_JOURNAL_ENABLED``; this endpoint runs one cycle
+    regardless of that flag. Returns a summary of the cycle.
+    """
+    config = collector.get_config()
+    result = collector.collect_once(config)
+    return {
+        "records_seen": result.records_seen,
+        "events_ingested": result.events_ingested,
+        "alerts": result.new_alerts,
+        "fallback_used": result.fallback_used,
+        "errors": result.errors,
+    }
