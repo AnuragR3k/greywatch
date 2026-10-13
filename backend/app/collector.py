@@ -585,7 +585,19 @@ def collect_once(config: CollectorConfig | None = None) -> CollectResult:
         return result
 
     if not events:
-        # Truly nothing new.
+        # Truly nothing new, but the collector still completed a poll cycle.
+        # Record ``last_run_at`` even on an idle journal so the status
+        # endpoint reflects a live, continuously-polling collector instead of
+        # a frozen checkpoint. The cursor and last_event_ts are left
+        # unchanged: with no new records there is nothing to advance past.
+        with siem._connection() as connection:
+            _set_state(
+                connection,
+                cursor=cursor,
+                event_ts=last_event_ts,
+                events_ingested=str(_count_journal_events(connection)),
+                run_at=_now_iso(),
+            )
         return result
 
     # Ingest + detect, then advance the checkpoint in the same transaction so

@@ -512,6 +512,39 @@ def test_collect_fallback_no_duplicates_on_overlap(_db, patch_journal):
     assert len(_event_rows()) == 3
 
 
+def test_idle_cycle_advances_last_run_at(_db, patch_journal):
+    """A steady-state poll that finds no new journal records must still
+    refresh the checkpoint's ``last_run_at``.
+
+    Regression test: the previous "truly nothing new" early-return path
+    skipped the checkpoint write entirely, so on an idle journal a healthy,
+    continuously-polling collector froze ``last_run_at`` and the status
+    endpoint falsely suggested the collector was dead.
+    """
+    # Seed a cursor from a prior run so the incremental (--after-cursor) path
+    # is taken — the steady state for a long-running collector on an idle host.
+    collector_mod.siem.set_collector_setting("journal_last_cursor", "cursor-prev")
+
+    # Idle cycle: journalctl returns no records after the cursor.
+    patch_journal.after = []
+
+    result = collect_once(collector_mod.CollectorConfig())
+
+    assert result.records_seen == 0
+    assert result.events_ingested == 0
+
+    # last_run_at must reflect this poll, not stay frozen from the prior run.
+    # _now_iso() truncates to whole seconds, so assert recency with a tolerance.
+    run_at = get_collector_setting("journal_last_run_at")
+    assert run_at is not None
+    run_at_dt = datetime.fromisoformat(run_at)
+    age = (datetime.now(timezone.utc) - run_at_dt).total_seconds()
+    assert 0 <= age <= 10
+
+    # The cursor must be left untouched: nothing new to advance past.
+    assert get_collector_setting("journal_last_cursor") == "cursor-prev"
+
+
 def test_journal_sshd_events_trigger_brute_force(_db, patch_journal):
     """Regression: journal-sourced sshd failures still raise SSH_BRUTE_FORCE."""
     ip = "203.0.113.10"
