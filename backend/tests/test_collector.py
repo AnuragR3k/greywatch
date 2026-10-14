@@ -615,6 +615,65 @@ def test_journal_sshd_events_trigger_brute_force(_db, patch_journal):
     assert any(a["rule_id"] == "SSH_BRUTE_FORCE" for a in alerts)
 
 
+def test_journal_records_produce_brute_force_evidence(_db, patch_journal):
+    """Full chain: journal record -> parsed event -> SQLite -> alert -> evidence.
+
+    Journal-sourced sshd failures are normalized by ``parse_journal_record``
+    into the same ``ssh_login_failed`` shape as HTTP-ingested lines and flow
+    through the shared detection engine + evidence query. This extends the
+    basic journal-alert test by walking the alert-detail/evidence API and
+    proving provenance (``source == 'journal'``) survives end-to-end, while
+    an unrelated journal record (different event type) is stored but excluded
+    from the brute-force evidence.
+    """
+    attack_ip = "203.0.113.10"
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    patch_journal.initial = [
+        rec(
+            f"c{i}", now,
+            f"Failed password for juser{i} from {attack_ip} port {54000 + i} ssh2",
+            ident="sshd",
+        )
+        for i in range(5)
+    ] + [
+        # Unrelated journal record: stored, but not part of brute-force evidence.
+        rec(
+            "cSUDO", now,
+            "pam_unix(sudo:session): session opened for user root by ry3k(uid=1000)",
+            ident="sudo",
+        ),
+    ]
+
+    result = collect_once(collector_mod.CollectorConfig())
+
+    # journal record -> parsed event -> SQLite
+    assert result.records_seen == 6
+    assert result.events_ingested == 6
+    assert len(result.new_alerts) == 1
+    alert = result.new_alerts[0]
+    assert alert["rule_id"] == "SSH_BRUTE_FORCE"
+    assert alert["severity"] == "high"
+
+    rows = _event_rows()
+    assert len(rows) == 6
+    assert all(r["source"] == "journal" for r in rows)
+    assert sum(1 for r in rows if r["event_type"] == "ssh_login_failed") == 5
+
+    # SQLite -> alert -> evidence (via the real alert-detail API)
+    detail = client.get(f"/api/v1/alerts/{alert['id']}").json()
+    assert detail["alert"]["rule_id"] == "SSH_BRUTE_FORCE"
+    assert detail["alert"]["source_ip"] == attack_ip
+    assert detail["alert"]["event_count"] == 5
+
+    evidence = detail["evidence_events"]
+    assert len(evidence) == 5
+    assert all(e["source_ip"] == attack_ip for e in evidence)
+    assert all(e["event_type"] == "ssh_login_failed" for e in evidence)
+    assert all(e["source"] == "journal" for e in evidence)
+    # The unrelated sudo record is stored but not part of the evidence.
+    assert not any("session opened" in e["raw_message"] for e in evidence)
+
+
 def test_ingest_events_runs_detection_and_preserves_source(_db):
     """The structured-events path stores provenance and runs detection."""
     from backend.app.siem import ingest_events

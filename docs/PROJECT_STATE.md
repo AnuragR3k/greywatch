@@ -34,8 +34,8 @@ greywatch/
 │   │   └── collector.py     # systemd-journal auth collector + CLI (new)
 │   ├── requirements.txt     # fastapi, uvicorn[standard], httpx, pytest
 │   └── tests/
-│       ├── test_siem.py     # 11 test cases (parsing, ingestion, alerts, evidence, migration)
-│       └── test_collector.py # 34 test cases: parsing, checkpoint recovery, dedup, malformed, SSH brute-force regression (new)
+│       ├── test_siem.py     # 16 cases (parsing, ingestion, alerts, evidence, migration, end-to-end + below-threshold + per-IP)
+│       └── test_collector.py # 41 cases: parsing, checkpoint recovery, dedup, malformed, SSH brute-force, journal→alert→evidence (new)
 ├── frontend/                # React + Vite SOC dashboard
 │   ├── index.html           # HTML template
 │   ├── package.json         # React 19, Vite 8, Oxlint scripts and dependencies
@@ -249,14 +249,14 @@ re-verified.
 
 | Verification Target | Command | Rerun? | Status | Result / Details |
 |---------------------|---------|--------|--------|------------------|
-| **Backend Tests** | `.venv/bin/pytest -v` (also: `.venv/bin/python -m pytest -v`) | Rerun 2026-10-14 | **PASSING** | `53 passed, 1 warning in 1.59s`, exit code 0 (13 `test_siem.py` + 40 `test_collector.py`). No regressions; the line-based SSH brute-force tests are unchanged and still green. A root `pyproject.toml` (`[tool.pytest.ini_options]` with `pythonpath = ["."]`) now lets `pytest` resolve the `backend` package without `PYTHONPATH="$PWD"`, so `.venv/bin/pytest -v`, `python -m pytest -v`, and `PYTHONPATH="$PWD" .venv/bin/pytest -v` are all equivalent.<br>*Warning: StarletteDeprecationWarning regarding httpx with testclient (pre-existing, from Starlette/FastAPI — not actionable until `httpx2` is released).* |
+| **Backend Tests** | `.venv/bin/pytest -v` (also: `.venv/bin/python -m pytest -v`) | Rerun 2026-10-14 | **PASSING** | `57 passed, 1 warning in 1.64s`, exit code 0 (16 `test_siem.py` + 41 `test_collector.py`). No regressions; the line-based SSH brute-force tests are unchanged and still green. Adds 4 new cases: `test_end_to_end_http_detection_flow` (full HTTP→alert→evidence chain, below/at-threshold + per-IP isolation, duplicate-alert prevention, unrelated/out-of-window evidence exclusion), `test_below_threshold_does_not_create_alert` (4 failures → no alert), `test_brute_force_threshold_is_per_source_ip` (two IPs at threshold → two alerts), and `test_journal_records_produce_brute_force_evidence` (journal record → parsed event → SQLite → SSH_BRUTE_FORCE → evidence via `/api/v1/alerts/{id}` with `source=journal` provenance). A root `pyproject.toml` (`[tool.pytest.ini_options]` with `pythonpath = ["."]`) lets `pytest` resolve the `backend` package without `PYTHONPATH="$PWD"`, so `.venv/bin/pytest -v`, `python -m pytest -v`, and `PYTHONPATH="$PWD" .venv/bin/pytest -v` are all equivalent.<br>*Warning: StarletteDeprecationWarning regarding httpx with testclient (pre-existing, from Starlette/FastAPI — not actionable until `httpx2` is released).* |
 | **Journal Collector (real Fedora journal)** | `logger -t sudo …` → `python -m backend.app.collector --once` → `curl /api/v1/events`+`/api/v1/alerts` | Rerun 2026-10-13 | **PASSING** | A controlled `sudo` session event injected with `logger` was collected by real `journalctl --output=json` and returned via the API with `source=journal`, correct UTC timestamp, and host. 5 `sshd` failures from one IP raised `SSH_BRUTE_FORCE`. A second `--once` reported `records_seen=0 ingested=0` (cursor-based restart safety; no duplicates). |
-| **Frontend Lint** | `npm run lint` (in `frontend/`) | Rerun 2026-10-12 | **PASSING (2 warnings)** | `Found 2 warnings and 0 errors`, exit code 0 (Oxlint 1.87.0).<br>1. `eslint(no-unused-vars)` in `App.jsx:294` (`catch (err)` unused).<br>2. `react(set-state-in-effect)` in `App.jsx:304` (`refresh()` called synchronously in `useEffect`). |
+| **Frontend Lint** | `npm run lint` (in `frontend/`) | Rerun 2026-10-14 | **PASSING (3 warnings)** | `Found 3 warnings and 0 errors`, exit code 0 (Oxlint 1.87.0).<br>1. `react(refs)` — "Cannot access refs during render" in `Dock.jsx` (pre-existing).<br>2. `react(set-state-in-effect)` in `App.jsx:795` (`refresh()` called synchronously in `useEffect` — pre-existing).<br>3. `no-unused-vars` — unused `catch (err)` parameter (pre-existing). |
 | **Frontend Production Build** | `npm run build` (in `frontend/`) | Rerun 2026-10-12 | **PASSING** | Vite 8.3.4, `✓ 17 modules transformed`, built in 266ms, exit code 0.<br>Output: `dist/index.html` (0.45 kB), `dist/assets/index-*.css` (12.92 kB), `dist/assets/index-*.js` (235.97 kB). |
 | **GitHub Actions CI** | Workflow run #38286017323 on PR #2 | Verified 2026-10-12 | **PASSING** | Both **Backend tests** and **Frontend checks** jobs passed on `chore/github-ci` commit `e251926`. [View run](https://github.com/AnuragR3k/greywatch/actions/runs/38286017323). |
 | **System Python Pytest** | `python -m pytest -v` | **NOT RERUN** | Unknown this session | Earlier finding (unverified now): system `/usr/bin/python` lacks `pytest`; the virtualenv `.venv` must be used. |
 | **Live Backend API** | `curl -s http://127.0.0.1:8000/health` | **NOT RERUN** | Unknown this session | Earlier result was HTTP 200 with `{"status":"ok",...}`; live server state was not re-checked. |
-| **Live Alert Evidence API** | `curl -s http://127.0.0.1:8000/api/v1/alerts/1` | **NOT RERUN** | Unknown this session | Earlier result was HTTP 200 with evidence events; not re-checked. |
+| **Live Alert Evidence API** | `curl -s http://127.0.0.1:8000/api/v1/alerts/1` | Rerun 2026-10-14 | **PASSING** | HTTP 200; response shape `{alert, evidence_window_start, evidence_window_end, evidence_events}` matches the dashboard evidence drawer exactly. The sample alert (`SSH_BRUTE_FORCE`, `severity=high`, `status=closed`, `source_ip=203.0.113.10`, `event_count=5`) returned 5 `ssh_login_failed` evidence events with `raw_message` containing "Failed password". Field compatibility between API and frontend verified. |
 | **Live Frontend Dev Server** | `curl -I -s http://localhost:5173/` | **NOT RERUN** | Unknown this session | Earlier result was HTTP 200 through the Vite proxy; not re-checked. |
 
 ---
@@ -278,7 +278,7 @@ re-verified.
 6. **Rule-specific evidence querying coupling:**
    - `get_alert_detail()` hardcodes `event_type = 'ssh_login_failed'`. When additional detection rules are introduced (e.g. web attacks, privilege escalation), this query must be generalized or delegated to rule-specific handlers.
 7. **Frontend linter warnings:**
-   - Two minor warnings exist in `frontend/src/App.jsx` regarding `catch (err)` and synchronous `setState` in `useEffect`.
+   - 3 minor warnings exist in the frontend (`react(refs)` in `Dock.jsx`, `react(set-state-in-effect)` at `App.jsx` `useEffect`, and an unused `catch` parameter). 0 errors; build is green. Address as time permits.
 8. **Environment requirement:**
    - Backend tests and commands must be executed using `.venv` (`.venv/bin/python` or after activating the venv), as the system Python lacks the required dependencies. Running tests no longer requires `PYTHONPATH="$PWD"`: a root `pyproject.toml` (`[tool.pytest.ini_options]` → `pythonpath = ["."]`) makes `.venv/bin/pytest -v` resolve the `backend` package directly, matching `python -m pytest -v`.
 
@@ -329,7 +329,8 @@ A prioritized list of near-term engineering tasks:
    - Freeze versions in `backend/requirements.txt` to guarantee reproducible installations across environments.
 3. **Fix frontend warnings & metadata:**
    - Fix HTML title in `frontend/index.html` to "Greywatch".
-   - Address the 2 Oxlint warnings in `frontend/src/App.jsx` (`catch` parameter and `useEffect` state sync).
+   - Address the Oxlint warnings in `frontend/src/App.jsx` (`catch` parameter and `useEffect` state sync).
+   - Fix the uncolored event-category badges: `categorizeEventType` assigns `teal`/`orange`/`purple`/`grey` tones to the Events-table badges, but `App.css` only defined `.badge` color rules for severities (`high`/`medium`/`low`/`info`) and statuses (`open`/`closed`). Added `.badge.teal`/`.orange`/`.purple`/`.grey` (using the existing accent-color palette) so category badges render with their intended fill. Verified `npm run lint` (0 errors) and `npm run build` (passing).
 4. **Generalize alert evidence engine:**
    - Refactor `get_alert_detail()` to support dynamic rule definitions rather than hardcoding `ssh_login_failed`.
 5. **Basic authentication & security controls:**

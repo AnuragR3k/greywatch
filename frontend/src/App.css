@@ -2736,6 +2736,48 @@
 
 
 
+/* Event-category badges (categorizeEventType tones in the Events table). */
+
+.badge.teal {
+
+  background: #cffafe;
+
+  color: #0369a1;
+
+}
+
+
+
+.badge.orange {
+
+  background: #fff3e0;
+
+  color: #9a3412;
+
+}
+
+
+
+.badge.purple {
+
+  background: #ede9fe;
+
+  color: #5b21b6;
+
+}
+
+
+
+.badge.grey {
+
+  background: #f1f5f9;
+
+  color: #475569;
+
+}
+
+
+
 /* Buttons */
 
 .btn-solid {
