@@ -36,6 +36,7 @@ Collection is **optional** and **off by default**. Set
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -51,6 +52,8 @@ from .siem import (
     INVALID_USER,
     SUCCESSFUL_LOGIN,
 )
+
+logger = logging.getLogger("greywatch.collector")
 
 #: Default journalctl binary. Override with GREYWATCH_JOURNAL_COMMAND for
 #: tests or alternate installations.
@@ -130,6 +133,10 @@ class JournalctlError(RuntimeError):
 
 def run_journalctl(args: list[str], *, command: str = DEFAULT_JOURNALCTL) -> list[dict]:
     """Run ``journalctl`` and return its JSON output as a list of records.
+
+    ``--no-pager`` and ``--output=json`` are injected here so that callers only
+    ever have to supply query filters (e.g. ``-t``, ``--after-cursor``,
+    ``--since``); the same process never receives each flag twice.
 
     Each line of stdout is expected to be a JSON object (one journal entry).
     Blank or malformed lines are skipped rather than aborting the whole batch,
@@ -453,6 +460,11 @@ class CollectResult:
 def _build_args(config: CollectorConfig, cursor: str | None) -> list[str]:
     """Build the ``journalctl`` argument list for one collection cycle.
 
+    Only query-specific flags are returned (``-t`` filters plus either
+    ``--after-cursor`` or ``--since``). ``--no-pager`` and ``--output=json``
+    are injected by :func:`run_journalctl`, so they are deliberately *not*
+    included here to avoid passing them twice on the command line.
+
     Incremental reads use ``--after-cursor`` (exclusive). When there is no
     usable cursor (first run, or after the cursor became invalid due to journal
     rotation) we fall back to ``--since`` over the recent lookback window.
@@ -465,7 +477,6 @@ def _build_args(config: CollectorConfig, cursor: str | None) -> list[str]:
     args = []
     for identifier in config.identifiers:
         args += ["-t", identifier]
-    args += ["--no-pager", "--output=json"]
 
     if cursor:
         args += ["--after-cursor", cursor]
@@ -639,17 +650,14 @@ def _build_fallback_args(config: CollectorConfig, since_iso: str) -> list[str]:
     """Build ``journalctl`` args for the ``--since`` fallback path.
 
     ``since_iso`` is a normalized ISO timestamp (from the last ingested event);
-    it is converted to the ``@<epoch>`` form journalctl reliably parses.
+    it is converted to the ``@<epoch>`` form journalctl reliably parses. Only
+    query filters are returned here: ``--no-pager`` and ``--output=json`` are
+    injected by :func:`run_journalctl`.
     """
     args = []
     for identifier in config.identifiers:
         args += ["-t", identifier]
-    args += [
-        "--no-pager",
-        "--output=json",
-        "--since",
-        _epoch_since_iso(since_iso, FALLBACK_REWIND_SECONDS),
-    ]
+    args += ["--since", _epoch_since_iso(since_iso, FALLBACK_REWIND_SECONDS)]
     return args
 
 
@@ -690,7 +698,18 @@ def run_loop(config: CollectorConfig | None = None) -> None:
 
     try:
         while not stop["flag"]:
-            collect_once(config)
+            try:
+                collect_once(config)
+            except Exception as exc:
+                # collect_once() already handles JournalctlError internally
+                # (it populates result.errors and returns normally). This outer
+                # guard catches everything else -- e.g. a transient SQLite
+                # "database is locked" from the concurrent API, or an
+                # unexpected bug -- so a single bad cycle never kills the
+                # continuously-running collector. The traceback is logged so
+                # the failure is diagnosable; systemd will still restart the
+                # service on a hard crash, but transient faults self-heal.
+                logger.exception("collection cycle failed: %s", exc)
             time.sleep(config.poll_interval)
     finally:
         for sig, handler in previous.items():

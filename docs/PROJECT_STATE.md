@@ -163,6 +163,8 @@ Only features verified in the codebase are documented below:
 - **Least privilege.** Reads the journal via `journalctl` (no root required for the collection path); the API is not required to run as root and is not needed at all for collection. Does **not** start, enable, or reconfigure SSH.
 - **Operational endpoints:** `GET /api/v1/journal/status` (checkpoint/lag) and `POST /api/v1/journal/collect` (trigger one cycle).
 - **CLI:** `python -m backend.app.collector [--once|--status]` or a continuous loop (example systemd unit in `docs/JOURNAL_COLLECTOR.md`).
+- **Resilient collection loop.** `run_loop()` wraps each `collect_once()` cycle in a guard that catches and logs unexpected failures (e.g. a transient SQLite `database is locked` from a concurrent API writer) via `logger.exception`, so a single bad cycle resumes on the next poll instead of killing the daemon. `JournalctlError` is still handled inside `collect_once()` (reported via `result.errors`); only truly unexpected exceptions reach the outer guard. systemd still restarts on a hard crash.
+- **Clean argument construction.** `run_journalctl()` is the single place that injects `--no-pager`/`--output=json`, so those flags are never duplicated on the resulting `journalctl` invocation (the per-cycle arg builders now contribute only query filters: `-t`, `--after-cursor`/`--since`).
 - Documented in `docs/JOURNAL_COLLECTOR.md` (install, permissions, config, startup, troubleshooting, verify-real-events on Fedora).
 
 ---
@@ -247,7 +249,7 @@ re-verified.
 
 | Verification Target | Command | Rerun? | Status | Result / Details |
 |---------------------|---------|--------|--------|------------------|
-| **Backend Tests** | `.venv/bin/python -m pytest -v` | Rerun 2026-10-13 | **PASSING** | `45 passed, 1 warning in 1.56s`, exit code 0 (11 existing `test_siem.py` + 34 new `test_collector.py`). No regressions; the line-based SSH brute-force tests are unchanged and still green.<br>*Warning: StarletteDeprecationWarning regarding httpx with testclient (pre-existing).* |
+| **Backend Tests** | `.venv/bin/pytest -v` (also: `.venv/bin/python -m pytest -v`) | Rerun 2026-10-14 | **PASSING** | `53 passed, 1 warning in 1.59s`, exit code 0 (13 `test_siem.py` + 40 `test_collector.py`). No regressions; the line-based SSH brute-force tests are unchanged and still green. A root `pyproject.toml` (`[tool.pytest.ini_options]` with `pythonpath = ["."]`) now lets `pytest` resolve the `backend` package without `PYTHONPATH="$PWD"`, so `.venv/bin/pytest -v`, `python -m pytest -v`, and `PYTHONPATH="$PWD" .venv/bin/pytest -v` are all equivalent.<br>*Warning: StarletteDeprecationWarning regarding httpx with testclient (pre-existing, from Starlette/FastAPI — not actionable until `httpx2` is released).* |
 | **Journal Collector (real Fedora journal)** | `logger -t sudo …` → `python -m backend.app.collector --once` → `curl /api/v1/events`+`/api/v1/alerts` | Rerun 2026-10-13 | **PASSING** | A controlled `sudo` session event injected with `logger` was collected by real `journalctl --output=json` and returned via the API with `source=journal`, correct UTC timestamp, and host. 5 `sshd` failures from one IP raised `SSH_BRUTE_FORCE`. A second `--once` reported `records_seen=0 ingested=0` (cursor-based restart safety; no duplicates). |
 | **Frontend Lint** | `npm run lint` (in `frontend/`) | Rerun 2026-10-12 | **PASSING (2 warnings)** | `Found 2 warnings and 0 errors`, exit code 0 (Oxlint 1.87.0).<br>1. `eslint(no-unused-vars)` in `App.jsx:294` (`catch (err)` unused).<br>2. `react(set-state-in-effect)` in `App.jsx:304` (`refresh()` called synchronously in `useEffect`). |
 | **Frontend Production Build** | `npm run build` (in `frontend/`) | Rerun 2026-10-12 | **PASSING** | Vite 8.3.4, `✓ 17 modules transformed`, built in 266ms, exit code 0.<br>Output: `dist/index.html` (0.45 kB), `dist/assets/index-*.css` (12.92 kB), `dist/assets/index-*.js` (235.97 kB). |
@@ -278,7 +280,7 @@ re-verified.
 7. **Frontend linter warnings:**
    - Two minor warnings exist in `frontend/src/App.jsx` regarding `catch (err)` and synchronous `setState` in `useEffect`.
 8. **Environment requirement:**
-   - Backend tests and commands must be executed using `.venv` (`.venv/bin/python` or after activating the venv), as the system Python lacks the required dependencies.
+   - Backend tests and commands must be executed using `.venv` (`.venv/bin/python` or after activating the venv), as the system Python lacks the required dependencies. Running tests no longer requires `PYTHONPATH="$PWD"`: a root `pyproject.toml` (`[tool.pytest.ini_options]` → `pythonpath = ["."]`) makes `.venv/bin/pytest -v` resolve the `backend` package directly, matching `python -m pytest -v`.
 
 ### Items Needing Further Investigation
 - **Production deployment strategy:** There is currently no configured production server setup (e.g., Nginx config or FastAPI static file mounting) for serving the frontend `dist/` bundle alongside the API.

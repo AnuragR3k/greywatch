@@ -12,6 +12,10 @@ this file's module docstring.
 """
 
 import json
+import logging
+import shutil
+import subprocess
+import time
 from datetime import datetime, timezone
 
 import pytest
@@ -360,8 +364,48 @@ def test_malformed_json_line_in_run_journalctl_is_skipped(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# Collection: ingestion + detection
+# Journalctl command construction
 # --------------------------------------------------------------------------- #
+
+
+def test_build_args_does_not_duplicate_output_flags():
+    """``run_journalctl`` injects ``--no-pager``/``--output=json`` exactly once;
+    the argument builders must only contribute query filters so the flags are
+    never passed to journalctl twice."""
+    cfg = collector_mod.CollectorConfig()
+    incremental = collector_mod._build_args(cfg, cursor="cur1")
+    fallback = collector_mod._build_fallback_args(cfg, "2026-10-13T10:00:00+00:00")
+    for args in (incremental, fallback):
+        assert args.count("--no-pager") == 0
+        assert args.count("--output=json") == 0
+    assert "--after-cursor" in incremental
+    assert "--since" in fallback
+
+
+def test_run_journalctl_passes_each_output_flag_once(tmp_path, monkeypatch):
+    """The full process invocation carries ``--no-pager``/``--output=json`` once."""
+    fake = tmp_path / "fake-journalctl"
+    fake.write_text("#!/bin/sh\n")
+    fake.chmod(0o755)
+
+    original_run = subprocess.run
+    captured: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    run_journalctl(["-t", "sudo", "--after-cursor", "cur1"], command=str(fake))
+
+    cmd = captured["cmd"]
+    assert cmd[0] == str(fake)
+    assert cmd.count("--no-pager") == 1
+    assert cmd.count("--output=json") == 1
+
+
+# --------------------------------------------------------------------------- #
+
 
 
 def test_collect_ingests_journal_events(_db, patch_journal):
@@ -695,3 +739,160 @@ def _open_legacy_db(path):
     )
     conn.commit()
     return conn
+
+
+# --------------------------------------------------------------------------- #
+# Continuous loop resilience
+# --------------------------------------------------------------------------- #
+
+
+def test_run_loop_survives_transcient_collection_error(monkeypatch, tmp_path, caplog):
+    """A single failed cycle must not abort the continuous collector loop.
+
+    ``collect_once`` already converts ``JournalctlError`` into result.errors,
+    but an *unexpected* failure (e.g. a transient SQLite "database is locked"
+    from the concurrent API) would previously escape and kill the daemon until
+    systemd restarted it. The loop must now log the failure and resume.
+    """
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "loop.db"))
+    initialize_database()
+
+    calls = {"n": 0}
+
+    class _Stop(BaseException):
+        """Test-only sentinel: terminates the otherwise-infinite loop."""
+
+    def fake_collect(config=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # Mimics a transient, non-JournalctlError failure.
+            raise RuntimeError("transient: database is locked")
+        raise _Stop
+
+    monkeypatch.setattr(collector_mod, "collect_once", fake_collect)
+    monkeypatch.setattr(collector_mod.time, "sleep", lambda s: None)
+    # Don't touch the test process's real signal handlers.
+    monkeypatch.setattr("signal.signal", lambda *a, **k: None)
+    monkeypatch.setattr("signal.getsignal", lambda s: None)
+
+    config = collector_mod.CollectorConfig(enabled=True, poll_interval=0.01)
+    with caplog.at_level(logging.ERROR, logger="greywatch.collector"):
+        with pytest.raises(_Stop):
+            collector_mod.run_loop(config)
+
+    # The loop reached a second cycle, proving the first error was absorbed.
+    assert calls["n"] == 2
+    # And it was logged for diagnosability rather than swallowed silently.
+    assert any("database is locked" in r.message for r in caplog.records)
+
+
+def test_run_loop_is_noop_when_disabled(monkeypatch, tmp_path):
+    """When disabled, run_loop returns immediately without touching journalctl."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "off.db"))
+    initialize_database()
+    calls = {"n": 0}
+
+    def boom(*a, **k):
+        calls["n"] += 1
+        raise AssertionError("collect_once must not be called when disabled")
+
+    monkeypatch.setattr(collector_mod, "collect_once", boom)
+    config = collector_mod.CollectorConfig(enabled=False)
+    collector_mod.run_loop(config)
+    assert calls["n"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# Real-journal end-to-end (skip-gated; exercises the genuine journalctl path)
+# --------------------------------------------------------------------------- #
+
+
+def _journal_is_writable_and_readable() -> bool:
+    """True only when a `logger`-injected syslog record is readable via journalctl.
+
+    Gates the real-journal end-to-end test so it exercises the genuine
+    production ``journalctl -o json`` read path where a usable user journal
+    exists, and cleanly skips (rather than fails) on CI or headless hosts.
+    """
+    if not shutil.which("journalctl") or not shutil.which("logger"):
+        return False
+    marker = f"grewatch-journal-probe-{int(time.time() * 1000)}"
+    try:
+        subprocess.run(
+            ["logger", "-t", "sudo", marker],
+            check=True,
+            timeout=5,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        try:
+            result = subprocess.run(
+                [
+                    "journalctl", "-t", "sudo",
+                    "--since", "5 minutes ago", "--no-pager",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (subprocess.SubprocessError, OSError):
+            return False
+        if result.returncode == 0 and marker in result.stdout:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def test_real_journal_collects_controlled_event(_db):
+    """End-to-end against the live systemd journal.
+
+    Injects a uniquely-marked event with ``logger`` (the canonical journal
+    injection path) and collects it through the real ``journalctl -o json``
+    reader -- no mocking of ``run_journalctl``. This validates argument
+    construction, cursor bootstrap, microsecond timestamp conversion, parsing,
+    provenance tagging, and that journal-sourced events share the detection
+    path with line-based ingestion.
+    """
+    if not _journal_is_writable_and_readable():
+        pytest.skip("requires a writable/readable systemd journal")
+
+    marker = f"grewatch-e2e-{int(time.time())}"
+    msg = (
+        f"pam_unix(sudo:session): session opened for user root(uid=0) by "
+        f"{marker}(uid=1000)"
+    )
+    subprocess.run(["logger", "-t", "sudo", msg], check=True)
+
+    # Wait until journald has flushed the entry so collect_once() sees it.
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        result = subprocess.run(
+            [
+                "journalctl", "-t", "sudo",
+                "--since", "5 minutes ago", "--no-pager",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0 and marker in result.stdout:
+            break
+        time.sleep(0.5)
+
+    result = collector_mod.collect_once(collector_mod.CollectorConfig())
+
+    assert result.errors == []
+    assert result.records_seen >= 1
+    assert result.fallback_used is False
+
+    rows = _event_rows()
+    matches = [r for r in rows if r["raw_message"] == msg]
+    assert matches, "injected journal event was not stored"
+    event = matches[0]
+    assert event["source"] == "journal"
+    assert event["event_type"] == "sudo_session_opened"
+    assert event["username"] == "root"
+    assert event["severity"] == "info"
+    assert event["host"]
