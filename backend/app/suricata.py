@@ -547,12 +547,50 @@ def status() -> dict:
 # --------------------------------------------------------------------------- #
 
 
+def _run_cycle(config: SuricataConfig) -> CollectResult | None:
+    """Run a single collection cycle with resilience and observability.
+
+    Mirrors :func:`collector.run_loop`'s "a single bad cycle never kills the
+    daemon" contract: :func:`collect_once` reports file/IO errors via
+    ``result.errors`` (it never raises them), so this outer guard only catches
+    truly unexpected exceptions. Unlike the previous loop body, it also **logs
+    the per-cycle outcome**: errors are logged at ``ERROR`` so a missing or
+    unreadable EVE file is visible without querying ``/status``, while a clean
+    idle cycle with no records stays silent (debug only) to avoid flooding logs
+    on every poll. Returns the :class:`~backend.app.collector.CollectResult`
+    (or ``None`` if an unexpected exception escaped ``collect_once``).
+    """
+    try:
+        result = collect_once(config)
+    except Exception as exc:  # noqa: BLE001 - resilient loop
+        # collect_once() already reports file/IO errors via result.errors.
+        # This outer guard catches anything else so the daemon survives
+        # transient faults (e.g. a transient SQLite ``database is locked`` from
+        # the concurrent API) and resumes on the next poll.
+        logger.exception("collection cycle failed: %s", exc)
+        return None
+
+    if result.errors:
+        logger.error("collection cycle reported errors: %s", result.errors)
+    elif result.records_seen:
+        logger.debug(
+            "collection cycle complete: records_seen=%d ingested=%d "
+            "new_alerts=%d",
+            result.records_seen,
+            result.events_ingested,
+            len(result.new_alerts),
+        )
+    return result
+
+
 def run_loop(config: SuricataConfig | None = None) -> None:
     """Run :func:`collect_once` on an interval until interrupted.
 
     The loop is a plain ``while`` + ``sleep`` (no scheduling dependency) so a
     single bad cycle -- e.g. a transient SQLite ``database is locked`` from the
-    concurrent API -- never kills the continuously-running collector.
+    concurrent API -- never kills the continuously-running collector. Each
+    cycle's errors are logged by :func:`_run_cycle` (see
+    :func:`backend.app.collector.run_loop`).
     """
     config = config or get_config()
     if not config.enabled:
@@ -574,13 +612,7 @@ def run_loop(config: SuricataConfig | None = None) -> None:
 
     try:
         while not stop["flag"]:
-            try:
-                collect_once(config)
-            except Exception as exc:  # noqa: BLE001 - resilient loop
-                # collect_once() already reports file/IO errors via
-                # result.errors. This outer guard catches anything else so the
-                # daemon survives transient faults and resumes on the next poll.
-                logger.exception("collection cycle failed: %s", exc)
+            _run_cycle(config)
             time.sleep(config.poll_interval)
     finally:
         for sig, handler in previous.items():

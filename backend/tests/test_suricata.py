@@ -1244,3 +1244,47 @@ def test_signature_bearing_dedup_ignores_category(_db):
     assert _alert_rows()[0]["event_count"] == 2
     detail = siem.get_alert_detail(_alert_rows()[0]["id"])
     assert len(detail["evidence_events"]) == 2
+
+
+# --------------------------------------------------------------------------- #
+# Operational logging: run_loop() observability (PR #3 review, finding #2)
+# --------------------------------------------------------------------------- #
+
+
+def test_run_cycle_logs_errors_for_missing_eve_file(_db, tmp_path, caplog):
+    """A missing/unreadable EVE file is logged at ERROR by ``_run_cycle`` so a
+    misconfigured continuous collector is visible without querying /status."""
+    cfg = SuricataConfig(eve_path=str(tmp_path / "does-not-exist.json"))
+    with caplog.at_level("ERROR", logger="greywatch.suricata"):
+        result = suricata_mod._run_cycle(cfg)
+    assert result is not None
+    assert result.errors  # "EVE file not found: ..."
+    assert "collection cycle reported errors" in caplog.text
+    assert "EVE file not found" in caplog.text
+
+
+def test_run_cycle_is_silent_on_clean_idle_cycle(_db, tmp_path, caplog):
+    """An idle cycle with no records and no errors must not write to the log
+    (no flood on every poll)."""
+    eve = tmp_path / "eve.json"
+    eve.write_text("", encoding="utf-8")
+    cfg = SuricataConfig(eve_path=str(eve))
+    with caplog.at_level("ERROR", logger="greywatch.suricata"):
+        result = suricata_mod._run_cycle(cfg)
+    assert result.errors == []
+    assert "collection cycle reported errors" not in caplog.text
+    assert "collection cycle failed" not in caplog.text
+
+
+def test_run_cycle_swallows_and_logs_unexpected_exceptions(_db, monkeypatch, caplog):
+    """``collect_once`` reports file/IO errors via ``result.errors``; anything
+    unexpected still kills only the cycle (logged), not the daemon."""
+    def boom(config):
+        raise RuntimeError("simulated disk corruption")
+
+    monkeypatch.setattr(suricata_mod, "collect_once", boom)
+    with caplog.at_level("ERROR", logger="greywatch.suricata"):
+        result = suricata_mod._run_cycle(SuricataConfig())
+    assert result is None
+    assert "collection cycle failed" in caplog.text
+    assert "simulated disk corruption" in caplog.text

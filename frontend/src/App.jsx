@@ -805,18 +805,6 @@ export default function App() {
             <DockIcon>
               <button
                 type="button"
-                className="tb-btn"
-                onClick={() => alert('Assigned incident telemetry to Anurag')}
-                aria-label="Assign operator"
-              >
-                <Icon name="assign" size={13} />
-                <span>Assign</span>
-              </button>
-            </DockIcon>
-
-            <DockIcon>
-              <button
-                type="button"
                 className="tb-btn tb-btn-more"
                 aria-label="More options"
                 onClick={() => {
