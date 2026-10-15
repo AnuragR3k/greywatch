@@ -50,9 +50,11 @@ class IngestRequest(BaseModel):
 # The server is launched with ``uvicorn`` (see README), whose default bind is
 # loopback, so the intended local/trusted-host deployment already passes this
 # gate. This guard additionally protects operators who re-launch with
-# ``--host 0.0.0.0``. Read/health endpoints are not gated here; in a
-# network-exposed deployment the reverse proxy is responsible for protecting
-# them (or set a token, which the dashboard cannot carry).
+# ``--host 0.0.0.0``: only ``/`` and ``/health`` are public, while every other
+# endpoint -- including the read endpoints that expose raw_message and alert
+# evidence -- is gated (loopback peer or a valid token). The dashboard (static
+# JS) cannot carry a token, so it assumes a local / trusted-host browser; a
+# network-exposed dashboard requires an auth-terminating reverse proxy.
 
 
 def _is_loopback_host(host: str | None) -> bool:
