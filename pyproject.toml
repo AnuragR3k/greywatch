@@ -1,0 +1,10 @@
+[tool.pytest.ini_options]
+# The Python package lives in backend/app but is imported as `backend.app.*`,
+# which requires the repository root on sys.path. `python -m pytest` adds the
+# current directory automatically, but the `.venv/bin/pytest` console script
+# does not -- so declare the path here. This makes every invocation equivalent:
+#   pytest -v
+#   .venv/bin/pytest -v
+#   python -m pytest -v
+pythonpath = ["."]
+testpaths = ["backend/tests"]

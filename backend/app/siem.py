@@ -10,8 +10,30 @@ import sqlite3
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[2] / "data" / "greywatch.db"
 
+
+def is_production_db_path(path: str | Path) -> bool:
+    """True if ``path`` resolves to the default production database.
+
+    This is a pure, side-effect-free helper used by the test-suite safety guard
+    (see ``backend/tests/conftest.py``) to detect when a test would use
+    ``data/greywatch.db`` — so it can refuse to run rather than silently mutate
+    production data. It does **not** change normal application behavior.
+    """
+    return Path(path).resolve() == DEFAULT_DB_PATH.resolve()
+
 BRUTE_FORCE_THRESHOLD = 5
 BRUTE_FORCE_WINDOW_MINUTES = 5
+
+# Suricata alert aggregation window. Repeated detections of the same Suricata
+# rule identity + network 5-tuple within this window aggregate into a single
+# open Greywatch alert (see ``_detect_suricata_alerts``). Detections of the
+# same key outside the window start a new alert so distinct incidents remain
+# distinguishable, while a steady stream of identical alerts cannot multiply
+# unboundedly.
+SURICATA_ALERT_WINDOW_MINUTES = 60
+
+# Rule id used for Greywatch alerts raised from Suricata EVE "alert" events.
+SURICATA_ALERT_RULE = "SURICATA_ALERT"
 
 # Traditional Linux syslog format:
 # Oct 12 19:41:23 fedora sshd[1234]: Failed password ...
@@ -71,17 +93,29 @@ def _migrate_alerts_table(connection: sqlite3.Connection) -> None:
     """Add columns missing from an alerts table created by an older release.
 
     SQLite has no "ADD COLUMN IF NOT EXISTS", so the existing columns are
-    inspected first. Existing rows are backfilled from created_at so the
-    evidence window behaves like it did before the column existed.
+    inspected first via ``PRAGMA table_info``. New columns are added with no
+    default, so existing rows keep their prior values and legacy SSH alerts
+    simply leave the new (Suricata-specific) columns ``NULL``. ``last_triggered_at``
+    is special-cased and backfilled from ``created_at`` so pre-existing alerts
+    keep their old evidence-window behavior.
     """
     columns = {
         row["name"]
         for row in connection.execute("PRAGMA table_info(alerts)").fetchall()
     }
-    if "last_triggered_at" not in columns:
-        connection.execute(
-            "ALTER TABLE alerts ADD COLUMN last_triggered_at TEXT"
-        )
+    additions: list[tuple[str, str]] = [
+        ("last_triggered_at", "TEXT"),
+        ("dest_ip", "TEXT"),
+        ("src_port", "INTEGER"),
+        ("dest_port", "INTEGER"),
+        ("proto", "TEXT"),
+        ("signature", "TEXT"),
+        ("signature_id", "INTEGER"),
+        ("category", "TEXT"),
+    ]
+    for column, dtype in additions:
+        if column not in columns:
+            connection.execute(f"ALTER TABLE alerts ADD COLUMN {column} {dtype}")
 
     connection.execute(
         """
@@ -90,6 +124,36 @@ def _migrate_alerts_table(connection: sqlite3.Connection) -> None:
         WHERE last_triggered_at IS NULL
         """
     )
+
+
+def _migrate_events_table(connection: sqlite3.Connection) -> None:
+    """Add provenance and network-metadata columns missing from an events
+    table created by an older release.
+
+    ``source`` records where an event originated (e.g. ``journal`` for genuine
+    systemd-journal events, ``suricata`` for Suricata EVE alerts, ``test`` for
+    synthetic records). The network/IDS columns (``dest_ip``, ``src_port``,
+    ``dest_port``, ``proto``, ``signature``, ``signature_id``, ``category``)
+    are populated by the Suricata collector and left NULL for SSH/journal/test
+    events so they stay queryable without guessing. Existing rows are preserved.
+    """
+    columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(events)").fetchall()
+    }
+    additions: list[tuple[str, str]] = [
+        ("source", "TEXT"),
+        ("dest_ip", "TEXT"),
+        ("src_port", "INTEGER"),
+        ("dest_port", "INTEGER"),
+        ("proto", "TEXT"),
+        ("signature", "TEXT"),
+        ("signature_id", "INTEGER"),
+        ("category", "TEXT"),
+    ]
+    for column, dtype in additions:
+        if column not in columns:
+            connection.execute(f"ALTER TABLE events ADD COLUMN {column} {dtype}")
 
 
 def initialize_database() -> None:
@@ -105,11 +169,24 @@ def initialize_database() -> None:
                 username TEXT,
                 source_ip TEXT,
                 severity TEXT NOT NULL,
-                raw_message TEXT NOT NULL
+                raw_message TEXT NOT NULL,
+                source TEXT,
+                dest_ip TEXT,
+                src_port INTEGER,
+                dest_port INTEGER,
+                proto TEXT,
+                signature TEXT,
+                signature_id INTEGER,
+                category TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_events_ip_time
                 ON events(source_ip, timestamp);
+
+            CREATE TABLE IF NOT EXISTS collector_state (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
 
             CREATE TABLE IF NOT EXISTS alerts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -122,7 +199,14 @@ def initialize_database() -> None:
                 event_count INTEGER NOT NULL,
                 status TEXT NOT NULL DEFAULT 'open',
                 closed_at TEXT,
-                last_triggered_at TEXT
+                last_triggered_at TEXT,
+                dest_ip TEXT,
+                src_port INTEGER,
+                dest_port INTEGER,
+                proto TEXT,
+                signature TEXT,
+                signature_id INTEGER,
+                category TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_alerts_status
@@ -130,6 +214,7 @@ def initialize_database() -> None:
             """
         )
         _migrate_alerts_table(connection)
+        _migrate_events_table(connection)
 
 
 def _normalize_timestamp(value: str | None, *, syslog: bool = False) -> str:
@@ -225,140 +310,438 @@ def parse_auth_line(line: str) -> dict | None:
     }
 
 
-def ingest_lines(lines: list[str]) -> dict:
-    """Parse and persist events, then evaluate the SSH brute-force rule."""
-    initialize_database()
+def _store_events_and_detect(
+    events: list[dict], connection: sqlite3.Connection
+) -> tuple[list[dict], list[dict]]:
+    """Persist normalized events and evaluate the SSH brute-force rule.
 
-    events = []
-    for line in lines:
-        event = parse_auth_line(line)
-        if event is not None:
-            events.append(event)
-
+    Events must already be in the shape produced by ``parse_auth_line`` (or the
+    journal collector's ``parse_journal_record``). Detection runs inside the
+    caller's transaction so the failed-login count reflects the rows just
+    inserted. Returns ``(inserted_events, new_alerts)``.
+    """
     inserted_events = []
     new_alerts = []
 
-    with _connection() as connection:
-        for event in events:
-            cursor = connection.execute(
+    for event in events:
+        cursor = connection.execute(
+            """
+            INSERT INTO events (
+                timestamp, host, event_type, username,
+                source_ip, severity, raw_message, source,
+                dest_ip, src_port, dest_port, proto,
+                signature, signature_id, category
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event["timestamp"],
+                event["host"],
+                event["event_type"],
+                event["username"],
+                event["source_ip"],
+                event["severity"],
+                event["raw_message"],
+                event.get("source"),
+                event.get("dest_ip"),
+                event.get("src_port"),
+                event.get("dest_port"),
+                event.get("proto"),
+                event.get("signature"),
+                event.get("signature_id"),
+                event.get("category"),
+            ),
+        )
+        inserted_events.append({"id": cursor.lastrowid, **event})
+
+    # Count failed logins only. Invalid-user messages can accompany a
+    # failed-login message, so counting both could inflate the threshold.
+    source_ips = {
+        event["source_ip"]
+        for event in events
+        if event["event_type"] == "ssh_login_failed"
+        and event["source_ip"]
+    }
+
+    now = datetime.now(timezone.utc)
+    now_text = now.isoformat(timespec="seconds")
+    cutoff_text = (
+        now - timedelta(minutes=BRUTE_FORCE_WINDOW_MINUTES)
+    ).isoformat(timespec="seconds")
+
+    for source_ip in sorted(source_ips):
+        count = connection.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM events
+            WHERE event_type = 'ssh_login_failed'
+              AND source_ip = ?
+              AND timestamp >= ?
+              AND timestamp <= ?
+            """,
+            (source_ip, cutoff_text, now_text),
+        ).fetchone()["total"]
+
+        if count < BRUTE_FORCE_THRESHOLD:
+            continue
+
+        existing = connection.execute(
+            """
+            SELECT id
+            FROM alerts
+            WHERE rule_id = 'SSH_BRUTE_FORCE'
+              AND source_ip = ?
+              AND status = 'open'
+            LIMIT 1
+            """,
+            (source_ip,),
+        ).fetchone()
+
+        description = (
+            f"Observed {count} failed SSH login attempts from {source_ip} "
+            f"within {BRUTE_FORCE_WINDOW_MINUTES} minutes. "
+            "Investigate the source, targeted accounts, and any related "
+            "successful logins."
+        )
+
+        # Update an existing alert instead of creating duplicates.
+        # last_triggered_at records when the count was last recalculated
+        # so the evidence window grows with the alert instead of staying
+        # anchored to created_at.
+        if existing:
+            connection.execute(
                 """
-                INSERT INTO events (
-                    timestamp, host, event_type, username,
-                    source_ip, severity, raw_message
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                UPDATE alerts
+                SET description = ?, event_count = ?,
+                    last_triggered_at = ?
+                WHERE id = ?
                 """,
-                (
-                    event["timestamp"],
-                    event["host"],
-                    event["event_type"],
-                    event["username"],
-                    event["source_ip"],
-                    event["severity"],
-                    event["raw_message"],
-                ),
+                (description, count, now_text, existing["id"]),
             )
-            inserted_events.append({"id": cursor.lastrowid, **event})
+            continue
 
-        # Count failed logins only. Invalid-user messages can accompany a
-        # failed-login message, so counting both could inflate the threshold.
-        source_ips = {
-            event["source_ip"]
-            for event in events
-            if event["event_type"] == "ssh_login_failed"
-            and event["source_ip"]
-        }
+        cursor = connection.execute(
+            """
+            INSERT INTO alerts (
+                created_at, rule_id, title, severity,
+                source_ip, description, event_count, status,
+                last_triggered_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)
+            """,
+            (
+                now_text,
+                "SSH_BRUTE_FORCE",
+                "Repeated SSH authentication failures",
+                "high",
+                source_ip,
+                description,
+                count,
+                now_text,
+            ),
+        )
 
-        now = datetime.now(timezone.utc)
-        now_text = now.isoformat(timespec="seconds")
-        cutoff_text = (
-            now - timedelta(minutes=BRUTE_FORCE_WINDOW_MINUTES)
+        new_alerts.append(
+            {
+                "id": cursor.lastrowid,
+                "created_at": now_text,
+                "rule_id": "SSH_BRUTE_FORCE",
+                "title": "Repeated SSH authentication failures",
+                "severity": "high",
+                "source_ip": source_ip,
+                "description": description,
+                "event_count": count,
+                "status": "open",
+                "last_triggered_at": now_text,
+            }
+        )
+
+    # Suricata EVE "alert" records become Greywatch alerts (rule_id
+    # SURICATA_ALERT) in the shared alerts table. This runs only on
+    # suricata_alert events, so SSH/journal/HTTP ingestion is unaffected.
+    new_alerts.extend(_detect_suricata_alerts(inserted_events, connection))
+
+    return inserted_events, new_alerts
+
+
+def _suricata_alert_description(event: dict, count: int) -> str:
+    """Build a human-readable description for a Suricata-derived alert.
+
+    Surfaces the *original* numeric Suricata severity (from the event dict's
+    ``raw_severity``) alongside the mapped Greywatch severity, so analysts do
+    not have to decode the raw EVE JSON to see it. The full original record is
+    still available in the alert's evidence events' ``raw_message``.
+    """
+    signature = event.get("signature")
+    signature_id = event.get("signature_id")
+    category = event.get("category")
+    raw_severity = event.get("raw_severity")
+    src_ip = event.get("source_ip") or "0.0.0.0"
+    dest_ip = event.get("dest_ip") or "0.0.0.0"
+    src_port = event.get("src_port")
+    dest_port = event.get("dest_port")
+    proto = event.get("proto") or "unknown"
+    severity = event.get("severity") or "low"
+
+    if signature:
+        sig = f"signature '{signature}' (id {signature_id})"
+    elif signature_id is not None:
+        sig = f"signature id {signature_id}"
+    else:
+        sig = "unknown signature"
+
+    orig = (
+        f"Suricata severity {raw_severity}"
+        if raw_severity is not None
+        else "Suricata severity unknown"
+    )
+    cat = f"category '{category}'" if category else "no category"
+    sport = src_port if src_port is not None else "any"
+    dport = dest_port if dest_port is not None else "any"
+
+    return (
+        f"Suricata IDS alert ({orig}, Greywatch: {severity}); "
+        f"{count} event(s) aggregated for {sig}, {cat}. "
+        f"Traffic: {src_ip}:{sport} -> {dest_ip}:{dport} over {proto}. "
+        "Source: Suricata EVE - see evidence events' raw_message for the "
+        "original record (including the original alert.severity)."
+    )
+
+
+#: Columns that identify one Suricata incident. ``signature``/``signature_id``
+#: are the rule identity; the rest are the network 5-tuple.
+SURICATA_INCIDENT_COLUMNS = (
+    "signature_id",
+    "signature",
+    "source_ip",
+    "dest_ip",
+    "src_port",
+    "dest_port",
+    "proto",
+)
+
+
+def _suricata_incident_conditions(record) -> tuple[list[str], list]:
+    """Return the NULL-safe ``WHERE`` conditions + values for an incident key.
+
+    Works for both an ingestion event dict and a stored ``alerts`` row, so the
+    alert-matching query in :func:`_detect_suricata_alerts` and the evidence
+    query in :func:`get_alert_detail` are built from *one* definition and can
+    never silently diverge. SQLite's ``IS`` matches both ``NULL IS NULL`` and
+    ``value IS value``, so absent optional fields compare correctly.
+
+    ``category`` participates in the key **only** when the record carries no
+    rule identity at all (no ``signature`` and no ``signature_id``). Without
+    that discriminator, unrelated unknown-signature detections that happen to
+    share a network 5-tuple would collapse into a single alert whose stored
+    severity/category came from one event while its description came from
+    another. When a rule identity *is* present, ``category`` is not part of the
+    key, so signature-based aggregation is byte-for-byte unchanged.
+    """
+    values = [record[column] for column in SURICATA_INCIDENT_COLUMNS]
+    conditions = [f"{column} IS ?" for column in SURICATA_INCIDENT_COLUMNS]
+
+    if record["signature"] is None and record["signature_id"] is None:
+        conditions.append("category IS ?")
+        values.append(record["category"])
+
+    return conditions, values
+
+
+def _detect_suricata_alerts(
+    events: list[dict], connection: sqlite3.Connection
+) -> list[dict]:
+    """Evaluate the ``SURICATA_ALERT`` rule over stored Suricata alert events.
+
+    Each ``suricata_alert`` event becomes a Greywatch alert (rule_id
+    ``SURICATA_ALERT``) in the shared ``alerts`` table, preserving the
+    signature identity (``signature``/``signature_id``), network 5-tuple
+    (source/destination IPs and ports, protocol), category, and the mapped
+    severity. The original numeric Suricata severity (0-4) is kept on the event
+    dict as ``raw_severity`` and surfaced in the alert description; the full
+    original EVE record (incl. ``alert.severity``) is always retained in event
+    ``raw_message`` for investigation.
+
+    **Deduplication / aggregation.** A single incident is identified by the
+    key ``(signature_id|signature, source_ip, dest_ip, src_port,
+    dest_port, proto)``, plus ``category`` when the record carries no rule
+    identity (see :func:`_suricata_incident_conditions`). Repeated detections
+    of the same key within ``SURICATA_ALERT_WINDOW_MINUTES`` of the alert's
+    last activity aggregate into the existing open alert -- ``event_count``
+    grows, ``last_triggered_at`` advances, and the underlying evidence events
+    remain stored (never lost). The same key outside the window, or a different
+    key, starts a new alert, so distinct attacks remain distinguishable while a
+    sustained stream of identical IDS alerts cannot create an unbounded number
+    of duplicates.
+
+    Only newly-created alerts are returned (aggregations are silent, matching
+    the ``SSH_BRUTE_FORCE`` rule). All writes use the caller's connection and
+    transaction, so alerts are created atomically with their events.
+    """
+    new_alerts: list[dict] = []
+    # Maps alert id -> the in-memory alert dict (the same object appended to
+    # new_alerts) so a freshly-created alert's count/description stay in sync
+    # when later events in the same batch aggregate into it. This mirrors the
+    # SSH_BRUTE_FORCE rule, whose returned count reflects all matching events.
+    created: dict[int, dict] = {}
+    window = timedelta(minutes=SURICATA_ALERT_WINDOW_MINUTES)
+
+    for event in events:
+        if event.get("event_type") != "suricata_alert":
+            continue
+
+        ts = event["timestamp"]
+        window_start = (
+            datetime.fromisoformat(ts).astimezone(timezone.utc) - window
         ).isoformat(timespec="seconds")
 
-        for source_ip in sorted(source_ips):
-            count = connection.execute(
+        signature = event.get("signature")
+        signature_id = event.get("signature_id")
+        src_ip = event.get("source_ip") or "0.0.0.0"
+        dest_ip = event.get("dest_ip") or "0.0.0.0"
+        src_port = event.get("src_port")
+        dest_port = event.get("dest_port")
+        proto = event.get("proto") or "unknown"
+        category = event.get("category")
+        severity = event.get("severity") or "low"
+
+        # NULL-safe matching across the full incident key (shared with the
+        # evidence query). SQLite's ``IS`` matches both NULL=NULL and
+        # value=value, so optional fields that are absent on both sides (e.g.
+        # an unknown dest_port) still compare correctly.
+        key_conditions, key_values = _suricata_incident_conditions(
+            {
+                "signature_id": signature_id,
+                "signature": signature,
+                "source_ip": src_ip,
+                "dest_ip": dest_ip,
+                "src_port": src_port,
+                "dest_port": dest_port,
+                "proto": proto,
+                "category": category,
+            }
+        )
+        where = " AND ".join(
+            ["rule_id = ?", "status = 'open'", *key_conditions, "last_triggered_at >= ?"]
+        )
+        existing = connection.execute(
+            f"""
+            SELECT id, event_count, last_triggered_at
+            FROM alerts
+            WHERE {where}
+            ORDER BY last_triggered_at DESC
+            LIMIT 1
+            """,
+            (SURICATA_ALERT_RULE, *key_values, window_start),
+        ).fetchone()
+
+        if existing:
+            old_last = existing["last_triggered_at"]
+            # Keep last_triggered_at non-decreasing across out-of-order /
+            # replayed events so the dedup window stays monotonic.
+            new_last = ts if (old_last is None or ts > old_last) else old_last
+            new_count = existing["event_count"] + 1
+            connection.execute(
                 """
-                SELECT COUNT(*) AS total
-                FROM events
-                WHERE event_type = 'ssh_login_failed'
-                  AND source_ip = ?
-                  AND timestamp >= ?
-                  AND timestamp <= ?
-                """,
-                (source_ip, cutoff_text, now_text),
-            ).fetchone()["total"]
-
-            if count < BRUTE_FORCE_THRESHOLD:
-                continue
-
-            existing = connection.execute(
-                """
-                SELECT id
-                FROM alerts
-                WHERE rule_id = 'SSH_BRUTE_FORCE'
-                  AND source_ip = ?
-                  AND status = 'open'
-                LIMIT 1
-                """,
-                (source_ip,),
-            ).fetchone()
-
-            description = (
-                f"Observed {count} failed SSH login attempts from {source_ip} "
-                f"within {BRUTE_FORCE_WINDOW_MINUTES} minutes. "
-                "Investigate the source, targeted accounts, and any related "
-                "successful logins."
-            )
-
-            # Update an existing alert instead of creating duplicates.
-            # last_triggered_at records when the count was last recalculated
-            # so the evidence window grows with the alert instead of staying
-            # anchored to created_at.
-            if existing:
-                connection.execute(
-                    """
-                    UPDATE alerts
-                    SET description = ?, event_count = ?,
-                        last_triggered_at = ?
-                    WHERE id = ?
-                    """,
-                    (description, count, now_text, existing["id"]),
-                )
-                continue
-
-            cursor = connection.execute(
-                """
-                INSERT INTO alerts (
-                    created_at, rule_id, title, severity,
-                    source_ip, description, event_count, status,
-                    last_triggered_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)
+                UPDATE alerts
+                SET event_count = ?, last_triggered_at = ?, description = ?
+                WHERE id = ?
                 """,
                 (
-                    now_text,
-                    "SSH_BRUTE_FORCE",
-                    "Repeated SSH authentication failures",
-                    "high",
-                    source_ip,
-                    description,
-                    count,
-                    now_text,
+                    new_count,
+                    new_last,
+                    _suricata_alert_description(event, new_count),
+                    existing["id"],
                 ),
             )
+            # Keep the in-memory alert consistent with the DB write so that a
+            # batch of identical events reports the aggregated count/description
+            # (rather than the count-at-creation of 1).
+            cached = created.get(existing["id"])
+            if cached is not None:
+                cached["event_count"] = new_count
+                cached["last_triggered_at"] = new_last
+                cached["description"] = _suricata_alert_description(
+                    event, new_count
+                )
+            continue
 
-            new_alerts.append(
-                {
-                    "id": cursor.lastrowid,
-                    "created_at": now_text,
-                    "rule_id": "SSH_BRUTE_FORCE",
-                    "title": "Repeated SSH authentication failures",
-                    "severity": "high",
-                    "source_ip": source_ip,
-                    "description": description,
-                    "event_count": count,
-                    "status": "open",
-                    "last_triggered_at": now_text,
-                }
+        description = _suricata_alert_description(event, 1)
+        title = (
+            signature
+            or (
+                f"Suricata alert (signature id {signature_id})"
+                if signature_id is not None
+                else "Suricata alert"
             )
+        )
+        cursor = connection.execute(
+            """
+            INSERT INTO alerts (
+                created_at, rule_id, title, severity,
+                source_ip, description, event_count, status,
+                last_triggered_at,
+                dest_ip, src_port, dest_port, proto,
+                signature, signature_id, category
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ts,
+                SURICATA_ALERT_RULE,
+                title,
+                severity,
+                src_ip,
+                description,
+                1,
+                ts,
+                dest_ip,
+                src_port,
+                dest_port,
+                proto,
+                signature,
+                signature_id,
+                category,
+            ),
+        )
+
+        new_alerts.append(
+            {
+                "id": cursor.lastrowid,
+                "created_at": ts,
+                "rule_id": SURICATA_ALERT_RULE,
+                "title": title,
+                "severity": severity,
+                "source_ip": src_ip,
+                "description": description,
+                "event_count": 1,
+                "status": "open",
+                "last_triggered_at": ts,
+                "dest_ip": dest_ip,
+                "src_port": src_port,
+                "dest_port": dest_port,
+                "proto": proto,
+                "signature": signature,
+                "signature_id": signature_id,
+                "category": category,
+            }
+        )
+        created[cursor.lastrowid] = new_alerts[-1]
+
+    return new_alerts
+
+
+def ingest_lines(lines: list[str]) -> dict:
+    """Parse and persist event lines, then evaluate the SSH brute-force rule.
+
+    Behavior is unchanged from the original line-based ingestion path: each
+    line is run through ``parse_auth_line`` and unrecognized lines are ignored.
+    """
+    initialize_database()
+
+    events = [event for line in lines if (event := parse_auth_line(line))]
+
+    with _connection() as connection:
+        inserted_events, new_alerts = _store_events_and_detect(
+            events, connection
+        )
 
     return {
         "received": len(lines),
@@ -367,6 +750,57 @@ def ingest_lines(lines: list[str]) -> dict:
         "events": inserted_events,
         "alerts": new_alerts,
     }
+
+
+def ingest_events(events: list[dict]) -> dict:
+    """Persist already-normalized events and evaluate detection rules.
+
+    This is the structured-events entry point used by the journal collector.
+    Unlike ``ingest_lines``, callers pass normalized event dicts (the shape
+    produced by ``parse_auth_line`` or ``collector.parse_journal_record``)
+    directly, so structured journal fields such as exact timestamps and
+    provenance survive ingestion without a round-trip through text parsing.
+    """
+    initialize_database()
+
+    with _connection() as connection:
+        inserted_events, new_alerts = _store_events_and_detect(
+            events, connection
+        )
+
+    parsed = len(inserted_events)
+    return {
+        "received": parsed,
+        "parsed": parsed,
+        "ignored": 0,
+        "events": inserted_events,
+        "alerts": new_alerts,
+    }
+
+
+def get_collector_setting(key: str, default: str | None = None) -> str | None:
+    """Read a key/value pair from the collector_state table."""
+    initialize_database()
+    with _connection() as connection:
+        row = connection.execute(
+            "SELECT value FROM collector_state WHERE key = ?",
+            (key,),
+        ).fetchone()
+    return row["value"] if row is not None else default
+
+
+def set_collector_setting(key: str, value: str | None) -> None:
+    """Upsert a key/value pair into the collector_state table."""
+    initialize_database()
+    with _connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO collector_state (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
 
 
 def list_events(limit: int = 100) -> list[dict]:
@@ -422,12 +856,22 @@ def close_alert(alert_id: int) -> bool:
 
 
 def get_alert_detail(alert_id: int) -> dict | None:
-    """Return an alert and the failed SSH events in its evidence window.
+    """Return an alert and the evidence events in its investigation window.
 
     The window ends at the alert's last trigger time — updated whenever the
     detection count is recalculated — so the returned events stay consistent
-    with the alert's event_count as new failures arrive. Alerts migrated from
+    with the alert's event_count as new events arrive. Alerts migrated from
     an older schema fall back to created_at.
+
+    Evidence querying is rule-specific:
+    * ``SSH_BRUTE_FORCE`` — ``ssh_login_failed`` events from the alert's
+      ``source_ip`` within ``[last_triggered_at - 5m, last_triggered_at]``.
+    * ``SURICATA_ALERT`` — ``suricata_alert`` events matching the alert's
+      signature identity and network 5-tuple within
+      ``[created_at, last_triggered_at]``. Their ``raw_message`` preserves the
+      original EVE record (incl. the original numeric ``alert.severity``).
+    * Any other/unknown rule id yields an empty evidence set rather than a
+      wrong one, so new rules fail safe.
     """
     initialize_database()
 
@@ -441,28 +885,73 @@ def get_alert_detail(alert_id: int) -> dict | None:
             return None
 
         alert = dict(row)
-        window_end = datetime.fromisoformat(
-            alert.get("last_triggered_at") or alert["created_at"]
-        )
-        start = (
-            window_end - timedelta(minutes=BRUTE_FORCE_WINDOW_MINUTES)
-        ).astimezone(timezone.utc).isoformat(timespec="seconds")
-        end = window_end.astimezone(timezone.utc).isoformat(
-            timespec="seconds"
-        )
+        rule_id = alert.get("rule_id")
 
-        rows = connection.execute(
-            """
-            SELECT *
-            FROM events
-            WHERE source_ip = ?
-              AND event_type = 'ssh_login_failed'
-              AND timestamp >= ?
-              AND timestamp <= ?
-            ORDER BY timestamp ASC
-            """,
-            (alert["source_ip"], start, end),
-        ).fetchall()
+        if rule_id == "SSH_BRUTE_FORCE":
+            window_end = datetime.fromisoformat(
+                alert.get("last_triggered_at") or alert["created_at"]
+            )
+            start = (
+                window_end - timedelta(minutes=BRUTE_FORCE_WINDOW_MINUTES)
+            ).astimezone(timezone.utc).isoformat(timespec="seconds")
+            end = window_end.astimezone(timezone.utc).isoformat(
+                timespec="seconds"
+            )
+
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM events
+                WHERE source_ip = ?
+                  AND event_type = 'ssh_login_failed'
+                  AND timestamp >= ?
+                  AND timestamp <= ?
+                ORDER BY timestamp ASC
+                """,
+                (alert["source_ip"], start, end),
+            ).fetchall()
+
+        elif rule_id == SURICATA_ALERT_RULE:
+            # Evidence = the Suricata alert events aggregated into this alert,
+            # covering its full lifetime [created_at, last_triggered_at]. The
+            # incident key is built by the SAME helper used when matching an
+            # existing alert at ingestion time, so evidence can never be scoped
+            # differently from the alert it belongs to.
+            window_end = datetime.fromisoformat(
+                alert.get("last_triggered_at") or alert["created_at"]
+            )
+            start = datetime.fromisoformat(
+                alert.get("created_at") or alert.get("last_triggered_at")
+            ).astimezone(timezone.utc).isoformat(timespec="seconds")
+            end = window_end.astimezone(timezone.utc).isoformat(
+                timespec="seconds"
+            )
+
+            key_conditions, key_values = _suricata_incident_conditions(alert)
+            where = " AND ".join(
+                [
+                    "event_type = 'suricata_alert'",
+                    *key_conditions,
+                    "timestamp >= ?",
+                    "timestamp <= ?",
+                ]
+            )
+            rows = connection.execute(
+                f"""
+                SELECT *
+                FROM events
+                WHERE {where}
+                ORDER BY timestamp ASC
+                """,
+                (*key_values, start, end),
+            ).fetchall()
+
+        else:
+            # Unknown / future rule: fail safe — no rule-specific evidence
+            # query is attempted rather than returning wrong evidence.
+            start = alert.get("created_at")
+            end = alert.get("last_triggered_at") or alert.get("created_at")
+            rows = []
 
     return {
         "alert": alert,
