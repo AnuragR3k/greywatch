@@ -13,6 +13,7 @@ from .siem import (
     list_events,
 )
 from . import collector
+from . import suricata
 
 app = FastAPI(
     title="Greywatch API",
@@ -101,6 +102,38 @@ def journal_collect():
     """
     config = collector.get_config()
     result = collector.collect_once(config)
+    return {
+        "records_seen": result.records_seen,
+        "events_ingested": result.events_ingested,
+        "alerts": result.new_alerts,
+        "fallback_used": result.fallback_used,
+        "errors": result.errors,
+    }
+
+
+@app.get("/api/v1/suricata/status", tags=["suricata"])
+def suricata_status():
+    """Return Suricata EVE collector checkpoint state.
+
+    Suricata collection is optional and disabled by default. The collector
+    state (`last_offset`, `last_event_ts`, `events_ingested`, `last_run_at`)
+    lives in the shared `collector_state` table alongside the journal
+    collector. A missing EVE file is reported here as ``last_offset: null``.
+    """
+    return suricata.status()
+
+
+@app.post("/api/v1/suricata/collect", tags=["suricata"])
+def suricata_collect():
+    """Trigger a single Suricata EVE collection cycle.
+
+    Useful for manual collection and verification. Continuous collection is
+    controlled by ``GREYWATCH_SURICATA_ENABLED``; this endpoint runs one cycle
+    regardless of that flag. If the EVE file is missing or unreadable the
+    error is reported in `errors` (HTTP 200) rather than raised.
+    """
+    config = suricata.get_config()
+    result = suricata.collect_once(config)
     return {
         "records_seen": result.records_seen,
         "events_ingested": result.events_ingested,
