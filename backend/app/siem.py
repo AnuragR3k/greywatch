@@ -72,12 +72,32 @@ SUCCESSFUL_LOGIN = re.compile(
 
 @contextmanager
 def _connection():
-    """Open a database connection and safely commit or roll back changes."""
+    """Open a database connection and safely commit or roll back changes.
+
+    WAL mode lets readers and one writer proceed concurrently instead of
+    serializing all access behind a single exclusive lock (the default
+    DELETE journal mode). The setting is persistent -- once the database is
+    switched to WAL it stays WAL -- so subsequent connections see it as a
+    no-op. ``synchronous=NORMAL`` is safe with WAL (the WAL file is fsync'd
+    at checkpoint, not on every commit) and avoids a per-commit fsync.
+    ``busy_timeout`` makes a contended writer wait instead of immediately
+    raising ``database is locked``.
+    """
     db_path = Path(os.environ.get("GREYWATCH_DB", str(DEFAULT_DB_PATH)))
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     connection = sqlite3.connect(db_path, timeout=5)
     connection.row_factory = sqlite3.Row
+
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError:
+        # Another connection holds a lock that blocks the WAL switch;
+        # WAL may already be active from an earlier connection. Retry
+        # on the next _connection() call.
+        pass
+    connection.execute("PRAGMA busy_timeout=5000")
+    connection.execute("PRAGMA synchronous=NORMAL")
 
     try:
         yield connection

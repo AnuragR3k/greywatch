@@ -1,4 +1,5 @@
 import sqlite3
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -7,6 +8,7 @@ from fastapi.testclient import TestClient
 from backend.app.main import app
 from backend.app.siem import (
     _connection,
+    ingest_lines,
     initialize_database,
     parse_auth_line,
 )
@@ -605,3 +607,140 @@ def test_brute_force_threshold_is_per_source_ip(tmp_path, monkeypatch):
     assert len(body["alerts"]) == 2
     assert {a["source_ip"] for a in body["alerts"]} == {ip_a, ip_b}
     assert client.get("/api/v1/alerts?status=all&limit=100").json()["count"] == 2
+
+
+# --------------------------------------------------------------------------- #
+# SQLite concurrency and rollback-journal reliability (F3)
+# --------------------------------------------------------------------------- #
+
+
+def _make_lines(count: int, source_ip: str, port_base: int) -> list[str]:
+    return [
+        f"sshd[410{i}]: Failed password for user{i} "
+        f"from {source_ip} port {port_base + i} ssh2"
+        for i in range(count)
+    ]
+
+
+def test_connection_uses_wal_mode(tmp_path, monkeypatch):
+    """_connection() switches the database to WAL journal mode."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "walmode.db"))
+    initialize_database()
+
+    with _connection() as conn:
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+
+    assert mode == "wal", f"expected WAL mode, got {mode!r}"
+
+
+def test_concurrent_ingest_lines_succeeds(tmp_path, monkeypatch):
+    """Concurrent writers on the same database do not deadlock or fail.
+
+    With the default DELETE journal mode, a write transaction takes an
+    exclusive lock and blocks all other readers/writers, so concurrent
+    ingestion from the API and collectors risks ``database is locked``.
+    WAL mode allows one writer plus concurrent readers.
+    """
+    db_path = str(tmp_path / "concurrent.db")
+    monkeypatch.setenv("GREYWATCH_DB", db_path)
+    initialize_database()
+
+    errors: list[BaseException] = []
+    results: list[dict] = []
+    lock = threading.Lock()
+
+    def ingest(tag: int) -> None:
+        try:
+            lines = _make_lines(3, f"10.0.0.{tag}", 54000 + tag * 100)
+            result = ingest_lines(lines)
+            with lock:
+                results.append(result)
+        except BaseException as exc:  # noqa: BLE001 - collect all failures
+            with lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=ingest, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert not threads or all(not t.is_alive() for t in threads), "a thread hung"
+    assert not errors, f"concurrent ingest raised: {errors}"
+    assert len(results) == 8, f"expected 8 results, got {len(results)}"
+
+    total_events = sum(r["parsed"] for r in results)
+    with _connection() as conn:
+        count = conn.execute("SELECT COUNT(*) AS n FROM events").fetchone()["n"]
+
+    assert count == total_events == 24, (count, total_events)
+
+
+def test_rollback_on_failed_transaction_leaves_no_partial_data(
+    tmp_path, monkeypatch
+):
+    """A failed write in the middle of a transaction rolls back everything.
+
+    The ``_connection()`` context manager rolls back on exception, so no
+    partial batch is ever visible to readers. This is the mechanism
+    ``_store_events_and_detect`` relies on: if any INSERT in a batch fails,
+    the whole batch (events + alerts + checkpoint) is rolled back.
+    """
+    db_path = str(tmp_path / "rollback.db")
+    monkeypatch.setenv("GREYWATCH_DB", db_path)
+    initialize_database()
+
+    # Persist one good event first, so we can tell whether the failed
+    # transaction left anything behind.
+    with _connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO events
+                (timestamp, host, event_type, username, source_ip,
+                 severity, raw_message)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "2026-01-01T00:00:00+00:00",
+                "preexisting-host",
+                "ssh_login_failed",
+                "olduser",
+                "10.0.0.99",
+                "medium",
+                "preexisting message",
+            ),
+        )
+
+    # Open a transaction, insert one row, then raise to trigger rollback.
+    try:
+        with _connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO events
+                    (timestamp, host, event_type, username, source_ip,
+                     severity, raw_message)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "2026-01-01T00:00:01+00:00",
+                    "failed-batch-host",
+                    "ssh_login_failed",
+                    "batchuser",
+                    "10.0.0.10",
+                    "medium",
+                    "should not be visible",
+                ),
+            )
+            raise RuntimeError("simulated batch failure")
+    except RuntimeError:
+        pass
+
+    # The preexisting event remains, but the failed batch is fully rolled back.
+    with _connection() as conn:
+        count = conn.execute("SELECT COUNT(*) AS n FROM events").fetchone()["n"]
+        rows = conn.execute(
+            "SELECT raw_message FROM events ORDER BY id"
+        ).fetchall()
+
+    assert count == 1, f"expected exactly 1 event, got {count}: {rows}"
+    assert rows[0]["raw_message"] == "preexisting message"
