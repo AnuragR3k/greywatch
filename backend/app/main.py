@@ -113,6 +113,27 @@ def _sanitize_errors(errors: list[str]) -> list[str]:
     return [_sanitize_error_message(e) for e in errors]
 
 
+def get_api_token() -> str | None:
+    """Return the configured API token, or ``None`` when unset or empty.
+
+    This is the single point of truth for the shared-secret token used by both
+    the trust boundary (access control) and the rate limiter (client identity
+    in token mode). Centralizing token retrieval here prevents the two
+    consumers from diverging if the environment variable is ever read
+    differently elsewhere.
+
+    * Unset or empty string -> ``None`` (no token configured).
+    * Any non-empty value (including whitespace-only) -> that value, returned
+      as-is. A whitespace-only token is truthy and enables token mode, but no
+      caller can ever authenticate against it because the Bearer path strips
+      whitespace from the provided value before comparison -- fail-closed.
+    """
+    token = os.environ.get("GREYWATCH_API_TOKEN")
+    if not token:
+        return None
+    return token
+
+
 class MaxBodySizeMiddleware:
     """ASGI middleware that rejects request bodies exceeding a byte limit.
 
@@ -326,7 +347,7 @@ class RateLimitMiddleware:
         In loopback mode the key is the ASGI peer host. The raw token is used
         only as an internal dictionary key and is never logged or returned.
         """
-        token = os.environ.get("GREYWATCH_API_TOKEN")
+        token = get_api_token()
         if token:
             return ("token", token)
         client = scope.get("client")
@@ -494,7 +515,7 @@ def _check_trust_boundary(request: Request) -> tuple[int, str] | None:
       from the ASGI connection (``request.client.host``); forwarding headers
       are not consulted, so they cannot spoof loopback.
     """
-    token = os.environ.get("GREYWATCH_API_TOKEN")
+    token = get_api_token()
     if token:
         provided = request.headers.get("Authorization", "")
         credentials_ok = False
