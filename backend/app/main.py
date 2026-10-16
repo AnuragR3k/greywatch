@@ -19,11 +19,118 @@ from .siem import (
 from . import collector
 from . import suricata
 
+# Maximum HTTP request body size, in bytes. Configurable via the
+# ``GREYWATCH_MAX_REQUEST_BYTES`` environment variable; defaults to 1 MiB.
+# A value of 0 or negative disables the limit (explicit operator choice).
+# Invalid (non-numeric) values fall back to this safe default and never
+# silently disable the protection.
+MAX_REQUEST_BYTES_DEFAULT = 1024 * 1024  # 1 MiB = 1,048,576 bytes
+
+
+def get_max_request_bytes() -> int | None:
+    """Return the max request-body size in bytes, or ``None`` to disable.
+
+    Reads ``GREYWATCH_MAX_REQUEST_BYTES`` from the environment on every call
+    so tests stay hermetic via ``monkeypatch.setenv``.
+
+    * Unset or empty -> ``MAX_REQUEST_BYTES_DEFAULT`` (1 MiB).
+    * Positive integer -> that limit.
+    * Zero or negative -> ``None`` (limit disabled by explicit operator choice).
+    * Non-numeric -> ``MAX_REQUEST_BYTES_DEFAULT`` (safe default; never
+      silently disable the protection because configuration parsing failed).
+    """
+    raw = os.environ.get("GREYWATCH_MAX_REQUEST_BYTES", "")
+    if not raw:
+        return MAX_REQUEST_BYTES_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        return MAX_REQUEST_BYTES_DEFAULT
+    if value <= 0:
+        return None
+    return value
+
+
+class MaxBodySizeMiddleware:
+    """ASGI middleware that rejects request bodies exceeding a byte limit.
+
+    The limit is enforced against the *actual bytes received* as they stream
+    in through ASGI ``http.request`` messages, not the ``Content-Length``
+    header. Missing, malformed, or misleading length headers are therefore
+    handled safely: we count real bytes and stop reading as soon as the limit
+    is exceeded, so an unbounded body is never buffered.
+
+    When the limit is exceeded, an HTTP ``413 Payload Too Large`` response is
+    sent directly and the inner application is never invoked. When the limit
+    is not exceeded, the bounded body is replayed to the inner application.
+    """
+
+    def __init__(self, app, max_bytes: int | None = None):
+        self.app = app
+        # A limit of 0 or negative is treated as "disabled" (no limit).
+        if max_bytes is not None and max_bytes <= 0:
+            max_bytes = None
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or self.max_bytes is None:
+            await self.app(scope, receive, send)
+            return
+
+        max_bytes = self.max_bytes
+        received = 0
+        chunks: list[bytes] = []
+
+        while True:
+            message = await receive()
+            message_type = message["type"]
+            if message_type == "http.request":
+                body = message.get("body", b"")
+                received += len(body)
+                chunks.append(body)
+                if received > max_bytes:
+                    await send(
+                        {
+                            "type": "http.response.start",
+                            "status": 413,
+                            "headers": [[b"content-type", b"application/json"]],
+                        }
+                    )
+                    await send(
+                        {
+                            "type": "http.response.body",
+                            "body": b'{"detail":"Request body too large"}',
+                        }
+                    )
+                    return
+                if not message.get("more_body"):
+                    break
+            elif message_type == "http.disconnect":
+                await self.app(scope, receive, send)
+                return
+            else:
+                await self.app(scope, receive, send)
+                return
+
+        full_body = b"".join(chunks)
+
+        async def replay_receive():
+            return {
+                "type": "http.request",
+                "body": full_body,
+                "more_body": False,
+            }
+
+        await self.app(scope, replay_receive, send)
+
+
 app = FastAPI(
     title="Greywatch API",
     description="Open-source security monitoring and SIEM platform",
     version="0.1.0",
 )
+
+app.add_middleware(MaxBodySizeMiddleware, max_bytes=get_max_request_bytes())
 
 
 class IngestRequest(BaseModel):

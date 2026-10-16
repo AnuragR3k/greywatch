@@ -180,6 +180,35 @@ X-API-Key: YOUR_TOKEN
 
 Requests with missing or invalid credentials are rejected.
 
+### Request body limits
+
+To prevent excessively large HTTP request bodies from consuming excessive
+memory or resources, Greywatch enforces a configurable maximum request-body
+size on every non-GET request body.
+
+The limit is controlled by the ``GREYWATCH_MAX_REQUEST_BYTES`` environment
+variable:
+
+| Value | Behavior |
+|-------|----------|
+| unset | Default limit of 1 MiB (1,048,576 bytes) |
+| positive integer | Custom limit in bytes |
+| 0 or negative | Limit disabled (no body-size check) |
+| non-numeric | Falls back to the 1 MiB default (never silently disabled) |
+
+Requests whose body exceeds the limit are rejected with HTTP **413 Payload Too
+Large** and a JSON body ``{"detail": "Request body too large"}``.
+
+The limit is enforced against the **actual bytes received** as the request
+streams in, not the ``Content-Length`` header. Missing, malformed, or
+misleading length headers are handled safely: an unbounded body is never
+buffered before the size check.
+
+The limit applies to all endpoints with request bodies, including
+``POST /api/v1/events/ingest``, ``POST /api/v1/journal/collect``,
+``POST /api/v1/suricata/collect``, and ``POST /api/v1/alerts/{id}/close``.
+GET requests and the public endpoints ``/`` and ``/health`` are unaffected.
+
 ### Dashboard deployment
 
 The static JavaScript dashboard cannot safely store a server-side secret. Remote dashboard access therefore requires an authentication-terminating reverse proxy and appropriate deployment configuration.

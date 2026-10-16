@@ -208,6 +208,26 @@ Only features verified in the codebase are documented below:
 - Asserts: 5 lines parsed, 5 events stored & queryable, exactly 1 `SSH_BRUTE_FORCE` alert (`high`/`open`/source_ip/`event_count=5`), 5 evidence events in window, and `source=NULL` provenance (so test events are distinguishable from journal/Suricata telemetry).
 - Fully self-cleaning (`trap ... EXIT` kills uvicorn and deletes its own temp DB). Run with `./scripts/live_ssh_brute_force_test.sh`; see `docs/LIVE_THREAT_TEST.md`.
 
+### 2.13 Configurable API request-body limits (`backend/app/main.py`)
+- `MaxBodySizeMiddleware` ASGI middleware enforces a maximum HTTP request-body size on every request with a body.
+- Configured via `GREYWATCH_MAX_REQUEST_BYTES` environment variable:
+  - Unset → default 1 MiB (1,048,576 bytes).
+  - Positive integer → custom byte limit.
+  - Zero or negative → limit disabled (explicit operator choice).
+  - Non-numeric → falls back to the 1 MiB default; never silently disabled.
+- Oversized requests are rejected with HTTP `413 Payload Too Large` and
+  `{"detail": "Request body too large"}`.
+- Enforcement counts **actual bytes received** as they stream through ASGI
+  `http.request` messages, not the `Content-Length` header. Missing,
+  malformed, or misleading length headers are handled safely; an unbounded
+  body is never buffered before the size check.
+- Applies to all endpoints with request bodies (ingest, journal collect,
+  Suricata collect, alert close). GET requests and the public endpoints
+  `/` and `/health` are unaffected.
+- Trust-boundary behavior is unchanged: the trust boundary middleware runs
+  outside (before) the body-limit middleware, so unauthorized requests are
+  rejected before their bodies are read.
+
 ---
 
 ## 3. Current Architecture
