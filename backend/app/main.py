@@ -5,6 +5,7 @@ import ipaddress
 import logging
 import math
 import os
+import re
 import time
 from dataclasses import dataclass
 from typing import Callable, Literal
@@ -93,6 +94,23 @@ def _log_denied_request(
         )
     except Exception:
         pass
+
+
+def _sanitize_error_message(message: str) -> str:
+    """Return a client-safe error message with filesystem paths removed.
+
+    Internal collector error messages may contain filesystem paths (EVE file
+    paths, journalctl command paths, journalctl stderr). Replace Unix absolute
+    paths with a generic placeholder so API clients do not receive internal
+    implementation details. Full details remain available in server-side logs
+    (run_loop / _run_cycle log the raw ``result.errors``).
+    """
+    return re.sub(r"/[^\s\"']+", "[path]", message)
+
+
+def _sanitize_errors(errors: list[str]) -> list[str]:
+    """Return a list of client-safe error messages."""
+    return [_sanitize_error_message(e) for e in errors]
 
 
 class MaxBodySizeMiddleware:
@@ -633,7 +651,7 @@ def journal_collect():
         "events_ingested": result.events_ingested,
         "alerts": result.new_alerts,
         "fallback_used": result.fallback_used,
-        "errors": result.errors,
+        "errors": _sanitize_errors(result.errors),
     }
 
 
@@ -668,5 +686,5 @@ def suricata_collect():
         "events_ingested": result.events_ingested,
         "alerts": result.new_alerts,
         "fallback_used": result.fallback_used,
-        "errors": result.errors,
+        "errors": _sanitize_errors(result.errors),
     }

@@ -524,6 +524,22 @@ def test_collect_endpoint_missing_file_reports_error(_db, tmp_path, monkeypatch)
     assert body["errors"]
 
 
+def test_collect_endpoint_missing_file_sanitizes_path(_db, tmp_path, monkeypatch):
+    """Missing EVE file error must not expose the configured filesystem path
+    in the API response. Full details remain in server-side logs."""
+    eve_path = str(tmp_path / "deep" / "nested" / "eve.json")
+    monkeypatch.setenv("GREYWATCH_SURICATA_EVE_PATH", eve_path)
+    resp = client.post("/api/v1/suricata/collect")
+    assert resp.status_code == 200  # error is reported, not raised
+    body = resp.json()
+    assert body["events_ingested"] == 0
+    assert body["records_seen"] == 0
+    assert body["errors"], "expected failure to be reported"
+    for err in body["errors"]:
+        assert eve_path not in err, f"filesystem path leaked in error: {err}"
+        assert "/deep/" not in err, f"raw path segment not sanitized: {err}"
+
+
 def test_run_loop_no_op_when_disabled(_db, tmp_path, monkeypatch):
     """An enabled=False config never collects (no EVE file even required)."""
     monkeypatch.setenv("GREYWATCH_SURICATA_EVE_PATH", str(tmp_path / "eve.json"))

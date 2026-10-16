@@ -756,6 +756,31 @@ def test_journal_collect_falls_back_when_journalctl_missing(_db, monkeypatch):
     assert body["errors"]
 
 
+def test_journal_collect_error_sanitizes_command_path(_db, monkeypatch):
+    """Journalctl error must not expose the configured command filesystem path
+    in the API response."""
+
+    def _raise_missing(args, **kwargs):
+        raise JournalctlError(
+            "journalctl binary not found: /usr/local/bin/custom-journalctl. "
+            "Install systemd-journald or set GREYWATCH_JOURNAL_COMMAND."
+        )
+
+    monkeypatch.setattr(collector_mod, "get_config", lambda: collector_mod.CollectorConfig())
+    monkeypatch.setattr(collector_mod, "run_journalctl", _raise_missing)
+
+    resp = client.post("/api/v1/journal/collect")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["events_ingested"] == 0
+    assert body["errors"], "expected failure to be reported"
+    for err in body["errors"]:
+        assert "/usr/local/bin/custom-journalctl" not in err, (
+            f"command path leaked in error: {err}"
+        )
+        assert "[path]" in err, f"path not replaced with placeholder: {err}"
+
+
 # --------------------------------------------------------------------------- #
 # Migration: legacy events table gains the source column
 # --------------------------------------------------------------------------- #
