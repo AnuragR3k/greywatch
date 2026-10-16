@@ -228,6 +228,29 @@ Only features verified in the codebase are documented below:
   outside (before) the body-limit middleware, so unauthorized requests are
   rejected before their bodies are read.
 
+- `RateLimitMiddleware` ASGI middleware enforces a per-client request rate
+  limit using a token bucket, running **after** the trust boundary so auth
+  failures (401/403) never consume rate-limit tokens. Configured via
+  `GREYWATCH_RATE_LIMIT_*` environment variables:
+  - `GREYWATCH_RATE_LIMIT_ENABLED` (default `1`): `0`/`false`/`no` disables;
+    invalid values fall back to enabled (never silently disabled).
+  - `GREYWATCH_RATE_LIMIT_INGESTION` (default `60`): req/min for
+    `POST /api/v1/events/ingest`.
+  - `GREYWATCH_RATE_LIMIT_READS` (default `120`): req/min for read endpoints.
+  - `GREYWATCH_RATE_LIMIT_COLLECTOR` (default `30`): req/min for journal and
+    Suricata collect endpoints.
+  - `GREYWATCH_RATE_LIMIT_ALERT_CLOSE` (default `30`): req/min for alert close.
+  - `GREYWATCH_RATE_LIMIT_BURST_MULTIPLIER` (default `2`): burst = limit ×
+    multiplier.
+  - Overshoot returns HTTP `429 Too Many Requests` with `{"detail": "Rate
+    limit exceeded"}` and a `Retry-After` header computed from an injectable
+    monotonic clock.
+  - Client identity is the ASGI peer host, or the shared token value in token
+    mode; forwarding headers are never consulted.
+  - The bucket store is bounded by `max_entries` (default 10,000) with LRU
+    eviction, capping memory growth.
+  - Public endpoints `/` and `/health` are never rate limited.
+
 ---
 
 ## 3. Current Architecture

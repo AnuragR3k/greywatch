@@ -33,6 +33,20 @@ from backend.app.siem import DEFAULT_DB_PATH, is_production_db_path
 
 
 @pytest.fixture(autouse=True)
+def _disable_rate_limit_for_global_app(monkeypatch):
+    """Disable rate limiting on the shared global app for existing tests.
+
+    The global FastAPI app registers a single ``RateLimitMiddleware`` whose
+    bucket store is shared across every ``TestClient(app)`` test in the
+    session. Existing tests are not rate-limit tests; disabling here prevents
+    cross-test token depletion and order-dependent 429 flakiness. The new
+    rate-limiter tests construct fresh middleware instances with explicit
+    config and are unaffected (explicit config takes precedence over env).
+    """
+    monkeypatch.setenv("GREYWATCH_RATE_LIMIT_ENABLED", "0")
+
+
+@pytest.fixture(autouse=True)
 def _isolate_test_database(tmp_path, monkeypatch):
     """Redirect unset ``GREYWATCH_DB`` to a temp DB; refuse an explicit prod path."""
     env_db = os.environ.get("GREYWATCH_DB")

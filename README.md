@@ -209,6 +209,41 @@ The limit applies to all endpoints with request bodies, including
 ``POST /api/v1/suricata/collect``, and ``POST /api/v1/alerts/{id}/close``.
 GET requests and the public endpoints ``/`` and ``/health`` are unaffected.
 
+### API rate limiting
+
+To prevent a single client from issuing an excessive number of requests,
+Greywatch rate limits protected API endpoints using a token-bucket algorithm.
+Rate limiting is enforced **after** API authentication, so failed-auth
+responses (401/403) never consume rate-limit tokens.
+
+The limiter is controlled by the ``GREYWATCH_RATE_LIMIT_*`` environment
+variables:
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| ``GREYWATCH_RATE_LIMIT_ENABLED`` | ``1`` | ``0``/``false``/``no`` disables rate limiting (explicit operator choice) |
+| ``GREYWATCH_RATE_LIMIT_INGESTION`` | ``60`` | requests/min for ``POST /api/v1/events/ingest`` |
+| ``GREYWATCH_RATE_LIMIT_READS`` | ``120`` | requests/min for GET events/alerts/status endpoints |
+| ``GREYWATCH_RATE_LIMIT_COLLECTOR`` | ``30`` | requests/min for journal/suricata collect endpoints |
+| ``GREYWATCH_RATE_LIMIT_ALERT_CLOSE`` | ``30`` | requests/min for ``POST /api/v1/alerts/{id}/close`` |
+| ``GREYWATCH_RATE_LIMIT_BURST_MULTIPLIER`` | ``2`` | burst capacity = limit × multiplier |
+
+Requests whose rate exceeds the limit are rejected with HTTP **429 Too Many
+Requests**, a JSON body ``{"detail": "Rate limit exceeded"}``, and a
+``Retry-After`` header indicating seconds to wait before the next request is
+allowed.
+
+Invalid or non-positive values fall back to the documented safe defaults and
+never silently disable rate limiting; disabling must be an explicit operator
+choice.
+
+Client identity is derived solely from the ASGI peer (``scope["client"]``) or,
+in token mode (``GREYWATCH_API_TOKEN`` set), the shared token value itself.
+Forwarding headers (``X-Forwarded-For``, etc.) are **never** consulted for
+client identity, so they cannot be spoofed to evade rate limiting.
+
+The public endpoints ``/`` and ``/health`` are never rate limited.
+
 ### Dashboard deployment
 
 The static JavaScript dashboard cannot safely store a server-side secret. Remote dashboard access therefore requires an authentication-terminating reverse proxy and appropriate deployment configuration.

@@ -2,8 +2,11 @@
 
 import hmac
 import ipaddress
+import math
 import os
-from typing import Literal
+import time
+from dataclasses import dataclass
+from typing import Callable, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
@@ -124,11 +127,215 @@ class MaxBodySizeMiddleware:
         await self.app(scope, replay_receive, send)
 
 
+# --------------------------------------------------------------------------- #
+# Configurable API rate limiting (security review F2)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class RateLimitConfig:
+    """Runtime configuration for the API rate limiter.
+
+    Limits are expressed as requests per minute. The burst capacity for a
+    category is ``limit * burst_multiplier``.
+    """
+
+    enabled: bool = True
+    ingestion: int = 60      # POST /api/v1/events/ingest
+    reads: int = 120         # GET /api/v1/events, /alerts, /alerts/{id}, status
+    collector: int = 30      # POST /api/v1/journal/collect, /suricata/collect
+    alert_close: int = 30    # POST /api/v1/alerts/{id}/close
+    burst_multiplier: int = 2
+
+
+def _parse_positive_int(raw: str | None, default: int) -> int:
+    """Parse a positive integer, returning ``default`` on any failure.
+
+    Non-numeric, empty, zero, or negative values all fall back to ``default``
+    so that misconfiguration never silently disables protection.
+    """
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _parse_bool(raw: str | None, default: bool) -> bool:
+    """Parse a boolean environment variable; invalid values fall back to default."""
+    if raw is None:
+        return default
+    v = raw.strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def get_rate_limit_config() -> RateLimitConfig:
+    """Return the rate-limiter configuration from the environment.
+
+    Reads on every call so tests stay hermetic via ``monkeypatch.setenv``.
+    Invalid values fall back to the documented safe defaults and never
+    silently disable rate limiting. Disabling must be an explicit operator
+    choice (``GREYWATCH_RATE_LIMIT_ENABLED=0/false/no``).
+    """
+    return RateLimitConfig(
+        enabled=_parse_bool(os.environ.get("GREYWATCH_RATE_LIMIT_ENABLED"), True),
+        ingestion=_parse_positive_int(
+            os.environ.get("GREYWATCH_RATE_LIMIT_INGESTION"), 60
+        ),
+        reads=_parse_positive_int(os.environ.get("GREYWATCH_RATE_LIMIT_READS"), 120),
+        collector=_parse_positive_int(
+            os.environ.get("GREYWATCH_RATE_LIMIT_COLLECTOR"), 30
+        ),
+        alert_close=_parse_positive_int(
+            os.environ.get("GREYWATCH_RATE_LIMIT_ALERT_CLOSE"), 30
+        ),
+        burst_multiplier=_parse_positive_int(
+            os.environ.get("GREYWATCH_RATE_LIMIT_BURST_MULTIPLIER"), 2
+        ),
+    )
+
+
+# Category of each protected path, used to select the per-category limit.
+_PATH_CATEGORIES: dict[str, str] = {
+    "/api/v1/events/ingest": "ingestion",
+    "/api/v1/journal/collect": "collector",
+    "/api/v1/suricata/collect": "collector",
+    "/api/v1/alerts/{alert_id}/close": "alert_close",
+}
+
+
+def _category_for_path(path: str) -> str | None:
+    """Return the rate-limit category for a path, or None if it is exempt."""
+    if path in PUBLIC_PATHS:
+        return None
+    if path.startswith("/api/v1/alerts/") and path.endswith("/close"):
+        return "alert_close"
+    return _PATH_CATEGORIES.get(path, "reads")
+
+
+class RateLimitMiddleware:
+    """ASGI middleware that rate limits requests using a token bucket.
+
+    A token bucket is kept per client identity. Each allowed request consumes
+    one token; tokens refill at the configured rate (requests per minute).
+    When the bucket is empty the request is rejected with HTTP 429 and a
+    ``Retry-After`` header.
+
+    The bucket store is bounded by ``max_entries``; when full the least
+    recently used entry is evicted so memory growth is capped. The middleware
+    never logs, exposes, or returns the shared API token. Client identity is
+    derived solely from the ASGI peer (``scope["client"]``) or, in token mode,
+    the shared token value itself -- forwarding headers are never consulted.
+    """
+
+    def __init__(
+        self,
+        app,
+        config: RateLimitConfig | None = None,
+        clock: Callable[[], float] | None = None,
+        max_entries: int = 10000,
+    ):
+        self.app = app
+        # ``config`` may be ``None``: in that case configuration is resolved
+        # from the environment on every request (used by the shared global
+        # app so tests can flip it via conftest). When an explicit config is
+        # passed (as focused tests do), it takes precedence.
+        self.config = config
+        self.clock = clock or time.monotonic
+        self._max_entries = max(1, int(max_entries))
+        #: bucket key -> [tokens, last_update]
+        self._buckets: dict[object, list] = {}
+
+    def _client_key(self, scope) -> object:
+        """Derive a rate-limit key from the request, never forwarding headers.
+
+        In token mode (``GREYWATCH_API_TOKEN`` set) all authenticated callers
+        share one bucket keyed by the token value itself (shared-secret model).
+        In loopback mode the key is the ASGI peer host. The raw token is used
+        only as an internal dictionary key and is never logged or returned.
+        """
+        token = os.environ.get("GREYWATCH_API_TOKEN")
+        if token:
+            return ("token", token)
+        client = scope.get("client")
+        host = client[0] if client else None
+        return ("ip", host or "unknown")
+
+    def _limit_for_path(self, path: str, cfg: RateLimitConfig) -> int | None:
+        """Return the requests-per-minute limit for a path, or None if exempt."""
+        category = _category_for_path(path)
+        if category is None:
+            return None
+        return getattr(cfg, category)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        cfg = self.config or get_rate_limit_config()
+        if not cfg.enabled:
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "/")
+        limit = self._limit_for_path(path, cfg)
+        if limit is None:
+            # Public path or otherwise exempt.
+            await self.app(scope, receive, send)
+            return
+
+        key = self._client_key(scope)
+        now = self.clock()
+        refill_per_sec = limit / 60.0
+        capacity = limit * cfg.burst_multiplier
+
+        tokens, last_update = self._buckets.get(key, [capacity, now])
+        elapsed = max(0.0, now - last_update)
+        tokens = min(capacity, tokens + elapsed * refill_per_sec)
+        last_update = now
+
+        if tokens < 1.0:
+            retry_after = max(1, math.ceil((1.0 - tokens) / refill_per_sec))
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 429,
+                    "headers": [
+                        [b"content-type", b"application/json"],
+                        [b"retry-after", str(retry_after).encode("ascii")],
+                    ],
+                }
+            )
+            await send(
+                {"type": "http.response.body", "body": b'{"detail":"Rate limit exceeded"}'}
+            )
+            return
+
+        tokens -= 1.0
+        self._buckets[key] = [tokens, last_update]
+
+        # Bound the store: evict the least recently used entry when full.
+        if len(self._buckets) > self._max_entries:
+            oldest = min(self._buckets.items(), key=lambda kv: kv[1][1])
+            del self._buckets[oldest[0]]
+
+        await self.app(scope, receive, send)
+
+
 app = FastAPI(
     title="Greywatch API",
     description="Open-source security monitoring and SIEM platform",
     version="0.1.0",
 )
+
+app.add_middleware(RateLimitMiddleware)
 
 app.add_middleware(MaxBodySizeMiddleware, max_bytes=get_max_request_bytes())
 
