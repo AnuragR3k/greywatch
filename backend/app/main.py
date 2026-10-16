@@ -2,6 +2,7 @@
 
 import hmac
 import ipaddress
+import logging
 import math
 import os
 import time
@@ -11,6 +12,8 @@ from typing import Callable, Literal
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger("greywatch.api")
 
 from .siem import (
     close_alert,
@@ -54,6 +57,44 @@ def get_max_request_bytes() -> int | None:
     return value
 
 
+def _client_peer(scope: dict) -> str:
+    """Return the ASGI peer host; client-supplied forwarding headers are never consulted."""
+    client = scope.get("client")
+    if isinstance(client, (list, tuple)) and len(client) >= 1 and client[0]:
+        return str(client[0])
+    return "unknown"
+
+
+def _log_denied_request(
+    *,
+    reason: str,
+    method: str,
+    path: str,
+    status_code: int,
+    peer: str,
+) -> None:
+    """Emit a structured denial log record.
+
+    Best-effort: logging errors are swallowed so a logging failure can never
+    turn a denied request into an allowed one (access control stays fail-closed).
+    Never logs credentials, cookies, bodies, or query strings.
+    """
+    try:
+        logger.info(
+            "denied_request",
+            extra={
+                "event": "request_denied",
+                "reason": reason,
+                "method": method,
+                "path": path,
+                "status": status_code,
+                "peer": peer,
+            },
+        )
+    except Exception:
+        pass
+
+
 class MaxBodySizeMiddleware:
     """ASGI middleware that rejects request bodies exceeding a byte limit.
 
@@ -92,6 +133,13 @@ class MaxBodySizeMiddleware:
                 received += len(body)
                 chunks.append(body)
                 if received > max_bytes:
+                    _log_denied_request(
+                        reason="request_body_too_large",
+                        method=scope.get("method", ""),
+                        path=scope.get("path", "/"),
+                        status_code=413,
+                        peer=_client_peer(scope),
+                    )
                     await send(
                         {
                             "type": "http.response.start",
@@ -302,6 +350,13 @@ class RateLimitMiddleware:
         last_update = now
 
         if tokens < 1.0:
+            _log_denied_request(
+                reason="rate_limit_exceeded",
+                method=scope.get("method", ""),
+                path=scope.get("path", "/"),
+                status_code=429,
+                peer=_client_peer(scope),
+            )
             retry_after = max(1, math.ceil((1.0 - tokens) / refill_per_sec))
             await send(
                 {
@@ -471,6 +526,15 @@ async def _trust_boundary(request: Request, call_next):
     denied = _check_trust_boundary(request)
     if denied is not None:
         status_code, detail = denied
+        _log_denied_request(
+            reason="authentication_required"
+            if status_code == 401
+            else "remote_peer_not_allowed",
+            method=request.method,
+            path=request.url.path,
+            status_code=status_code,
+            peer=_client_peer(request.scope),
+        )
         headers = {"WWW-Authenticate": "Bearer"} if status_code == 401 else {}
         return JSONResponse(
             status_code=status_code,
