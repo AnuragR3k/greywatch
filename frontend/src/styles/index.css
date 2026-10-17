@@ -1,0 +1,164 @@
+@import "tailwindcss";
+
+/* ==========================================================================
+   Greywatch design system — "security operations instrument panel"
+   Dark graphite surfaces, fine borders, restrained emerald accent, and a
+   distinct severity ramp. Shared by the marketing landing page and the SOC
+   application. Token names below (--color-text-muted, --color-text-secondary,
+   --color-card, --color-background) are asserted by scripts/check-contrast.mjs.
+   ========================================================================== */
+@theme {
+  --color-background: #0a0d10;
+  --color-card: #12161b;
+  --color-card-hover: #171d23;
+  --color-raised: #1e242b;
+  --color-border-card: #242c34;
+
+  --color-text-primary: #e7ebef;
+  --color-text-secondary: #98a4af;
+  --color-text-muted: #7d8893;
+
+  --color-accent: #34d399;
+  --color-accent-strong: #10b981;
+  --color-accent-lime: #a3e635;
+
+  --color-severity-critical: #f87171;
+  --color-severity-high: #fb923c;
+  --color-severity-medium: #fbbf24;
+  --color-severity-low: #7dd3fc;
+  --color-severity-info: #93c5fd;
+  --color-severity-healthy: #34d399;
+  --color-severity-unknown: #94a3b8;
+
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --radius-panel: 12px;
+}
+
+:root {
+  --gw-sidebar-w: 15rem;      /* expanded desktop rail (240px) */
+  --gw-sidebar-w-collapsed: 4rem;
+
+  color-scheme: dark;
+  font-family: var(--font-sans);
+  color: var(--color-text-primary);
+  background-color: var(--color-background);
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  max-width: 100%;
+  overflow-x: hidden;
+  background-color: var(--color-background);
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+  border: none;
+  background: transparent;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+::selection {
+  background: var(--color-accent);
+  color: #04140c;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #3a424e transparent;
+}
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb { background: #3a424e; border-radius: 9999px; }
+*::-webkit-scrollbar-thumb:hover { background: #5b6470; }
+
+/* ---------------------------------------------------------------- utilities */
+.gw-grid-bg {
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.028) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.028) 1px, transparent 1px);
+  background-size: 44px 44px;
+}
+
+.gw-chrome {
+  background: linear-gradient(180deg, rgba(23, 29, 35, 0.72), rgba(10, 13, 16, 0.72));
+  backdrop-filter: blur(10px);
+}
+
+.gw-reveal {
+  opacity: 0;
+  transform: translateY(10px);
+  animation: gw-rise 0.5s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+@keyframes gw-rise {
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes gw-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+.gw-pulse { animation: gw-pulse 2.4s ease-in-out infinite; }
+
+@keyframes gw-sheen {
+  from { background-position: 200% 0; }
+  to { background-position: -200% 0; }
+}
+.gw-skeleton {
+  background: linear-gradient(90deg, #171d23 25%, #1e242b 37%, #171d23 63%);
+  background-size: 400% 100%;
+  animation: gw-sheen 1.4s ease infinite;
+  border-radius: 6px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .gw-reveal,
+  .gw-pulse,
+  .gw-skeleton,
+  * {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+  .gw-reveal { opacity: 1; transform: none; }
+}
