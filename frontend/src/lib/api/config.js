@@ -6,13 +6,41 @@
 // serving in production. The frontend never holds a server-side secret. Remote
 // deployments must terminate authentication at a reverse proxy.
 
+// Resolve the API base URL from the environment.
+//
+//   * Unset -> "" (same-origin; the Vite dev proxy forwards /api and /health).
+//   * Set   -> that origin, with any trailing slashes trimmed.
+//
+// Both `VITE_API_BASE_URL` (the documented name) and the legacy `VITE_API_URL`
+// are honoured; the former wins when both are set. Neither ever carries a
+// secret — a build-time `VITE_*` value is compiled into a public bundle.
+function resolveBaseUrl() {
+  if (typeof import.meta === 'undefined' || !import.meta.env) return ''
+  const raw = import.meta.env.VITE_API_BASE_URL || import.meta.env.VITE_API_URL
+  return raw ? String(raw).replace(/\/+$/, '') : ''
+}
+
+// Optional, runtime-injected bearer token.
+//
+// Deliberately NOT read from a `VITE_*` env var: those are baked into the
+// public bundle, so a token there would be a leaked secret. Instead an
+// operator that fronts the API with token mode can inject the token at
+// runtime (e.g. a bootstrap script served alongside a same-origin dashboard):
+//
+//     window.__GREYWATCH_API_TOKEN__ = '<token>'
+//
+// The value is held only in memory for the page's lifetime and is never
+// persisted to storage. When it is absent (the loopback/local default) no
+// Authorization header is sent and the backend's loopback trust boundary
+// applies.
+export function getRuntimeToken() {
+  if (typeof window === 'undefined') return null
+  const token = window.__GREYWATCH_API_TOKEN__
+  return typeof token === 'string' && token ? token : null
+}
+
 export const API_CONFIG = {
-  // Empty base URL keeps requests same-origin (proxied in dev). Override with
-  // VITE_API_URL only for non-secret deployment wiring.
-  baseUrl:
-    typeof import.meta !== 'undefined' && import.meta.env.VITE_API_URL
-      ? String(import.meta.env.VITE_API_URL).replace(/\/+$/, '')
-      : '',
+  baseUrl: resolveBaseUrl(),
 
   // Reads are cheap; collector actions can be slower.
   timeoutMs: 10000,
