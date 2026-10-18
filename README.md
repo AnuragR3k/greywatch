@@ -6,6 +6,9 @@ Greywatch collects security events, detects suspicious activity, and helps inves
 
 **Status:** Active development. Not yet production-ready.
 
+<img width="1911" height="968" alt="image" src="https://github.com/user-attachments/assets/d23135f7-7e05-484b-8115-85a9264d6334" />
+
+
 ## Installation
 
 ### Prerequisites
