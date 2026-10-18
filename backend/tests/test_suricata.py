@@ -1069,6 +1069,94 @@ def test_collect_restart_resumes_from_persisted_checkpoint(_db, tmp_path):
     assert len(_event_rows()) == 4
 
 
+def test_collect_db_failure_rolls_back_and_preserves_checkpoint(
+    _db, tmp_path, monkeypatch
+):
+    """A database failure mid-cycle must never advance the checkpoint.
+
+    The optimistic offset, the inserted events and the raised alerts are
+    committed in ONE transaction, so a failure during ingestion (e.g. a
+    transient ``database is locked`` from the concurrent API) rolls the whole
+    cycle back. The checkpoint therefore still points at the unprocessed
+    record: the detection is not silently lost, and the retry ingests it
+    exactly once (no duplicate).
+    """
+    import sqlite3
+
+    path = _write_eve(tmp_path / "eve.json", [_alert_line(0)])
+    cfg = SuricataConfig(eve_path=str(path))
+
+    real = siem._store_events_and_detect
+    calls = {"n": 0}
+
+    def flaky(events, connection):
+        # Run the real work first (events + alert written inside the caller's
+        # transaction), then fail before the caller commits -- simulating a DB
+        # error late in the cycle.
+        real(events, connection)
+        calls["n"] += 1
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(siem, "_store_events_and_detect", flaky)
+
+    with pytest.raises(sqlite3.OperationalError):
+        collect_once(cfg)
+
+    assert calls["n"] == 1
+    # Nothing from the failed cycle is visible, and the checkpoint is untouched.
+    assert _event_rows() == []
+    assert _alert_rows() == []
+    assert get_collector_setting("suricata_last_offset") is None
+    assert get_collector_setting("suricata_last_run_at") is None
+
+    # Retry with the real pipeline resumes from the same record (no loss) and
+    # ingests it exactly once (no duplicate).
+    monkeypatch.setattr(siem, "_store_events_and_detect", real)
+    result = collect_once(cfg)
+    assert result.errors == []
+    assert result.events_ingested == 1
+    assert len(_alert_rows()) == 1
+    assert _alert_rows()[0]["rule_id"] == "SURICATA_ALERT"
+    assert len(_event_rows()) == 1
+    assert get_collector_setting("suricata_last_offset") == str(path.stat().st_size)
+
+
+def test_evaluate_detections_dispatches_all_rules(_db):
+    """The shared pipeline runs every rule over one normalized batch.
+
+    A batch mixing a threshold-reaching burst of SSH failures and a Suricata
+    alert yields both ``SSH_BRUTE_FORCE`` and ``SURICATA_ALERT`` new alerts, in
+    that stable order, from the single dispatch point -- proving the two
+    telemetry sources share one detection path.
+    """
+    from backend.app.siem import parse_auth_line
+
+    ssh_events = [
+        parse_auth_line(
+            f"dispatch-host sshd[1]: Failed password for root "
+            f"from 203.0.113.9 port {40000 + i} ssh2"
+        )
+        for i in range(siem.BRUTE_FORCE_THRESHOLD)
+    ]
+    assert all(event is not None for event in ssh_events)
+    assert {event["event_type"] for event in ssh_events} == {"ssh_login_failed"}
+
+    rec = _eve_alert(sig_id=2023999, signature="ET TEST dispatch")
+    suri_event = parse_eve_record(rec, raw_line=json.dumps(rec))
+
+    with _connection() as connection:
+        inserted, alerts = siem._store_events_and_detect(
+            [*ssh_events, suri_event], connection
+        )
+
+    assert [a["rule_id"] for a in alerts] == ["SSH_BRUTE_FORCE", "SURICATA_ALERT"]
+    assert len(inserted) == len(ssh_events) + 1
+    assert {a["rule_id"] for a in _alert_rows()} == {
+        "SSH_BRUTE_FORCE",
+        "SURICATA_ALERT",
+    }
+
+
 def test_collect_skips_invalid_records_but_keeps_valid_neighbours(_db, tmp_path):
     """Non-object JSON, bad timestamps and unknown types never abort a batch.
 

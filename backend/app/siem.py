@@ -330,48 +330,19 @@ def parse_auth_line(line: str) -> dict | None:
     }
 
 
-def _store_events_and_detect(
+def _detect_ssh_brute_force(
     events: list[dict], connection: sqlite3.Connection
-) -> tuple[list[dict], list[dict]]:
-    """Persist normalized events and evaluate the SSH brute-force rule.
+) -> list[dict]:
+    """Evaluate the ``SSH_BRUTE_FORCE`` rule for one ingested batch.
 
-    Events must already be in the shape produced by ``parse_auth_line`` (or the
-    journal collector's ``parse_journal_record``). Detection runs inside the
-    caller's transaction so the failed-login count reflects the rows just
-    inserted. Returns ``(inserted_events, new_alerts)``.
+    Counts failed logins per source IP over the configured window using the
+    caller's connection, so the count reflects the rows just inserted. One open
+    alert per offending IP is created or updated in place (aggregation, never
+    unbounded duplication in a batch). Returns newly-created alerts only;
+    updates to an existing open alert are silent, matching the rule's
+    de-duplication contract.
     """
-    inserted_events = []
-    new_alerts = []
-
-    for event in events:
-        cursor = connection.execute(
-            """
-            INSERT INTO events (
-                timestamp, host, event_type, username,
-                source_ip, severity, raw_message, source,
-                dest_ip, src_port, dest_port, proto,
-                signature, signature_id, category
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                event["timestamp"],
-                event["host"],
-                event["event_type"],
-                event["username"],
-                event["source_ip"],
-                event["severity"],
-                event["raw_message"],
-                event.get("source"),
-                event.get("dest_ip"),
-                event.get("src_port"),
-                event.get("dest_port"),
-                event.get("proto"),
-                event.get("signature"),
-                event.get("signature_id"),
-                event.get("category"),
-            ),
-        )
-        inserted_events.append({"id": cursor.lastrowid, **event})
+    new_alerts: list[dict] = []
 
     # Count failed logins only. Invalid-user messages can accompany a
     # failed-login message, so counting both could inflate the threshold.
@@ -474,10 +445,92 @@ def _store_events_and_detect(
             }
         )
 
+    return new_alerts
+
+
+def evaluate_detections(
+    events: list[dict],
+    inserted_events: list[dict],
+    connection: sqlite3.Connection,
+) -> list[dict]:
+    """Shared detection pipeline: run every enabled rule over one batch.
+
+    Single dispatch point shared by every telemetry source. HTTP ingestion
+    (:func:`ingest_lines`), the journal collector and the Suricata collector all
+    normalize to Greywatch's event shape and reach detection through
+    :func:`_store_events_and_detect`, which calls this function. Everything runs
+    inside the caller's transaction, so a rule failure rolls the whole batch
+    back with the caller's checkpoint write.
+
+    Two arguments because the rules differ in what they need:
+
+    * ``events`` are the normalized inputs, used by database-backed rules (the
+      SSH failed-login window query);
+    * ``inserted_events`` are the rows just persisted, carrying their assigned
+      ``id`` (used by the Suricata evidence/incident keying).
+
+    Rules dispatched (in order, so alert ordering is stable):
+
+    * ``SSH_BRUTE_FORCE`` -- repeated ``ssh_login_failed`` from one source.
+    * ``SURICATA_ALERT`` -- Suricata EVE ``alert`` detections, de-duplicated by
+      signature identity + network 5-tuple within the aggregation window.
+
+    Returns the newly-created alerts. Aggregations into an existing open alert
+    are intentionally not returned (they are updates, not new alerts).
+    """
+    new_alerts = _detect_ssh_brute_force(events, connection)
     # Suricata EVE "alert" records become Greywatch alerts (rule_id
     # SURICATA_ALERT) in the shared alerts table. This runs only on
     # suricata_alert events, so SSH/journal/HTTP ingestion is unaffected.
     new_alerts.extend(_detect_suricata_alerts(inserted_events, connection))
+    return new_alerts
+
+
+def _store_events_and_detect(
+    events: list[dict], connection: sqlite3.Connection
+) -> tuple[list[dict], list[dict]]:
+    """Persist normalized events and run the shared detection pipeline.
+
+    Events must already be in the shape produced by ``parse_auth_line`` (or the
+    journal/Suricata collector normalizers). Storage and detection both run
+    inside the caller's transaction, so the failed-login count reflects the rows
+    just inserted and a failure leaves nothing partially applied (events,
+    alerts and the caller's checkpoint advance are committed or rolled back
+    together). Returns ``(inserted_events, new_alerts)``.
+    """
+    inserted_events = []
+
+    for event in events:
+        cursor = connection.execute(
+            """
+            INSERT INTO events (
+                timestamp, host, event_type, username,
+                source_ip, severity, raw_message, source,
+                dest_ip, src_port, dest_port, proto,
+                signature, signature_id, category
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event["timestamp"],
+                event["host"],
+                event["event_type"],
+                event["username"],
+                event["source_ip"],
+                event["severity"],
+                event["raw_message"],
+                event.get("source"),
+                event.get("dest_ip"),
+                event.get("src_port"),
+                event.get("dest_port"),
+                event.get("proto"),
+                event.get("signature"),
+                event.get("signature_id"),
+                event.get("category"),
+            ),
+        )
+        inserted_events.append({"id": cursor.lastrowid, **event})
+
+    new_alerts = evaluate_detections(events, inserted_events, connection)
 
     return inserted_events, new_alerts
 
