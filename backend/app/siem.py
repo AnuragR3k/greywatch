@@ -32,6 +32,32 @@ BRUTE_FORCE_WINDOW_MINUTES = 5
 # unboundedly.
 SURICATA_ALERT_WINDOW_MINUTES = 60
 
+# Rule id for Greywatch incidents raised by the SSH brute-force then success
+# correlation rule.
+SSH_BRUTE_FORCE_THEN_SUCCESS_RULE = "SSH_BRUTE_FORCE_THEN_SUCCESS"
+
+# Correlation window: failures and the subsequent success must fall within this
+# bounded window and match on source IP. Configurable via
+# ``GREYWATCH_CORRELATION_WINDOW_MINUTES``.
+CORRELATION_WINDOW_MINUTES = 30
+
+
+def get_correlation_window_minutes() -> int:
+    """Return the correlation window in minutes from the environment.
+
+    Reads ``GREYWATCH_CORRELATION_WINDOW_MINUTES`` on every call so tests stay
+    hermetic via ``monkeypatch.setenv``. Invalid values fall back to the safe
+    default and never silently disable correlation.
+    """
+    raw = os.environ.get("GREYWATCH_CORRELATION_WINDOW_MINUTES", "")
+    if not raw:
+        return CORRELATION_WINDOW_MINUTES
+    try:
+        value = int(raw)
+    except ValueError:
+        return CORRELATION_WINDOW_MINUTES
+    return value if value > 0 else CORRELATION_WINDOW_MINUTES
+
 # Rule id used for Greywatch alerts raised from Suricata EVE "alert" events.
 SURICATA_ALERT_RULE = "SURICATA_ALERT"
 
@@ -231,6 +257,43 @@ def initialize_database() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_alerts_status
                 ON alerts(status, created_at);
+
+            CREATE TABLE IF NOT EXISTS incidents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                rule_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                source_ip TEXT NOT NULL,
+                description TEXT NOT NULL,
+                event_count INTEGER NOT NULL,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                closed_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_incidents_status
+                ON incidents(status, created_at);
+
+            CREATE INDEX IF NOT EXISTS idx_incidents_rule_ip
+                ON incidents(rule_id, source_ip, status);
+
+            CREATE TABLE IF NOT EXISTS incident_events (
+                incident_id INTEGER NOT NULL,
+                event_id INTEGER NOT NULL,
+                added_at TEXT NOT NULL,
+                PRIMARY KEY (incident_id, event_id),
+                FOREIGN KEY (incident_id) REFERENCES incidents(id),
+                FOREIGN KEY (event_id) REFERENCES events(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_incident_events_incident
+                ON incident_events(incident_id);
+
+            CREATE INDEX IF NOT EXISTS idx_incident_events_event
+                ON incident_events(event_id);
             """
         )
         _migrate_alerts_table(connection)
@@ -474,16 +537,22 @@ def evaluate_detections(
     * ``SSH_BRUTE_FORCE`` -- repeated ``ssh_login_failed`` from one source.
     * ``SURICATA_ALERT`` -- Suricata EVE ``alert`` detections, de-duplicated by
       signature identity + network 5-tuple within the aggregation window.
+    * ``SSH_BRUTE_FORCE_THEN_SUCCESS`` -- repeated ``ssh_login_failed`` from one
+      source followed by a subsequent ``ssh_login_success`` (correlation rule).
 
-    Returns the newly-created alerts. Aggregations into an existing open alert
-    are intentionally not returned (they are updates, not new alerts).
+    Returns ``(new_alerts, new_incidents)``. Aggregations into an existing open
+    alert/incident are intentionally not returned (they are updates, not new
+    records).
     """
     new_alerts = _detect_ssh_brute_force(events, connection)
     # Suricata EVE "alert" records become Greywatch alerts (rule_id
     # SURICATA_ALERT) in the shared alerts table. This runs only on
     # suricata_alert events, so SSH/journal/HTTP ingestion is unaffected.
     new_alerts.extend(_detect_suricata_alerts(inserted_events, connection))
-    return new_alerts
+    # Correlation rules run last over the just-stored events so a success that
+    # completes a pattern can see failures stored earlier in the same batch.
+    new_incidents = _correlate_ssh_brute_force_then_success(events, connection)
+    return new_alerts, new_incidents
 
 
 def _store_events_and_detect(
@@ -496,7 +565,7 @@ def _store_events_and_detect(
     inside the caller's transaction, so the failed-login count reflects the rows
     just inserted and a failure leaves nothing partially applied (events,
     alerts and the caller's checkpoint advance are committed or rolled back
-    together). Returns ``(inserted_events, new_alerts)``.
+    together).     Returns ``(inserted_events, new_alerts, new_incidents)``.
     """
     inserted_events = []
 
@@ -530,9 +599,9 @@ def _store_events_and_detect(
         )
         inserted_events.append({"id": cursor.lastrowid, **event})
 
-    new_alerts = evaluate_detections(events, inserted_events, connection)
+    new_alerts, new_incidents = evaluate_detections(events, inserted_events, connection)
 
-    return inserted_events, new_alerts
+    return inserted_events, new_alerts, new_incidents
 
 
 def _suricata_alert_description(event: dict, count: int) -> str:
@@ -801,6 +870,352 @@ def _detect_suricata_alerts(
     return new_alerts
 
 
+def _correlate_ssh_brute_force_then_success(
+    events: list[dict], connection: sqlite3.Connection
+) -> list[dict]:
+    """Evaluate the ``SSH_BRUTE_FORCE_THEN_SUCCESS`` correlation rule.
+
+    Correlates repeated SSH authentication failures with a subsequent
+    successful SSH login from the same source IP within a bounded time window.
+
+    The rule is driven by newly ingested ``ssh_login_success`` events: a new
+    success is the trigger that can complete the pattern, so failures stored in
+    earlier collection cycles (visible on this connection within the transaction)
+    are counted. Failures arriving without a later success produce no incident
+    -- the missing successful-login signal is deliberately not fabricated.
+
+    Only ``ssh_login_failed`` and ``ssh_login_success`` events are considered,
+    so Suricata ``suricata_*`` events can never trigger this SSH-specific rule.
+    Matching is by source IP and the events are stored verbatim; no successful
+    login events are invented.
+
+    One open incident per (rule_id, source_ip) is maintained: re-evaluation
+    updates the existing incident in place (idempotent) rather than creating
+    duplicates. All writes use the caller's connection and transaction.
+
+    Returns newly-created incident dicts.
+    """
+    new_incidents: list[dict] = []
+    window = timedelta(minutes=get_correlation_window_minutes())
+    now = datetime.now(timezone.utc)
+    cutoff = now - window
+
+    # Latest success per source IP in this batch; a success drives correlation.
+    latest_success: dict[str, dict] = {}
+    for event in events:
+        if event.get("event_type") != "ssh_login_success":
+            continue
+        source_ip = event.get("source_ip")
+        if not source_ip:
+            continue
+        existing = latest_success.get(source_ip)
+        if existing is None or event["timestamp"] > existing["timestamp"]:
+            latest_success[source_ip] = event
+
+    for source_ip in sorted(latest_success):
+        success = latest_success[source_ip]
+        try:
+            success_dt = datetime.fromisoformat(success["timestamp"].replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            # A success without a usable timestamp cannot be bounded by the
+            # window; skip it rather than correlating on the clock.
+            continue
+        if success_dt.tzinfo is None:
+            success_dt = success_dt.astimezone(timezone.utc)
+        if success_dt < cutoff:
+            # Success is outside the bounded correlation window.
+            continue
+
+        window_start = success_dt - window
+        window_start_iso = window_start.isoformat(timespec="seconds")
+        success_iso = success_dt.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+        count = connection.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM events
+            WHERE event_type = 'ssh_login_failed'
+              AND source_ip = ?
+              AND timestamp >= ?
+              AND timestamp <= ?
+            """,
+            (source_ip, window_start_iso, success_iso),
+        ).fetchone()["total"]
+
+        if count < BRUTE_FORCE_THRESHOLD:
+            continue
+
+        first_row = connection.execute(
+            """
+            SELECT timestamp
+            FROM events
+            WHERE event_type = 'ssh_login_failed'
+              AND source_ip = ?
+              AND timestamp >= ?
+              AND timestamp <= ?
+            ORDER BY timestamp ASC
+            LIMIT 1
+            """,
+            (source_ip, window_start_iso, success_iso),
+        ).fetchone()
+        first_seen_at = first_row["timestamp"] if first_row else success_iso
+
+        description = (
+            f"Observed {count} failed SSH login attempts from {source_ip} "
+            f"followed by a successful login from {source_ip} at {success_iso} "
+            f"within {get_correlation_window_minutes()} minutes. "
+            "Investigate for credential compromise; the successful login "
+            "indicates the brute force may have succeeded."
+        )
+
+        # Related events: the matching failures plus the successful login.
+        failure_rows = connection.execute(
+            """
+            SELECT id FROM events
+            WHERE event_type = 'ssh_login_failed'
+              AND source_ip = ?
+              AND timestamp >= ?
+              AND timestamp <= ?
+            ORDER BY timestamp ASC
+            """,
+            (source_ip, window_start_iso, success_iso),
+        ).fetchall()
+        related_event_ids = [row["id"] for row in failure_rows]
+
+        success_id = connection.execute(
+            """
+            SELECT id FROM events
+            WHERE event_type = 'ssh_login_success'
+              AND source_ip = ?
+              AND timestamp = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (source_ip, success_iso),
+        ).fetchone()
+        if success_id is not None:
+            related_event_ids.append(success_id["id"])
+
+        incident = _upsert_incident(
+            rule_id=SSH_BRUTE_FORCE_THEN_SUCCESS_RULE,
+            title="SSH brute force followed by successful login",
+            severity="critical",
+            source_ip=source_ip,
+            description=description,
+            event_count=count,
+            first_seen_at=first_seen_at,
+            last_seen_at=success_iso,
+            related_event_ids=related_event_ids,
+            connection=connection,
+        )
+        new_incidents.append(incident)
+
+    return new_incidents
+
+
+def _now_iso() -> str:
+    """Current UTC time as a normalized ISO-8601 string."""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _upsert_incident(
+    *,
+    rule_id: str,
+    title: str,
+    severity: str,
+    source_ip: str,
+    description: str,
+    event_count: int,
+    first_seen_at: str,
+    last_seen_at: str,
+    related_event_ids: list[int],
+    connection: sqlite3.Connection,
+) -> dict:
+    """Create or update the open incident for ``(rule_id, source_ip)``.
+
+    Re-evaluation updates the existing open incident in place (event count,
+    last seen, description) so repeated collection never creates duplicate
+    incidents. Related events are attached idempotently. Returns the incident
+    dict.
+    """
+    now_text = _now_iso()
+
+    existing = connection.execute(
+        """
+        SELECT id FROM incidents
+        WHERE rule_id = ? AND source_ip = ? AND status = 'open'
+        LIMIT 1
+        """,
+        (rule_id, source_ip),
+    ).fetchone()
+
+    if existing:
+        incident_id = existing["id"]
+        connection.execute(
+            """
+            UPDATE incidents
+            SET updated_at = ?, event_count = ?, last_seen_at = ?, description = ?
+            WHERE id = ?
+            """,
+            (now_text, event_count, last_seen_at, description, incident_id),
+        )
+    else:
+        cursor = connection.execute(
+            """
+            INSERT INTO incidents (
+                created_at, updated_at, rule_id, title, severity, status,
+                source_ip, description, event_count, first_seen_at, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)
+            """,
+            (
+                now_text, now_text, rule_id, title, severity,
+                source_ip, description, event_count, first_seen_at, last_seen_at,
+            ),
+        )
+        incident_id = cursor.lastrowid
+
+    for event_id in related_event_ids:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO incident_events (incident_id, event_id, added_at)
+            VALUES (?, ?, ?)
+            """,
+            (incident_id, event_id, now_text),
+        )
+
+    # Read back the persisted row on the same connection (no nested
+    # connection, so the caller's transaction stays intact).
+    row = connection.execute(
+        "SELECT * FROM incidents WHERE id = ?", (incident_id,)
+    ).fetchone()
+    incident = dict(row)
+    incident["related_event_ids"] = sorted(set(related_event_ids))
+    return incident
+
+
+def list_incidents(
+    status: str = "open", limit: int = 100
+) -> list[dict]:
+    """List incidents, ordered by first seen (newest first)."""
+    initialize_database()
+
+    with _connection() as connection:
+        if status == "all":
+            rows = connection.execute(
+                """
+                SELECT * FROM incidents
+                ORDER BY first_seen_at DESC, id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT * FROM incidents
+                WHERE status = ?
+                ORDER BY first_seen_at DESC, id DESC
+                LIMIT ?
+                """,
+                (status, limit),
+            ).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+def get_incident(incident_id: int) -> dict | None:
+    """Return an incident with its related events in chronological order."""
+    initialize_database()
+
+    with _connection() as connection:
+        row = connection.execute(
+            "SELECT * FROM incidents WHERE id = ?", (incident_id,)
+        ).fetchone()
+        if row is None:
+            return None
+
+        incident = dict(row)
+        event_rows = connection.execute(
+            """
+            SELECT e.*
+            FROM events e
+            JOIN incident_events ie ON ie.event_id = e.id
+            WHERE ie.incident_id = ?
+            ORDER BY e.timestamp ASC, e.id ASC
+            """,
+            (incident_id,),
+        ).fetchall()
+
+    incident["related_events"] = [dict(event) for event in event_rows]
+    incident["related_event_ids"] = [event["id"] for event in incident["related_events"]]
+    return incident
+
+
+_ALLOWED_TRANSITIONS: dict[str, set[str]] = {
+    "acknowledged": {"open"},
+    "resolved": {"open", "acknowledged"},
+}
+
+
+def _transition_incident(
+    incident_id: int, to_status: str
+) -> dict:
+    """Transition an incident to ``to_status``.
+
+    Returns a dict with ``ok`` and either ``status`` (success) or ``error``
+    (``"not_found"`` or ``"invalid_transition"``). Transitions are idempotent:
+    an incident already in ``to_status`` is left unchanged and reported ok.
+    """
+    initialize_database()
+    now_text = _now_iso()
+
+    with _connection() as connection:
+        row = connection.execute(
+            "SELECT status FROM incidents WHERE id = ?", (incident_id,)
+        ).fetchone()
+        if row is None:
+            return {"ok": False, "error": "not_found"}
+
+        current = row["status"]
+        if current == to_status:
+            return {"ok": True, "status": current}
+
+        allowed = _ALLOWED_TRANSITIONS.get(to_status, set())
+        if current not in allowed:
+            return {"ok": False, "error": "invalid_transition"}
+
+        if to_status == "resolved":
+            connection.execute(
+                """
+                UPDATE incidents
+                SET status = 'resolved', updated_at = ?, closed_at = ?
+                WHERE id = ?
+                """,
+                (now_text, now_text, incident_id),
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE incidents
+                SET status = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (to_status, now_text, incident_id),
+            )
+
+    return {"ok": True, "status": to_status}
+
+
+def acknowledge_incident(incident_id: int) -> dict:
+    """Acknowledge an open incident (open -> acknowledged)."""
+    return _transition_incident(incident_id, "acknowledged")
+
+
+def resolve_incident(incident_id: int) -> dict:
+    """Resolve an open or acknowledged incident (-> resolved)."""
+    return _transition_incident(incident_id, "resolved")
+
+
 def ingest_lines(lines: list[str]) -> dict:
     """Parse and persist event lines, then evaluate the SSH brute-force rule.
 
@@ -812,7 +1227,7 @@ def ingest_lines(lines: list[str]) -> dict:
     events = [event for line in lines if (event := parse_auth_line(line))]
 
     with _connection() as connection:
-        inserted_events, new_alerts = _store_events_and_detect(
+        inserted_events, new_alerts, new_incidents = _store_events_and_detect(
             events, connection
         )
 
@@ -822,6 +1237,7 @@ def ingest_lines(lines: list[str]) -> dict:
         "ignored": len(lines) - len(inserted_events),
         "events": inserted_events,
         "alerts": new_alerts,
+        "incidents": new_incidents,
     }
 
 
@@ -837,7 +1253,7 @@ def ingest_events(events: list[dict]) -> dict:
     initialize_database()
 
     with _connection() as connection:
-        inserted_events, new_alerts = _store_events_and_detect(
+        inserted_events, new_alerts, new_incidents = _store_events_and_detect(
             events, connection
         )
 
@@ -848,6 +1264,7 @@ def ingest_events(events: list[dict]) -> dict:
         "ignored": 0,
         "events": inserted_events,
         "alerts": new_alerts,
+        "incidents": new_incidents,
     }
 
 

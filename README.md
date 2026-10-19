@@ -82,6 +82,7 @@ Press `Ctrl+C` in each terminal running the backend or frontend.
 - **SSH brute-force detection:** Detect repeated failed SSH login attempts and generate alerts.
 - **Alert investigation:** Review severity, source IPs, event evidence, and raw log messages.
 - **Alert resolution:** Investigate and resolve alerts through the dashboard.
+- **Incident correlation:** Detect SSH brute-force followed by a same-IP successful login (`SSH_BRUTE_FORCE_THEN_SUCCESS`) and manage incidents through open → acknowledge → resolved states, with related events.
 - **Linux journal collector:** Optionally collect PAM, SSH, and sudo authentication events from systemd journals.
 - **Suricata integration:** Optionally ingest supported EVE JSON events, including alerts, DNS, HTTP, TLS, and flow telemetry.
 - **Event search:** Search and inspect collected security events.
@@ -151,6 +152,19 @@ Endpoints:
 - `POST /api/v1/suricata/collect`
 
 Automated tests and fixture-based ingestion cover the integration. A complete live Suricata traffic-to-alert workflow still requires end-to-end verification.
+
+### Incident correlation
+
+Greywatch correlates repeated SSH authentication failures with a subsequent same-IP successful login (`SSH_BRUTE_FORCE_THEN_SUCCESS`). A correlation incident is raised per source IP when the failure threshold is met within a bounded window (default 30 minutes, configurable via `GREYWATCH_CORRELATION_WINDOW_MINUTES`). Incidents progress through `open → acknowledged → resolved` and carry the related failure and success events.
+
+The correlation window defaults to 30 minutes and is configurable via the `GREYWATCH_CORRELATION_WINDOW_MINUTES` environment variable.
+
+Endpoints:
+
+- `GET /api/v1/incidents`
+- `GET /api/v1/incidents/{id}`
+- `POST /api/v1/incidents/{id}/acknowledge`
+- `POST /api/v1/incidents/{id}/resolve`
 
 ## API Security
 
@@ -276,6 +290,7 @@ These checks validate the automated test suite and frontend code/build. They do 
 - Rule-based SSH brute-force detection
 - Alert evidence and investigation
 - Alert resolution
+- Incident correlation and lifecycle (open → acknowledge → resolved) with related events
 - Optional systemd journal collection
 - Optional Suricata EVE JSON collection
 - API trust-boundary enforcement

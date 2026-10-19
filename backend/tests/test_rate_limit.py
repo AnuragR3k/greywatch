@@ -642,4 +642,3 @@ def test_middleware_registration_order():
     assert names[0] == "BaseHTTPMiddleware"  # trust boundary
     assert names[1] == "MaxBodySizeMiddleware"
     assert names[2] == "RateLimitMiddleware"
-

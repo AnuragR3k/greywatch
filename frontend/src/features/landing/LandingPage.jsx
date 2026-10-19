@@ -1,14 +1,28 @@
 // Marketing landing page. Expressive where the dashboard is restrained.
 // The embedded SOC preview is a clearly-labelled sample (see SocPreview.jsx).
 
+import { useEffect, useState } from 'react'
 import { ArrowRight, BookLock, Radar, ShieldCheck, Terminal } from 'lucide-react'
 import { GithubIcon } from '@/components/icons/GithubIcon'
+import { GreywatchMark } from '@/components/icons/GreywatchMark'
+import PillNav from '@/components/navigation/PillNav'
 import { SmoothScroll } from '@/components/motion/SmoothScroll'
-import { Reveal } from '@/components/motion/Reveal'
+import { AnimatedContent } from '@/components/motion/AnimatedContent'
 import { SpotlightCard } from '@/components/motion/SpotlightCard'
+import GradientASCII from '@/components/motion/GradientASCII'
 import { SocPreview } from './SocPreview'
 
 const GITHUB_URL = 'https://github.com/AnuragR3k/greywatch'
+
+// In-page sections. Kept as real anchors (no dead links); the active item is
+// driven by the scroll-spy in <Nav>.
+const LANDING_SECTIONS = ['top', 'features', 'integrations', 'architecture']
+const LANDING_NAV = [
+  { label: 'Overview', href: '#top' },
+  { label: 'Features', href: '#features' },
+  { label: 'Integrations', href: '#integrations' },
+  { label: 'Architecture', href: '#architecture' },
+]
 
 const FEATURES = [
   { icon: Terminal, title: 'Unified event pipeline', body: 'Journal, Suricata EVE, and HTTP-ingested logs are normalized into one queryable event stream with provenance.' },
@@ -38,27 +52,76 @@ const WORKFLOW = [
 ]
 
 function Nav({ onEnterDashboard }) {
+  const [scrolled, setScrolled] = useState(false)
+  const [activeHref, setActiveHref] = useState('#top')
+
+  // Single passive listener drives both the frosted-on-scroll surface and the
+  // section scroll-spy that highlights the active pill item.
+  useEffect(() => {
+    const onScroll = () => {
+      setScrolled(window.scrollY > 8)
+      let current = LANDING_SECTIONS[0]
+      for (const id of LANDING_SECTIONS) {
+        const el = document.getElementById(id)
+        if (el && el.getBoundingClientRect().top <= 96) current = id
+      }
+      setActiveHref(`#${current}`)
+    }
+    onScroll()
+    window.addEventListener('scroll', onScroll, { passive: true })
+    window.addEventListener('resize', onScroll)
+    return () => {
+      window.removeEventListener('scroll', onScroll)
+      window.removeEventListener('resize', onScroll)
+    }
+  }, [])
+
   return (
-    <header className="gw-chrome sticky top-0 z-40 border-b border-border-card">
-      <div className="mx-auto flex h-16 w-full max-w-[1360px] items-center gap-4 px-5 lg:px-10">
-        <a href="#/" className="flex items-center gap-2.5">
-          <svg width="24" height="24" viewBox="0 0 32 32" fill="none" aria-hidden="true">
-            <path d="M16 2.5 27 7v9.2c0 6.3-4.4 10.9-11 13.3C9.4 27.1 5 22.5 5 16.2V7L16 2.5Z" fill="#0E1512" stroke="#34d399" strokeWidth="1.6" strokeLinejoin="round" />
-            <circle cx="16" cy="16" r="3" fill="#a3e635" />
-          </svg>
-          <span className="text-sm font-semibold tracking-tight text-text-primary">Greywatch</span>
-        </a>
-        <nav className="ml-6 hidden items-center gap-6 text-xs font-medium text-text-secondary md:flex">
-          <a href="#features" className="hover:text-text-primary">Features</a>
-          <a href="#integrations" className="hover:text-text-primary">Integrations</a>
-          <a href="#architecture" className="hover:text-text-primary">Architecture</a>
-        </nav>
-        <div className="ml-auto flex items-center gap-2">
-          <a href={GITHUB_URL} target="_blank" rel="noreferrer" className="flex items-center gap-1.5 rounded-md border border-border-card px-3 py-1.5 text-xs font-medium text-text-secondary hover:bg-card-hover hover:text-text-primary">
+    <header
+      className={`fixed inset-x-0 top-0 z-40 border-b transition-[background-color,backdrop-filter,border-color] duration-300 ${
+        scrolled ? 'border-border-card bg-[#0a0d10]/80 backdrop-blur-md' : 'border-transparent bg-transparent'
+      }`}
+    >
+      <div className="mx-auto flex h-16 w-full max-w-[1360px] items-center gap-3 px-5 lg:px-10">
+        <div className="min-w-0 flex-1">
+          <PillNav
+            logo={<GreywatchMark size={22} />}
+            logoAlt="Greywatch home"
+            logoHref="#top"
+            items={LANDING_NAV}
+            activeHref={activeHref}
+            onItemClick={(item) => setActiveHref(item.href)}
+            theme="dark"
+            layout="split"
+            surface="glass"
+            size="md"
+            itemStyle="pill"
+            hoverEffect="fill"
+            indicator="dot"
+            barColor="rgba(17, 22, 27, 0.72)"
+            highlightColor="#34d399"
+            bounce={0.3}
+            stretch={0.5}
+            collapse="auto"
+            intro
+            ariaLabel="Sections"
+          />
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          <a
+            href={GITHUB_URL}
+            target="_blank"
+            rel="noreferrer"
+            className="hidden items-center gap-1.5 rounded-md border border-border-card px-3 py-1.5 text-xs font-medium text-text-secondary hover:bg-card-hover hover:text-text-primary sm:flex"
+          >
             <GithubIcon size={13} /> GitHub
           </a>
-          <button type="button" onClick={onEnterDashboard} className="rounded-md bg-accent px-3.5 py-1.5 text-xs font-semibold text-[#04140c] hover:bg-accent-strong">
-            Open dashboard
+          <button
+            type="button"
+            onClick={onEnterDashboard}
+            className="rounded-md bg-accent px-3.5 py-1.5 text-xs font-semibold whitespace-nowrap text-[#04140c] hover:bg-accent-strong"
+          >
+            Launch dashboard
           </button>
         </div>
       </div>
@@ -73,12 +136,28 @@ export function LandingPage({ onEnterDashboard }) {
         <Nav onEnterDashboard={onEnterDashboard} />
 
         {/* Hero */}
-        <section className="gw-grid-bg relative overflow-hidden">
-          <div
-            className="pointer-events-none absolute inset-x-0 -top-40 mx-auto h-[640px] max-w-[1100px]"
-            style={{ background: 'radial-gradient(ellipse 700px 420px at 50% 40%, rgba(52,211,153,0.15), rgba(52,211,153,0.04) 45%, transparent 72%)' }}
-            aria-hidden="true"
-          />
+        <section id="top" className="gw-grid-bg relative overflow-hidden">
+          <div className="pointer-events-none absolute inset-0" aria-hidden="true">
+            <GradientASCII
+              colors={['#04140c', '#0d3d2a', '#10b981', '#34d399', '#a3e635']}
+              shape="horizon"
+              characters=" =+xX0S8#@"
+              cellSize={18}
+              density={0.7}
+              glow={0.22}
+              speed={0.55}
+              flow={0.6}
+              softness={0.6}
+              gradientOpacity={0.85}
+              grain={0.07}
+              variation={1}
+              fontFamily='"JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace'
+            />
+            <div
+              className="absolute inset-0"
+              style={{ background: 'linear-gradient(180deg, rgba(10,13,16,0.4) 0%, rgba(10,13,16,0) 34%, rgba(10,13,16,0.55) 76%, #0a0d10 100%)' }}
+            />
+          </div>
           <div className="relative mx-auto flex max-w-[1360px] flex-col items-center px-5 pb-16 pt-20 text-center lg:px-10 lg:pt-24">
             <span className="inline-flex items-center gap-2 rounded-full border border-border-card bg-card/60 px-3 py-1 font-mono text-[11px] text-text-muted">
               Open-source · Linux · FastAPI + React
@@ -107,28 +186,32 @@ export function LandingPage({ onEnterDashboard }) {
 
         {/* Features */}
         <section id="features" className="mx-auto max-w-[1360px] px-5 py-24 lg:px-10">
-          <Reveal>
+          <AnimatedContent distance={30} duration={0.7} threshold={0.2}>
             <h2 className="max-w-[640px] text-[clamp(26px,3.2vw,38px)] font-semibold leading-tight tracking-tight text-white">
               A focused console for Linux detection and response.
             </h2>
-          </Reveal>
-          <div className="mt-10 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-            {FEATURES.map((f, i) => (
-              <Reveal key={f.title} delay={i * 0.05}>
-                <SpotlightCard className="h-full p-5">
-                  <f.icon size={18} className="text-accent" aria-hidden="true" />
-                  <h3 className="mt-3 text-sm font-semibold text-text-primary">{f.title}</h3>
-                  <p className="mt-2 text-xs leading-relaxed text-text-muted">{f.body}</p>
-                </SpotlightCard>
-              </Reveal>
+          </AnimatedContent>
+          <AnimatedContent
+            className="mt-10 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4"
+            distance={50}
+            duration={0.7}
+            stagger={0.08}
+            threshold={0.15}
+          >
+            {FEATURES.map((f) => (
+              <SpotlightCard key={f.title} className="h-full p-5">
+                <f.icon size={18} className="text-accent" aria-hidden="true" />
+                <h3 className="mt-3 text-sm font-semibold text-text-primary">{f.title}</h3>
+                <p className="mt-2 text-xs leading-relaxed text-text-muted">{f.body}</p>
+              </SpotlightCard>
             ))}
-          </div>
+          </AnimatedContent>
         </section>
 
         {/* Integrations */}
         <section id="integrations" className="border-y border-border-card bg-[#0c1014]">
           <div className="mx-auto grid max-w-[1360px] grid-cols-1 gap-10 px-5 py-24 lg:grid-cols-2 lg:px-10">
-            <Reveal>
+            <AnimatedContent distance={30} duration={0.7} threshold={0.2}>
               <h2 className="text-[clamp(26px,3.2vw,38px)] font-semibold leading-tight tracking-tight text-white">
                 Telemetry from the host and the wire.
               </h2>
@@ -136,37 +219,46 @@ export function LandingPage({ onEnterDashboard }) {
                 Both integrations are optional and disabled by default. Greywatch records provenance so
                 journal, Suricata, and ingested events are always distinguishable.
               </p>
-            </Reveal>
-            <div className="flex flex-col gap-4">
+            </AnimatedContent>
+            <AnimatedContent
+              className="flex flex-col gap-4"
+              direction="horizontal"
+              distance={40}
+              duration={0.7}
+              stagger={0.1}
+              threshold={0.15}
+            >
               {INTEGRATIONS.map((it) => (
-                <Reveal key={it.name}>
-                  <div className="rounded-panel border border-border-card bg-card p-5">
-                    <h3 className="text-sm font-semibold text-text-primary">{it.name}</h3>
-                    <p className="mt-2 text-xs leading-relaxed text-text-secondary">{it.detail}</p>
-                    <p className="mt-3 font-mono text-[11px] text-text-muted">{it.types}</p>
-                  </div>
-                </Reveal>
+                <div key={it.name} className="rounded-panel border border-border-card bg-card p-5">
+                  <h3 className="text-sm font-semibold text-text-primary">{it.name}</h3>
+                  <p className="mt-2 text-xs leading-relaxed text-text-secondary">{it.detail}</p>
+                  <p className="mt-3 font-mono text-[11px] text-text-muted">{it.types}</p>
+                </div>
               ))}
-            </div>
+            </AnimatedContent>
           </div>
         </section>
 
         {/* Architecture */}
         <section id="architecture" className="mx-auto max-w-[1360px] px-5 py-24 lg:px-10">
-          <Reveal>
+          <AnimatedContent distance={30} duration={0.7} threshold={0.2}>
             <h2 className="text-[clamp(26px,3.2vw,38px)] font-semibold leading-tight tracking-tight text-white">How it works.</h2>
-          </Reveal>
-          <div className="mt-10 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-            {WORKFLOW.map((w, i) => (
-              <Reveal key={w.step} delay={i * 0.05}>
-                <div className="rounded-panel border border-border-card bg-card p-5">
-                  <span className="font-mono text-xs text-accent">{w.step}</span>
-                  <h3 className="mt-2 text-sm font-semibold text-text-primary">{w.title}</h3>
-                  <p className="mt-2 text-xs leading-relaxed text-text-muted">{w.body}</p>
-                </div>
-              </Reveal>
+          </AnimatedContent>
+          <AnimatedContent
+            className="mt-10 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4"
+            distance={50}
+            duration={0.7}
+            stagger={0.08}
+            threshold={0.15}
+          >
+            {WORKFLOW.map((w) => (
+              <div key={w.step} className="rounded-panel border border-border-card bg-card p-5">
+                <span className="font-mono text-xs text-accent">{w.step}</span>
+                <h3 className="mt-2 text-sm font-semibold text-text-primary">{w.title}</h3>
+                <p className="mt-2 text-xs leading-relaxed text-text-muted">{w.body}</p>
+              </div>
             ))}
-          </div>
+          </AnimatedContent>
         </section>
 
         {/* Footer */}

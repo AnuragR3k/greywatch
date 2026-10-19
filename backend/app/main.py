@@ -17,11 +17,15 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger("greywatch.api")
 
 from .siem import (
+    acknowledge_incident,
     close_alert,
     get_alert_detail,
+    get_incident,
     ingest_lines,
+    list_incidents,
     list_alerts,
     list_events,
+    resolve_incident,
 )
 from . import collector
 from . import suricata
@@ -291,6 +295,7 @@ def get_rate_limit_config() -> RateLimitConfig:
 # Category of each protected path, used to select the per-category limit.
 _PATH_CATEGORIES: dict[str, str] = {
     "/api/v1/events/ingest": "ingestion",
+    "/api/v1/incidents": "reads",
     "/api/v1/journal/collect": "collector",
     "/api/v1/suricata/collect": "collector",
     "/api/v1/alerts/{alert_id}/close": "alert_close",
@@ -302,6 +307,10 @@ def _category_for_path(path: str) -> str | None:
     if path in PUBLIC_PATHS:
         return None
     if path.startswith("/api/v1/alerts/") and path.endswith("/close"):
+        return "alert_close"
+    if path.startswith("/api/v1/incidents/") and (
+        path.endswith("/acknowledge") or path.endswith("/resolve")
+    ):
         return "alert_close"
     return _PATH_CATEGORIES.get(path, "reads")
 
@@ -646,6 +655,65 @@ def resolve_alert(alert_id: int):
         )
 
     return {"id": alert_id, "status": "closed"}
+
+
+@app.get("/api/v1/incidents", tags=["incidents"])
+def get_incidents(
+    status: Literal["open", "acknowledged", "resolved", "all"] = "open",
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    """List correlated incidents.
+
+    Access is governed by the Greywatch trust boundary (see
+    :func:`_trust_boundary`).
+    """
+    incidents = list_incidents(status=status, limit=limit)
+    return {"count": len(incidents), "incidents": incidents}
+
+
+@app.get("/api/v1/incidents/{incident_id}", tags=["incidents"])
+def get_incident_endpoint(incident_id: int):
+    """Return a single incident with its related events in chronological order."""
+    result = get_incident(incident_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    return result
+
+
+@app.post("/api/v1/incidents/{incident_id}/acknowledge", tags=["incidents"])
+def acknowledge_incident_endpoint(incident_id: int):
+    """Acknowledge an open incident (open -> acknowledged)."""
+    result = acknowledge_incident(incident_id)
+    if not result["ok"]:
+        if result["error"] == "not_found":
+            raise HTTPException(status_code=404, detail="Incident not found")
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot acknowledge incident in status "
+                f"'{result.get('status', 'unknown')}'"
+            ),
+        )
+    incident = get_incident(incident_id)
+    return {"id": incident_id, "status": incident["status"]}
+
+
+@app.post("/api/v1/incidents/{incident_id}/resolve", tags=["incidents"])
+def resolve_incident_endpoint(incident_id: int):
+    """Resolve an open or acknowledged incident (-> resolved)."""
+    result = resolve_incident(incident_id)
+    if not result["ok"]:
+        if result["error"] == "not_found":
+            raise HTTPException(status_code=404, detail="Incident not found")
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot resolve incident in status "
+                f"'{result.get('status', 'unknown')}'"
+            ),
+        )
+    incident = get_incident(incident_id)
+    return {"id": incident_id, "status": incident["status"]}
 
 
 @app.get("/api/v1/journal/status", tags=["journal"])

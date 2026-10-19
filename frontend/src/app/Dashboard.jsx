@@ -7,6 +7,7 @@ import { NAV_ITEMS, navItemForPath } from './routes'
 import { useAlerts, useHealth } from '@/hooks/useTelemetry'
 import { OverviewPage } from '@/features/overview/OverviewPage'
 import { AlertsPage } from '@/features/alerts/AlertsPage'
+import { IncidentsPage } from '@/features/incidents/IncidentsPage'
 import { EventsPage } from '@/features/events/EventsPage'
 import { JournalPage } from '@/features/collectors/JournalPage'
 import { SuricataPage } from '@/features/collectors/SuricataPage'
@@ -14,6 +15,7 @@ import { SettingsPage } from '@/features/settings/SettingsPage'
 
 function renderView(path, onNavigate) {
   if (path.startsWith('/dashboard/alerts')) return <AlertsPage />
+  if (path.startsWith('/dashboard/incidents')) return <IncidentsPage />
   if (path.startsWith('/dashboard/events')) return <EventsPage />
   if (path.startsWith('/dashboard/journal')) return <JournalPage />
   if (path.startsWith('/dashboard/suricata')) return <SuricataPage />

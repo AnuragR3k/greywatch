@@ -4,11 +4,21 @@
 
 import { Menu, RefreshCw } from 'lucide-react'
 import { GithubIcon } from '@/components/icons/GithubIcon'
+import PillNav from '@/components/navigation/PillNav'
 import { cn } from '@/lib/utils'
 import { StatusDot } from '@/components/ui/StatusDot'
 import { Button } from '@/components/ui/Button'
 
 const GITHUB_URL = 'https://github.com/AnuragR3k/greywatch'
+
+// Compact top-level quick switch. Deliberately a subset of the sidebar — the
+// sidebar remains the full navigation; this only surfaces the most-used views
+// and is shown on wide layouts where there is room.
+const QUICK_NAV = [
+  { label: 'Overview', href: '#/dashboard' },
+  { label: 'Alerts', href: '#/dashboard/alerts' },
+  { label: 'Events', href: '#/dashboard/events' },
+]
 
 const API_LABEL = {
   healthy: 'API online',
@@ -16,7 +26,7 @@ const API_LABEL = {
   unknown: 'Connecting…',
 }
 
-export function TopBar({ title, subtitle, apiState, onRefresh, refreshing, onMenuToggle, mobileOpen }) {
+export function TopBar({ title, subtitle, apiState, activePath = '/dashboard', onRefresh, refreshing, onMenuToggle, mobileOpen }) {
   return (
     <header className="sticky top-0 z-30 border-b border-border-card bg-background/80 backdrop-blur-md">
       <div className="flex items-center gap-3 px-4 py-3">
@@ -33,6 +43,27 @@ export function TopBar({ title, subtitle, apiState, onRefresh, refreshing, onMen
         <div className="min-w-0 flex-1">
           <h1 className="truncate text-sm font-semibold tracking-wide text-text-primary">{title}</h1>
           {subtitle && <p className="truncate text-[11px] text-text-muted">{subtitle}</p>}
+        </div>
+
+        <div className="hidden xl:block">
+          <PillNav
+            items={QUICK_NAV}
+            activeHref={`#${activePath}`}
+            theme="dark"
+            layout="joined"
+            surface="glass"
+            size="sm"
+            itemStyle="pill"
+            hoverEffect="fill"
+            indicator="dot"
+            barColor="rgba(17, 22, 27, 0.72)"
+            highlightColor="#34d399"
+            bounce={0.3}
+            stretch={0.5}
+            collapse="never"
+            intro={false}
+            ariaLabel="Primary"
+          />
         </div>
 
         <div className="flex items-center gap-2">

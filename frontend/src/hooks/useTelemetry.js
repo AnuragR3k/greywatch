@@ -9,6 +9,10 @@ import {
   fetchAlerts,
   fetchAlertDetail,
   closeAlert,
+  fetchIncidents,
+  fetchIncidentDetail,
+  acknowledgeIncident,
+  resolveIncident,
   fetchJournalStatus,
   fetchSuricataStatus,
   collectJournal,
@@ -37,6 +41,21 @@ export function useAlertDetail(id) {
   return useResource(
     (o = {}) => (id != null ? fetchAlertDetail(id, { signal: o.signal }) : null),
     `alert-detail:${id}`,
+    { immediate: id != null },
+  )
+}
+
+export function useIncidents({ status = 'all', limit = 100 } = {}) {
+  return useResource(
+    (o = {}) => fetchIncidents({ status, limit, signal: o.signal }),
+    `incidents:${status}:${limit}`,
+  )
+}
+
+export function useIncidentDetail(id) {
+  return useResource(
+    (o = {}) => (id != null ? fetchIncidentDetail(id, { signal: o.signal }) : null),
+    `incident-detail:${id}`,
     { immediate: id != null },
   )
 }
@@ -81,6 +100,14 @@ function useMutation(fn) {
 
 export function useCloseAlert() {
   return useMutation((id) => closeAlert(id))
+}
+
+export function useAcknowledgeIncident() {
+  return useMutation((id) => acknowledgeIncident(id))
+}
+
+export function useResolveIncident() {
+  return useMutation((id) => resolveIncident(id))
 }
 
 export function useCollectJournal() {

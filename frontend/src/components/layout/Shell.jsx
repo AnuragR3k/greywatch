@@ -60,6 +60,7 @@ export function Shell({
           title={title}
           subtitle={subtitle}
           apiState={apiState}
+          activePath={activePath}
           onRefresh={onRefresh}
           refreshing={refreshing}
           onMenuToggle={() => setMobileOpen((o) => !o)}

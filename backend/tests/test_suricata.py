@@ -1145,11 +1145,13 @@ def test_evaluate_detections_dispatches_all_rules(_db):
     suri_event = parse_eve_record(rec, raw_line=json.dumps(rec))
 
     with _connection() as connection:
-        inserted, alerts = siem._store_events_and_detect(
+        inserted, alerts, incidents = siem._store_events_and_detect(
             [*ssh_events, suri_event], connection
         )
 
     assert [a["rule_id"] for a in alerts] == ["SSH_BRUTE_FORCE", "SURICATA_ALERT"]
+    # No ``ssh_login_success`` event, so the correlation rule fires no incident.
+    assert incidents == []
     assert len(inserted) == len(ssh_events) + 1
     assert {a["rule_id"] for a in _alert_rows()} == {
         "SSH_BRUTE_FORCE",

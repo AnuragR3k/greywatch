@@ -175,7 +175,7 @@ Expected key fields:
 
 ### Viewing the result in the dashboard
 
-The dashboard polls exactly these endpoints every 10 seconds and renders them in
+The dashboard polls exactly these endpoints every 15 seconds and renders them in
 the **Alerts** feed (Rule ID, Severity badge, Status badge, Source IP, Event
 count), the **Security Events** table (Source badge, Type badge, Severity, Raw
 message, expandable detail), and the **Alert Evidence** drawer
@@ -292,7 +292,7 @@ curl -s "http://127.0.0.1:8000/api/v1/events?limit=20" | python3 -m json.tool | 
 | `required tool 'uvicorn' not found` | Activate the venv: `source .venv/bin/activate`, or run from the repo root so `.venv/bin/uvicorn` resolves. |
 | Alert not raised after ingest | Confirm exactly 5 lines were sent and all parsed (`parsed: 5`). Fewer than 5 within the 5-minute window raises no alert by design. |
 | Production `data/greywatch.db` shows unexpected rows | The test never writes to it (temp DB only). If you ever see otherwise, stop the script and report it; the script refuses to start if the temp DB is non-empty. |
-| Dashboard shows stale data | The dashboard polls every 10 s; wait one poll, or click refresh in the UI. |
+| Dashboard shows stale data | The dashboard polls every 15 s; wait one poll, or click refresh in the UI. |
 | Vite proxy 502 / cannot reach API | The dashboard proxies to `:8000`. Start your dev API on `:8000` (isolated DB per §6) or adjust `frontend/vite.config.js`. |
 
 ---

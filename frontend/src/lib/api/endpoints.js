@@ -2,7 +2,7 @@
 // normalized data (arrays for collections, objects for single resources).
 
 import { get, post } from './client'
-import { API_PATHS, ALERT_STATUSES, DEFAULT_LIMIT, MAX_LIMIT } from './config'
+import { API_PATHS, ALERT_STATUSES, DEFAULT_LIMIT, INCIDENT_STATUSES, MAX_LIMIT } from './config'
 
 const clampLimit = (n) => Math.min(Math.max(Number(n) || DEFAULT_LIMIT, 1), MAX_LIMIT)
 
@@ -39,6 +39,29 @@ export function fetchAlertDetail(id, options = {}) {
 /* POST /api/v1/alerts/{id}/close -> { id, status: 'closed' } */
 export function closeAlert(id, options = {}) {
   return post(API_PATHS.closeAlert(id), null, options)
+}
+
+/* GET /api/v1/incidents?status=&limit= -> incident[] */
+export async function fetchIncidents({ status = 'all', limit = DEFAULT_LIMIT, signal } = {}) {
+  const safeStatus = INCIDENT_STATUSES.includes(status) ? status : 'all'
+  const data = await get(`${API_PATHS.incidents}?status=${safeStatus}&limit=${clampLimit(limit)}`, { signal })
+  if (Array.isArray(data)) return data
+  return Array.isArray(data?.incidents) ? data.incidents : []
+}
+
+/* GET /api/v1/incidents/{id} -> { incident, related_events, related_event_ids } */
+export function fetchIncidentDetail(id, options = {}) {
+  return get(API_PATHS.incidentDetail(id), options)
+}
+
+/* POST /api/v1/incidents/{id}/acknowledge -> { id, status: 'acknowledged' } */
+export function acknowledgeIncident(id, options = {}) {
+  return post(API_PATHS.acknowledgeIncident(id), null, options)
+}
+
+/* POST /api/v1/incidents/{id}/resolve -> { id, status: 'resolved' } */
+export function resolveIncident(id, options = {}) {
+  return post(API_PATHS.resolveIncident(id), null, options)
 }
 
 /* GET /api/v1/journal/status */

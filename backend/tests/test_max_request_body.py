@@ -517,4 +517,3 @@ def test_asgi_misleading_content_length_actual_bytes_enforced(
     messages = anyio.run(run)
 
     assert messages[0]["status"] == 413
-

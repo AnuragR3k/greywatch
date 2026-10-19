@@ -156,10 +156,12 @@ export const alertNetworkSummary = formatNetworkSummary
 
 export const SSH_BRUTE_FORCE_RULE = 'SSH_BRUTE_FORCE'
 export const SURICATA_ALERT_RULE = 'SURICATA_ALERT'
+export const SSH_BRUTE_FORCE_THEN_SUCCESS_RULE = 'SSH_BRUTE_FORCE_THEN_SUCCESS'
 
 const RULE_LABELS = {
   [SSH_BRUTE_FORCE_RULE]: 'SSH brute force',
   [SURICATA_ALERT_RULE]: 'Suricata IDS',
+  [SSH_BRUTE_FORCE_THEN_SUCCESS_RULE]: 'SSH brute force → success',
 }
 
 export function isSuricataAlert(alert) {
@@ -169,6 +171,18 @@ export function isSuricataAlert(alert) {
 export function alertRuleLabel(ruleId) {
   if (!hasValue(ruleId)) return 'Unknown rule'
   return RULE_LABELS[ruleId] || String(ruleId).replace(/_/g, ' ').toLowerCase()
+}
+
+export function incidentRuleLabel(ruleId) {
+  if (!hasValue(ruleId)) return 'Unknown rule'
+  return RULE_LABELS[ruleId] || String(ruleId).replace(/_/g, ' ').toLowerCase()
+}
+
+export function incidentSearchText(incident) {
+  return [
+    incident?.title, incident?.rule_id, incident?.description, incident?.status, incident?.severity,
+    incident?.source_ip, incidentRuleLabel(incident?.rule_id),
+  ].filter(hasValue).map((v) => String(v).toLowerCase())
 }
 
 export function suricataSeverityFromAlert(alert) {

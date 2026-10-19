@@ -502,7 +502,9 @@ def collect_once(config: SuricataConfig | None = None) -> CollectResult:
             if (e["timestamp"], e["host"], e["raw_message"]) not in existing_keys
         ]
 
-        inserted, new_alerts = siem._store_events_and_detect(new_events, connection)
+        inserted, new_alerts, _new_incidents = siem._store_events_and_detect(
+            new_events, connection
+        )
 
         advanced_ts = inserted[-1]["timestamp"] if inserted else last_event_ts
         _set_state(

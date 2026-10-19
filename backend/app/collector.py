@@ -626,7 +626,9 @@ def collect_once(config: CollectorConfig | None = None) -> CollectResult:
             if (e["timestamp"], e["host"], e["raw_message"]) not in existing_keys
         ]
 
-        inserted, new_alerts = siem._store_events_and_detect(new_events, connection)
+        inserted, new_alerts, _new_incidents = siem._store_events_and_detect(
+            new_events, connection
+        )
 
         # Advance the checkpoint in the same transaction as the inserts so a
         # crash cannot leave events stored but the cursor un-advanced.

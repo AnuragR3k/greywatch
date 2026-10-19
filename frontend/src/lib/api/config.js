@@ -66,9 +66,14 @@ export const API_PATHS = {
   journalCollect: '/api/v1/journal/collect',
   suricataStatus: '/api/v1/suricata/status',
   suricataCollect: '/api/v1/suricata/collect',
+  incidents: '/api/v1/incidents',
+  incidentDetail: (id) => `/api/v1/incidents/${id}`,
+  acknowledgeIncident: (id) => `/api/v1/incidents/${id}/acknowledge`,
+  resolveIncident: (id) => `/api/v1/incidents/${id}/resolve`,
 }
 
 export const ALERT_STATUSES = ['open', 'closed', 'all']
+export const INCIDENT_STATUSES = ['open', 'acknowledged', 'resolved', 'all']
 export const DEFAULT_LIMIT = 100
 export const MAX_LIMIT = 500
 export const POLL_INTERVAL_MS = 15000
