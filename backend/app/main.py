@@ -19,6 +19,7 @@ logger = logging.getLogger("greywatch.api")
 from .siem import (
     acknowledge_incident,
     close_alert,
+    count_incidents,
     get_alert_detail,
     get_incident,
     ingest_lines,
@@ -661,14 +662,23 @@ def resolve_alert(alert_id: int):
 def get_incidents(
     status: Literal["open", "acknowledged", "resolved", "all"] = "open",
     limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
 ):
     """List correlated incidents.
+
+    Supports server-side pagination via ``limit`` and ``offset``. ``count`` is
+    the number of incidents on this page; ``total`` is the number of incidents
+    matching ``status`` across all pages.
 
     Access is governed by the Greywatch trust boundary (see
     :func:`_trust_boundary`).
     """
-    incidents = list_incidents(status=status, limit=limit)
-    return {"count": len(incidents), "incidents": incidents}
+    incidents = list_incidents(status=status, limit=limit, offset=offset)
+    return {
+        "count": len(incidents),
+        "total": count_incidents(status=status),
+        "incidents": incidents,
+    }
 
 
 @app.get("/api/v1/incidents/{incident_id}", tags=["incidents"])

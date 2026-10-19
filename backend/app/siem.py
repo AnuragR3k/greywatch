@@ -1094,10 +1094,18 @@ def _upsert_incident(
 
 
 def list_incidents(
-    status: str = "open", limit: int = 100
+    status: str = "open", limit: int = 100, offset: int = 0
 ) -> list[dict]:
-    """List incidents, ordered by first seen (newest first)."""
+    """List correlated incidents, ordered by first seen (newest first).
+
+    ``offset`` skips the first ``offset`` matching rows so callers can page
+    through the result set. The total number of matching incidents is not
+    returned here; callers that need it should run a separate COUNT query.
+    """
     initialize_database()
+
+    if offset < 0:
+        offset = 0
 
     with _connection() as connection:
         if status == "all":
@@ -1105,9 +1113,9 @@ def list_incidents(
                 """
                 SELECT * FROM incidents
                 ORDER BY first_seen_at DESC, id DESC
-                LIMIT ?
+                LIMIT ? OFFSET ?
                 """,
-                (limit,),
+                (limit, offset),
             ).fetchall()
         else:
             rows = connection.execute(
@@ -1115,12 +1123,34 @@ def list_incidents(
                 SELECT * FROM incidents
                 WHERE status = ?
                 ORDER BY first_seen_at DESC, id DESC
-                LIMIT ?
+                LIMIT ? OFFSET ?
                 """,
-                (status, limit),
+                (status, limit, offset),
             ).fetchall()
 
     return [dict(row) for row in rows]
+
+
+def count_incidents(status: str = "open") -> int:
+    """Return the total number of incidents matching ``status``.
+
+    Used alongside :func:`list_incidents` so clients can compute the number of
+    pages without fetching every row.
+    """
+    initialize_database()
+
+    with _connection() as connection:
+        if status == "all":
+            row = connection.execute(
+                "SELECT COUNT(*) AS total FROM incidents"
+            ).fetchone()
+        else:
+            row = connection.execute(
+                "SELECT COUNT(*) AS total FROM incidents WHERE status = ?",
+                (status,),
+            ).fetchone()
+
+    return int(row["total"])
 
 
 def get_incident(incident_id: int) -> dict | None:

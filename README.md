@@ -161,7 +161,8 @@ The correlation window defaults to 30 minutes and is configurable via the `GREYW
 
 Endpoints:
 
-- `GET /api/v1/incidents`
+- `GET /api/v1/incidents` — supports `status`, `limit` (max 500), and `offset`
+  query parameters; returns `count`, `total`, and `incidents`.
 - `GET /api/v1/incidents/{id}`
 - `POST /api/v1/incidents/{id}/acknowledge`
 - `POST /api/v1/incidents/{id}/resolve`

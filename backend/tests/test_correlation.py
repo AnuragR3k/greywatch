@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 from backend.app import main
 from backend.app.siem import (
     SSH_BRUTE_FORCE_THEN_SUCCESS_RULE,
+    count_incidents,
     get_incident,
     ingest_events,
     initialize_database,
@@ -462,3 +463,102 @@ def test_ssh_brute_force_alert_regression(tmp_path, _window_env, monkeypatch):
     assert result["alerts"][0]["rule_id"] == "SSH_BRUTE_FORCE"
     assert result["alerts"][0]["severity"] == "high"
     assert result["alerts"][0]["status"] == "open"
+
+
+def _make_incident(db_path, ip, monkeypatch):
+    """Create one ``SSH_BRUTE_FORCE_THEN_SUCCESS`` incident for ``ip``."""
+    monkeypatch.setenv("GREYWATCH_DB", str(db_path))
+    initialize_database()
+    events = [
+        *_failures(5, ip, start_minutes_ago=20),
+        _ssh_event("ssh_login_success", ip, -14),
+    ]
+    return ingest_events(events)["incidents"][0]
+
+
+def test_list_incidents_offset_pagination(tmp_path, _window_env, monkeypatch):
+    """list_incidents honors limit/offset and count_incidents reports the total."""
+    db_path = tmp_path / "paginate.db"
+    ips = [f"203.0.113.{10 + i}" for i in range(7)]
+    for ip in ips:
+        _make_incident(db_path, ip, monkeypatch)
+
+    monkeypatch.setenv("GREYWATCH_DB", str(db_path))
+    initialize_database()
+
+    assert count_incidents(status="all") == 7
+
+    first = list_incidents(status="all", limit=3, offset=0)
+    assert len(first) == 3
+
+    second = list_incidents(status="all", limit=3, offset=3)
+    assert len(second) == 3
+    assert {i["id"] for i in second}.isdisjoint({i["id"] for i in first})
+
+    third = list_incidents(status="all", limit=3, offset=6)
+    assert len(third) == 1
+
+    fourth = list_incidents(status="all", limit=3, offset=9)
+    assert fourth == []
+
+
+def test_list_incidents_offset_clamps_negative(tmp_path, _window_env, monkeypatch):
+    """A negative offset is treated as zero rather than erroring."""
+    db_path = tmp_path / "clamp.db"
+    _make_incident(db_path, ATTACK_IP, monkeypatch)
+
+    monkeypatch.setenv("GREYWATCH_DB", str(db_path))
+    initialize_database()
+
+    assert len(list_incidents(status="all", limit=5, offset=-5)) == 1
+
+
+def test_incidents_api_pagination_returns_total_and_offset(
+    tmp_path, _window_env, monkeypatch
+):
+    """GET /api/v1/incidents supports limit/offset and returns total count."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "api_paginate.db"))
+    initialize_database()
+
+    ips = [f"203.0.113.{20 + i}" for i in range(5)]
+    for ip in ips:
+        events = [
+            *_failures(5, ip, start_minutes_ago=20),
+            _ssh_event("ssh_login_success", ip, -14),
+        ]
+        ingest_events(events)
+
+    # Page 1: limit 2, offset 0.
+    r1 = client.get("/api/v1/incidents?status=all&limit=2&offset=0")
+    assert r1.status_code == 200
+    b1 = r1.json()
+    assert b1["total"] == 5
+    assert b1["count"] == 2
+    assert len(b1["incidents"]) == 2
+
+    # Page 2: limit 2, offset 2 — no overlap with page 1.
+    r2 = client.get("/api/v1/incidents?status=all&limit=2&offset=2")
+    assert r2.status_code == 200
+    b2 = r2.json()
+    assert b2["total"] == 5
+    assert b2["count"] == 2
+    assert len(b2["incidents"]) == 2
+    assert {i["id"] for i in b2["incidents"]}.isdisjoint(
+        {i["id"] for i in b1["incidents"]}
+    )
+
+    # Page 3: offset 4 -> single remaining item.
+    r3 = client.get("/api/v1/incidents?status=all&limit=2&offset=4")
+    assert r3.status_code == 200
+    b3 = r3.json()
+    assert b3["total"] == 5
+    assert b3["count"] == 1
+    assert len(b3["incidents"]) == 1
+
+    # Beyond range: empty page, total still reported.
+    r4 = client.get("/api/v1/incidents?status=all&limit=2&offset=10")
+    assert r4.status_code == 200
+    b4 = r4.json()
+    assert b4["total"] == 5
+    assert b4["count"] == 0
+    assert b4["incidents"] == []

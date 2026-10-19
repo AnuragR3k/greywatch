@@ -45,10 +45,10 @@ export function useAlertDetail(id) {
   )
 }
 
-export function useIncidents({ status = 'all', limit = 100 } = {}) {
+export function useIncidents({ status = 'all', limit = 100, offset = 0 } = {}) {
   return useResource(
-    (o = {}) => fetchIncidents({ status, limit, signal: o.signal }),
-    `incidents:${status}:${limit}`,
+    (o = {}) => fetchIncidents({ status, limit, offset, signal: o.signal }),
+    `incidents:${status}:${limit}:${offset}`
   )
 }
 

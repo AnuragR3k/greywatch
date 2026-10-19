@@ -20,7 +20,7 @@ export function IncidentDetailDrawer({ incidentId, onClose, onStatusChange }) {
   const [confirming, setConfirming] = useState(false)
   const [confirmAction, setConfirmAction] = useState(null)
 
-  const incident = data?.incident
+  const incident = data
   const related = Array.isArray(data?.related_events) ? data.related_events : []
 
   const handleAction = useCallback(async () => {

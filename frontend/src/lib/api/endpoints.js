@@ -41,12 +41,26 @@ export function closeAlert(id, options = {}) {
   return post(API_PATHS.closeAlert(id), null, options)
 }
 
-/* GET /api/v1/incidents?status=&limit= -> incident[] */
-export async function fetchIncidents({ status = 'all', limit = DEFAULT_LIMIT, signal } = {}) {
-  const safeStatus = INCIDENT_STATUSES.includes(status) ? status : 'all'
-  const data = await get(`${API_PATHS.incidents}?status=${safeStatus}&limit=${clampLimit(limit)}`, { signal })
-  if (Array.isArray(data)) return data
-  return Array.isArray(data?.incidents) ? data.incidents : []
+/* GET /api/v1/incidents?status=&limit=&offset= -> { count, total, incidents[] } */
+export async function fetchIncidents({
+  status = "all",
+  limit = DEFAULT_LIMIT,
+  offset = 0,
+  signal,
+} = {}) {
+  const safeStatus = INCIDENT_STATUSES.includes(status) ? status : "all"
+  const data = await get(
+    `${API_PATHS.incidents}?status=${safeStatus}&limit=${clampLimit(
+      limit
+    )}&offset=${Math.max(Number(offset) || 0, 0)}`,
+    { signal }
+  )
+  if (Array.isArray(data)) return { count: data.length, total: data.length, incidents: data }
+  return {
+    count: Array.isArray(data?.incidents) ? data.incidents.length : 0,
+    total: Number.isFinite(Number(data?.total)) ? Number(data.total) : 0,
+    incidents: Array.isArray(data?.incidents) ? data.incidents : [],
+  }
 }
 
 /* GET /api/v1/incidents/{id} -> { incident, related_events, related_event_ids } */
