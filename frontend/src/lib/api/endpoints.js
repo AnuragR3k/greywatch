@@ -23,12 +23,28 @@ export function ingestLines(lines, options = {}) {
   return post(`${API_PATHS.events}/ingest`, { lines }, options)
 }
 
-/* GET /api/v1/alerts?status=&limit= -> alert[] */
-export async function fetchAlerts({ status = 'all', limit = DEFAULT_LIMIT, signal } = {}) {
+/* GET /api/v1/alerts?status=&limit=&offset=&source_ip= -> { count, total, alerts[] } */
+export async function fetchAlerts({
+  status = 'all',
+  limit = DEFAULT_LIMIT,
+  offset = 0,
+  source_ip,
+  signal,
+} = {}) {
   const safeStatus = ALERT_STATUSES.includes(status) ? status : 'all'
-  const data = await get(`${API_PATHS.alerts}?status=${safeStatus}&limit=${clampLimit(limit)}`, { signal })
-  if (Array.isArray(data)) return data
-  return Array.isArray(data?.alerts) ? data.alerts : []
+  const params = new URLSearchParams({
+    status: safeStatus,
+    limit: String(clampLimit(limit)),
+    offset: String(Math.max(Number(offset) || 0, 0)),
+  })
+  if (source_ip) params.set('source_ip', source_ip)
+  const data = await get(`${API_PATHS.alerts}?${params}`, { signal })
+  if (Array.isArray(data)) return { count: data.length, total: data.length, alerts: data }
+  return {
+    count: Array.isArray(data?.alerts) ? data.alerts.length : 0,
+    total: Number.isFinite(Number(data?.total)) ? Number(data.total) : 0,
+    alerts: Array.isArray(data?.alerts) ? data.alerts : [],
+  }
 }
 
 /* GET /api/v1/alerts/{id} -> { alert, evidence_window_start, evidence_window_end, evidence_events } */

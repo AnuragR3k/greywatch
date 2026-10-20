@@ -19,6 +19,7 @@ logger = logging.getLogger("greywatch.api")
 from .siem import (
     acknowledge_incident,
     close_alert,
+    count_alerts,
     count_incidents,
     get_alert_detail,
     get_incident,
@@ -648,9 +649,20 @@ def get_events(
 def get_alerts(
     status: Literal["open", "closed", "all"] = "open",
     limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    source_ip: str | None = Query(default=None),
 ):
-    alerts = list_alerts(status=status, limit=limit)
-    return {"count": len(alerts), "alerts": alerts}
+    """List alerts with server-side pagination and optional source-IP filter.
+
+    ``count`` is the number of alerts on this page; ``total`` is the number of
+    alerts matching ``status``/``source_ip`` across all pages.
+    """
+    alerts = list_alerts(status=status, limit=limit, offset=offset, source_ip=source_ip)
+    return {
+        "count": len(alerts),
+        "total": count_alerts(status=status, source_ip=source_ip),
+        "alerts": alerts,
+    }
 
 
 @app.get("/api/v1/alerts/{alert_id}", tags=["alerts"])
@@ -677,20 +689,24 @@ def get_incidents(
     status: Literal["open", "acknowledged", "resolved", "all"] = "open",
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
+    source_ip: str | None = Query(default=None),
 ):
     """List correlated incidents.
 
-    Supports server-side pagination via ``limit`` and ``offset``. ``count`` is
-    the number of incidents on this page; ``total`` is the number of incidents
-    matching ``status`` across all pages.
+    Supports server-side pagination via ``limit`` and ``offset`` and optional
+    filtering by ``source_ip``. ``count`` is the number of incidents on this
+    page; ``total`` is the number of incidents matching ``status``/``source_ip``
+    across all pages.
 
     Access is governed by the Greywatch trust boundary (see
     :func:`_trust_boundary`).
     """
-    incidents = list_incidents(status=status, limit=limit, offset=offset)
+    incidents = list_incidents(
+        status=status, limit=limit, offset=offset, source_ip=source_ip
+    )
     return {
         "count": len(incidents),
-        "total": count_incidents(status=status),
+        "total": count_incidents(status=status, source_ip=source_ip),
         "incidents": incidents,
     }
 

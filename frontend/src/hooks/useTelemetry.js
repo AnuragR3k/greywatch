@@ -30,11 +30,25 @@ export function useEvents({ limit = 100 } = {}) {
   )
 }
 
-export function useAlerts({ status = 'all', limit = 100 } = {}) {
-  return useResource(
-    (o = {}) => fetchAlerts({ status, limit, signal: o.signal }),
-    `alerts:${status}:${limit}`,
+export function useAlerts({
+  status = 'all',
+  limit = 100,
+  offset = 0,
+  source_ip,
+} = {}) {
+  const resource = useResource(
+    (o = {}) =>
+      fetchAlerts({ status, limit, offset, source_ip, signal: o.signal }),
+    `alerts:${status}:${limit}:${offset}:${source_ip ?? ''}`,
   )
+  return {
+    ...resource,
+    // `data` stays an alerts array so existing consumers (Dashboard) are
+    // unaffected; `count`/`total` expose server-side pagination.
+    data: resource.data?.alerts ?? null,
+    count: resource.data?.count ?? 0,
+    total: resource.data?.total ?? 0,
+  }
 }
 
 export function useAlertDetail(id) {
@@ -45,11 +59,23 @@ export function useAlertDetail(id) {
   )
 }
 
-export function useIncidents({ status = 'all', limit = 100, offset = 0 } = {}) {
-  return useResource(
-    (o = {}) => fetchIncidents({ status, limit, offset, signal: o.signal }),
-    `incidents:${status}:${limit}:${offset}`
+export function useIncidents({
+  status = 'all',
+  limit = 100,
+  offset = 0,
+  source_ip,
+} = {}) {
+  const resource = useResource(
+    (o = {}) =>
+      fetchIncidents({ status, limit, offset, source_ip, signal: o.signal }),
+    `incidents:${status}:${limit}:${offset}:${source_ip ?? ''}`,
   )
+  return {
+    ...resource,
+    data: resource.data?.incidents ?? null,
+    count: resource.data?.count ?? 0,
+    total: resource.data?.total ?? 0,
+  }
 }
 
 export function useIncidentDetail(id) {

@@ -611,6 +611,55 @@ def test_brute_force_threshold_is_per_source_ip(tmp_path, monkeypatch):
     assert client.get("/api/v1/alerts?status=all&limit=100").json()["count"] == 2
 
 
+def test_alerts_listing_pagination_offset_and_total(tmp_path, monkeypatch):
+    """The alerts listing returns a true total and honors limit/offset."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "page.db"))
+    ip_a, ip_b, ip_c = "203.0.113.10", "198.51.100.7", "198.51.100.8"
+    lines = (
+        [_failed_login_line(i, ip_a) for i in range(5)]
+        + [_failed_login_line(i, ip_b, port=55000) for i in range(5)]
+        + [_failed_login_line(i, ip_c, port=56000) for i in range(5)]
+    )
+    client.post("/api/v1/events/ingest", json={"lines": lines})
+
+    first = client.get("/api/v1/alerts?status=all&limit=2&offset=0").json()
+    assert first["count"] == 2
+    assert first["total"] == 3
+    assert len(first["alerts"]) == 2
+
+    second = client.get("/api/v1/alerts?status=all&limit=2&offset=2").json()
+    assert second["count"] == 1
+    assert second["total"] == 3
+    assert {a["id"] for a in second["alerts"]}.isdisjoint({a["id"] for a in first["alerts"]})
+
+    third = client.get("/api/v1/alerts?status=all&limit=2&offset=4").json()
+    assert third["count"] == 0
+    assert third["total"] == 3
+    assert third["alerts"] == []
+
+
+def test_alerts_listing_source_ip_filter(tmp_path, monkeypatch):
+    """The alerts listing can be narrowed to a single source IP."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "filter.db"))
+    ip_a, ip_b = "203.0.113.10", "198.51.100.7"
+    lines = (
+        [_failed_login_line(i, ip_a) for i in range(5)]
+        + [_failed_login_line(i, ip_b, port=55000) for i in range(5)]
+    )
+    client.post("/api/v1/events/ingest", json={"lines": lines})
+
+    filtered = client.get(f"/api/v1/alerts?status=all&limit=100&source_ip={ip_a}").json()
+    assert filtered["count"] == 1
+    assert filtered["total"] == 1
+    assert filtered["alerts"][0]["source_ip"] == ip_a
+
+    # A source IP with no alerts returns an empty page with total 0.
+    none = client.get("/api/v1/alerts?status=all&limit=100&source_ip=10.0.0.99").json()
+    assert none["count"] == 0
+    assert none["total"] == 0
+    assert none["alerts"] == []
+
+
 def _ssh_failed_event(
     source_ip: str,
     timestamp: str,

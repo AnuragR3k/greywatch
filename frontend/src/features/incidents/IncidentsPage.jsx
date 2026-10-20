@@ -38,9 +38,10 @@ const SEVERITY_OPTIONS = [
 
 export function IncidentsPage() {
   // Fetch the complete matching result set for the selected status (up to the
-  // 500-record API cap). Severity and search are then applied client-side over
-  // this complete set — never over a truncated page — so filters stay correct.
-  const { data: incidentsPage, loading, error, refetch } = useIncidents({
+  // 500-record API cap). Severity, source IP, and search are then applied
+  // client-side over this complete set — never over a truncated page — so
+  // filters stay correct. ``total`` is the server-side total across all pages.
+  const { data: incidents, loading, error, refetch, total: serverTotal } = useIncidents({
     status: 'all',
     limit: 500,
     offset: 0,
@@ -51,20 +52,23 @@ export function IncidentsPage() {
   const [search, setSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState('open')
   const [severityFilter, setSeverityFilter] = useState('all')
+  const [sourceIpFilter, setSourceIpFilter] = useState('')
   const [page, setPage] = useState(1)
   const [viewingId, setViewingId] = useState(null)
   const [confirmId, setConfirmId] = useState(null)
   const [confirmAction, setConfirmAction] = useState(null)
 
-  // Complete, filtered result set for the current status/severity/search.
+  // Complete, filtered result set for the current status/severity/source-IP/search.
   const allRows = useMemo(() => {
-    const list = (incidentsPage?.incidents ?? []).filter((i) => {
+    const term = search.trim().toLowerCase()
+    const sourceIp = sourceIpFilter.trim()
+    const list = (incidents ?? []).filter((i) => {
       // Status is already applied server-side; re-apply defensively in case the
       // status filter changes without a refetch.
       if (statusFilter !== 'all' && i.status !== statusFilter) return false
       if (severityFilter !== 'all' && i.severity !== severityFilter) return false
-      if (search) {
-        const term = search.trim().toLowerCase()
+      if (sourceIp && String(i.source_ip).toLowerCase() !== sourceIp.toLowerCase()) return false
+      if (term) {
         if (!incidentSearchText(i).some((v) => v.includes(term))) return false
       }
       return true
@@ -76,9 +80,9 @@ export function IncidentsPage() {
       if (av > bv) return -1
       return 0
     })
-  }, [incidentsPage, statusFilter, severityFilter, search])
+  }, [incidents, statusFilter, severityFilter, sourceIpFilter, search])
 
-  const total = incidentsPage?.total ?? allRows.length
+  const total = serverTotal || allRows.length
   const totalPages = Math.max(1, Math.ceil(allRows.length / PAGE_SIZE))
   // Clamp to a valid page when the result set shrinks (items resolved/deleted
   // while viewing a later page) or when filters change.
@@ -90,7 +94,7 @@ export function IncidentsPage() {
   // page is no longer valid (items resolved/deleted while viewing a later page).
   useEffect(() => {
     if (page > totalPages) setPage(1)
-  }, [statusFilter, severityFilter, search, totalPages, page])
+  }, [statusFilter, severityFilter, sourceIpFilter, search, totalPages, page])
 
   const handleAction = useCallback(async () => {
     if (confirmId == null || !confirmAction) return
@@ -113,7 +117,7 @@ export function IncidentsPage() {
     [currentPage, totalPages]
   )
 
-  const isError = error && !incidentsPage
+  const isError = error && !incidents
 
   return (
     <div className="flex flex-col gap-4">
@@ -139,6 +143,14 @@ export function IncidentsPage() {
             }}
             options={SEVERITY_OPTIONS}
             className="w-44"
+          />
+          <input
+            type="search"
+            value={sourceIpFilter}
+            onChange={(e) => { setSourceIpFilter(e.target.value); setPage(1) }}
+            placeholder="Source IP…"
+            aria-label="Filter by source IP"
+            className="h-8 w-full min-w-[160px] rounded-md border border-border-card bg-card px-3 text-xs text-text-primary placeholder:text-text-muted outline-none focus:border-accent"
           />
           <input
             type="search"

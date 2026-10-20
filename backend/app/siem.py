@@ -1206,13 +1206,14 @@ def _upsert_incident(
 
 
 def list_incidents(
-    status: str = "open", limit: int = 100, offset: int = 0
+    status: str = "open", limit: int = 100, offset: int = 0, source_ip: str | None = None
 ) -> list[dict]:
     """List correlated incidents, ordered by first seen (newest first).
 
     ``offset`` skips the first ``offset`` matching rows so callers can page
-    through the result set. The total number of matching incidents is not
-    returned here; callers that need it should run a separate COUNT query.
+    through the result set. ``source_ip`` narrows results to a single source
+    IP when provided. The total number of matching incidents is not returned
+    here; callers that need it should run :func:`count_incidents`.
     """
     initialize_database()
 
@@ -1224,27 +1225,29 @@ def list_incidents(
             rows = connection.execute(
                 """
                 SELECT * FROM incidents
+                WHERE (? IS NULL OR source_ip = ?)
                 ORDER BY first_seen_at DESC, id DESC
                 LIMIT ? OFFSET ?
                 """,
-                (limit, offset),
+                (source_ip, source_ip, limit, offset),
             ).fetchall()
         else:
             rows = connection.execute(
                 """
                 SELECT * FROM incidents
                 WHERE status = ?
+                  AND (? IS NULL OR source_ip = ?)
                 ORDER BY first_seen_at DESC, id DESC
                 LIMIT ? OFFSET ?
                 """,
-                (status, limit, offset),
+                (status, source_ip, source_ip, limit, offset),
             ).fetchall()
 
     return [dict(row) for row in rows]
 
 
-def count_incidents(status: str = "open") -> int:
-    """Return the total number of incidents matching ``status``.
+def count_incidents(status: str = "open", source_ip: str | None = None) -> int:
+    """Return the total number of incidents matching ``status`` and ``source_ip``.
 
     Used alongside :func:`list_incidents` so clients can compute the number of
     pages without fetching every row.
@@ -1252,15 +1255,30 @@ def count_incidents(status: str = "open") -> int:
     initialize_database()
 
     with _connection() as connection:
-        if status == "all":
-            row = connection.execute(
-                "SELECT COUNT(*) AS total FROM incidents"
-            ).fetchone()
+        if source_ip is None:
+            if status == "all":
+                row = connection.execute(
+                    "SELECT COUNT(*) AS total FROM incidents"
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT COUNT(*) AS total FROM incidents WHERE status = ?",
+                    (status,),
+                ).fetchone()
         else:
-            row = connection.execute(
-                "SELECT COUNT(*) AS total FROM incidents WHERE status = ?",
-                (status,),
-            ).fetchone()
+            if status == "all":
+                row = connection.execute(
+                    "SELECT COUNT(*) AS total FROM incidents WHERE source_ip = ?",
+                    (source_ip,),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    """
+                    SELECT COUNT(*) AS total FROM incidents
+                    WHERE status = ? AND source_ip = ?
+                    """,
+                    (status, source_ip),
+                ).fetchone()
 
     return int(row["total"])
 
@@ -1480,27 +1498,80 @@ def list_events(limit: int = 100) -> list[dict]:
     return [dict(row) for row in rows]
 
 
-def list_alerts(status: str = "open", limit: int = 100) -> list[dict]:
+def list_alerts(status: str = "open", limit: int = 100, offset: int = 0, source_ip: str | None = None):
+    """List alerts, ordered by id descending.
+
+    ``offset`` skips the first ``offset`` matching rows so callers can page
+    through the result set. ``source_ip`` narrows results to a single source
+    IP when provided. Returns the matching rows (capped by ``limit``); callers
+    that need the total should use :func:`count_alerts`.
+    """
     initialize_database()
+
+    if offset < 0:
+        offset = 0
 
     with _connection() as connection:
         if status == "all":
             rows = connection.execute(
-                "SELECT * FROM alerts ORDER BY id DESC LIMIT ?",
-                (limit,),
+                """
+                SELECT * FROM alerts
+                WHERE (? IS NULL OR source_ip = ?)
+                ORDER BY id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (source_ip, source_ip, limit, offset),
             ).fetchall()
         else:
             rows = connection.execute(
                 """
                 SELECT * FROM alerts
                 WHERE status = ?
+                  AND (? IS NULL OR source_ip = ?)
                 ORDER BY id DESC
-                LIMIT ?
+                LIMIT ? OFFSET ?
                 """,
-                (status, limit),
+                (status, source_ip, source_ip, limit, offset),
             ).fetchall()
 
     return [dict(row) for row in rows]
+
+
+def count_alerts(status: str = "all", source_ip: str | None = None) -> int:
+    """Return the total number of alerts matching ``status`` and ``source_ip``.
+
+    Used alongside :func:`list_alerts` so clients can compute the number of
+    pages without fetching every row.
+    """
+    initialize_database()
+
+    with _connection() as connection:
+        if source_ip is None:
+            if status == "all":
+                row = connection.execute(
+                    "SELECT COUNT(*) AS total FROM alerts"
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT COUNT(*) AS total FROM alerts WHERE status = ?",
+                    (status,),
+                ).fetchone()
+        else:
+            if status == "all":
+                row = connection.execute(
+                    "SELECT COUNT(*) AS total FROM alerts WHERE source_ip = ?",
+                    (source_ip,),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    """
+                    SELECT COUNT(*) AS total FROM alerts
+                    WHERE status = ? AND source_ip = ?
+                    """,
+                    (status, source_ip),
+                ).fetchone()
+
+    return int(row["total"])
 
 
 def close_alert(alert_id: int) -> bool:
