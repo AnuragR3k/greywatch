@@ -818,6 +818,112 @@ def test_suricata_alert_dedup_across_collection_cycles(_db, tmp_path):
     assert len(siem.list_events()) == 4  # evidence grew, not lost
 
 
+# --------------------------------------------------------------------------- #
+# Suricata record identity & replay safety
+# --------------------------------------------------------------------------- #
+
+
+def test_suricata_events_store_source_record_id(_db, tmp_path):
+    """Each ingested Suricata event carries a stable ``source_record_id``
+    derived from (generation, inode, device, byte_offset)."""
+    path = _write_eve(tmp_path / "eve.json", [_alert_line(0), _alert_line(1)])
+    result = collect_once(SuricataConfig(eve_path=str(path)))
+
+    assert result.events_ingested == 2
+    rows = _event_rows()
+    assert len(rows) == 2
+    assert all(r["source_record_id"] is not None for r in rows)
+    assert all(r["source"] == "suricata" for r in rows)
+    # Distinct byte offsets -> distinct record ids.
+    assert len({r["source_record_id"] for r in rows}) == 2
+    # Generation persisted.
+    gen = get_collector_setting("suricata_file_generation")
+    assert gen is not None
+    assert int(gen) >= 0
+
+
+def test_suricata_distinct_identical_payloads_preserved(_db, tmp_path):
+    """The same Suricata payload ingested at a later byte offset (new cycle)
+    is stored as a distinct event: identity is offset-based, not content-based,
+    so legitimate repeated events are never collapsed."""
+    path = tmp_path / "eve.json"
+    line = json.dumps(_eve_alert(sig_id=2023001, signature="identical-payload"))
+    path.write_text(line + "\n", encoding="utf-8")
+    cfg = SuricataConfig(eve_path=str(path))
+
+    first = collect_once(cfg)
+    assert first.events_ingested == 1
+
+    # Append the identical payload again at a new offset.
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+    second = collect_once(cfg)
+    assert second.records_seen == 1
+    assert second.events_ingested == 1  # stored despite identical payload
+    assert len(_event_rows()) == 2
+    rows = _event_rows()
+    assert len({r["source_record_id"] for r in rows}) == 2
+
+
+def test_suricata_replay_identifiable_record_skipped(_db):
+    """Re-ingesting the same Suricata source_record_id is skipped at the
+    storage layer (belt-and-suspenders beyond byte-offset checkpointing)."""
+    rec = _eve_alert(sig_id=2023001, signature="replay-test")
+    raw_line = json.dumps(rec)
+    event = parse_eve_record(rec, raw_line=raw_line)
+    event["source"] = "suricata"
+    event["source_record_id"] = "5:12345:678:1024"
+
+    first = siem.ingest_events([event])
+    assert first["parsed"] == 1
+    assert len(first["alerts"]) == 1
+
+    second = siem.ingest_events([event])  # exact replay of same record id
+    assert second["parsed"] == 0  # skipped as duplicate
+    assert second["alerts"] == []  # no new alert, count not inflated
+    assert len(siem.list_events()) == 1  # one logical event
+
+
+def test_suricata_generation_increments_on_truncation(_db, tmp_path):
+    """Truncating the EVE file bumps the file generation so new content at a
+    previously-used byte offset is not wrongly treated as a duplicate."""
+    path = tmp_path / "eve.json"
+    _write_eve(path, [_alert_line(0), _alert_line(1)])
+    cfg = SuricataConfig(eve_path=str(path))
+
+    first = collect_once(cfg)
+    assert first.events_ingested == 2
+    gen_before = int(get_collector_setting("suricata_file_generation"))
+
+    # Truncate and write fresh content at offset 0.
+    path.write_text(_alert_line(2) + "\n", encoding="utf-8")
+    resumed = collect_once(cfg)
+    gen_after = int(get_collector_setting("suricata_file_generation"))
+
+    assert gen_after == gen_before + 1  # generation bumped on truncation
+    assert resumed.events_ingested == 1  # new content stored (no offset collision)
+    assert len(_event_rows()) == 3  # 2 old + 1 new
+
+
+def test_suricata_repeated_collection_no_duplicates(_db, tmp_path):
+    """Repeated collection cycles with no new data ingest nothing and store
+    no duplicates."""
+    path = _write_eve(tmp_path / "eve.json", [_alert_line(0)])
+    cfg = SuricataConfig(eve_path=str(path))
+
+    first = collect_once(cfg)
+    assert first.events_ingested == 1
+
+    second = collect_once(cfg)  # idle: offset at EOF
+    assert second.records_seen == 0
+    assert second.events_ingested == 0
+    assert len(_event_rows()) == 1
+
+    third = collect_once(cfg)  # again
+    assert third.events_ingested == 0
+    assert len(_event_rows()) == 1
+
+
 def test_suricata_alert_no_signature_id_still_alerts(_db):
     """An alert record lacking signature_id/signature still raises an alert
     (keyed on the network tuple), with a safe generated title."""

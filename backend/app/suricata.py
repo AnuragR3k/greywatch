@@ -173,12 +173,35 @@ def _state_key_last_run_at() -> str:
     return _SURICATA_PREFIX + "last_run_at"
 
 
+def _state_key_generation() -> str:
+    return _SURICATA_PREFIX + "file_generation"
+
+
 def _get_offset() -> str | None:
     return siem.get_collector_setting(_state_key_offset())
 
 
 def _get_last_event_ts() -> str | None:
     return siem.get_collector_setting(_state_key_event_ts())
+
+
+def _get_generation() -> int:
+    """Return the current file-generation counter.
+
+    The generation is incremented whenever the EVE file is truncated or
+    rotated (stored offset exceeds the file size), so byte offsets from a
+    previous file incarnation never collide with new content at the same
+    byte position after truncation. Suricata EVE has no globally stable
+    record id, so ``(generation, inode, device, byte_offset)`` is the
+    closest stable identity we can enforce within a file incarnation.
+    """
+    value = siem.get_collector_setting(_state_key_generation())
+    if value is None:
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _count_suricata_events(connection: sqlite3.Connection) -> int:
@@ -199,6 +222,7 @@ def _set_state(connection: sqlite3.Connection, **values: object) -> None:
         _state_key_event_ts(): values.get("event_ts"),
         _state_key_events_ingested(): values.get("events_ingested"),
         _state_key_last_run_at(): values.get("run_at"),
+        _state_key_generation(): values.get("generation"),
     }
     for key, value in mapping.items():
         if value is None:
@@ -345,15 +369,19 @@ def parse_eve_record(record: object, *, raw_line: str) -> dict | None:
 
 def _read_eve_records(
     path: str, offset: int, max_records: int
-) -> tuple[list[tuple[str, dict]], int, bool]:
+) -> tuple[list[tuple[str, dict, int]], int, bool]:
     """Read EVE JSON lines from ``path`` starting at byte ``offset``.
 
     Returns ``(records, new_offset, rotated)`` where ``records`` is a list of
-    ``(raw_line, parsed_dict)`` tuples. Malformed JSON lines are skipped (not
-    returned) so one corrupt line cannot abort the batch. Only complete,
-    newline-terminated lines are processed; a trailing line without a newline
-    is held back (and re-read next cycle) so a record Suricata is mid-writing
-    is never parsed half-complete.
+    ``(raw_line, parsed_dict, byte_offset)`` tuples. ``byte_offset`` is the
+    starting byte position of the line within the file and, combined with the
+    file's inode and device (``source_record_id``), forms a stable record
+    identity across collector restarts within a single file incarnation.
+
+    Malformed JSON lines are skipped (not returned) so one corrupt line cannot
+    abort the batch. Only complete, newline-terminated lines are processed; a
+    trailing line without a newline is held back (and re-read next cycle) so a
+    record Suricata is mid-writing is never parsed half-complete.
 
     ``rotated`` is True when the file shrank below ``offset`` (log rotation /
     truncation) and the offset was reset to 0.
@@ -370,12 +398,13 @@ def _read_eve_records(
         offset = 0
         rotated = True
 
-    records: list[tuple[str, dict]] = []
+    records: list[tuple[str, dict, int]] = []
     last_complete = offset  # byte position after the last complete line
 
     with file_path.open("rb") as fh:
         fh.seek(offset)
         for raw_bytes in fh:
+            line_start = fh.tell() - len(raw_bytes)
             if raw_bytes.endswith(b"\n"):
                 last_complete = fh.tell()
             else:
@@ -392,7 +421,7 @@ def _read_eve_records(
                 # Skip malformed lines; the next record is unaffected.
                 continue
             if isinstance(record, dict):
-                records.append((line, record))
+                records.append((line, record, line_start))
                 if len(records) >= max_records:
                     break
 
@@ -441,14 +470,35 @@ def collect_once(config: SuricataConfig | None = None) -> CollectResult:
     result = CollectResult()
     siem.initialize_database()
 
+    # File stats for identity (inode:device) and rotation/truncation
+    # detection (stored offset vs current size).
+    try:
+        _st = os.stat(config.eve_path)
+        _inode_dev = f"{_st.st_ino}:{_st.st_dev}"
+        _size = _st.st_size
+    except OSError:
+        _inode_dev = ""
+        _size = None
+
     try:
         offset = int(_get_offset() or 0)
     except (TypeError, ValueError):
         offset = 0
     last_event_ts = _get_last_event_ts()
+    generation = _get_generation()
+
+    rotated = False
+    if _size is not None and offset > _size:
+        # Truncation or rotation: the stored offset is past the end of the
+        # file. Bump the generation so byte offsets from the previous file
+        # incarnation never collide with new content at the same byte
+        # position after truncation, then restart from the beginning.
+        generation += 1
+        offset = 0
+        rotated = True
 
     try:
-        raw_records, new_offset, rotated = _read_eve_records(
+        raw_records, new_offset, read_rotated = _read_eve_records(
             config.eve_path, offset, config.max_records
         )
     except (OSError, SuricataError) as exc:
@@ -457,19 +507,32 @@ def collect_once(config: SuricataConfig | None = None) -> CollectResult:
         result.errors.append(str(exc))
         return result
 
+    rotated = rotated or read_rotated
     result.records_seen = len(raw_records)
     result.fallback_used = rotated
 
+    # Stable record identity: (generation, inode, device, byte_offset)
+    # uniquely identifies a record within a single file incarnation and
+    # survives truncation (generation bumps). Combined with source="suricata"
+    # this is enforced by the DB partial unique index on
+    # (source, source_record_id) so replays within the same file are never
+    # stored twice. On move-rotation (new inode) the identity changes; that
+    # is a documented limitation (Suricata EVE has no globally stable record
+    # id).
     # Normalize + within-batch de-duplication by raw line.
     events: list[dict] = []
     seen_lines: set[str] = set()
-    for raw_line, record in raw_records:
+    for raw_line, record, byte_offset in raw_records:
         if raw_line in seen_lines:
             continue
         seen_lines.add(raw_line)
         event = parse_eve_record(record, raw_line=raw_line)
         if event is None:
             continue
+        if _inode_dev:
+            event["source_record_id"] = (
+                f"{generation}:{_inode_dev}:{byte_offset}"
+            )
         events.append(event)
         if len(events) >= config.max_records:
             break
@@ -483,6 +546,7 @@ def collect_once(config: SuricataConfig | None = None) -> CollectResult:
                 event_ts=last_event_ts,
                 events_ingested=str(_count_suricata_events(connection)),
                 run_at=_now_iso(),
+                generation=str(generation),
             )
         result.cursor_advanced = new_offset != offset
         return result
@@ -490,17 +554,24 @@ def collect_once(config: SuricataConfig | None = None) -> CollectResult:
     # Ingest + detect, then advance the offset in the same transaction so a
     # crash cannot leave events inserted but the offset un-advanced.
     with siem._connection() as connection:
-        # De-duplicate against recently-stored events (rotation/reset overlap).
-        dedup_since = min(
-            (e["timestamp"] for e in events),
-            default=_now_iso(),
-        )
-        existing_keys = _read_existing_keys(connection, dedup_since)
-        new_events = [
-            e
-            for e in events
-            if (e["timestamp"], e["host"], e["raw_message"]) not in existing_keys
-        ]
+        # De-duplicate against recently-stored events, but only when the offset
+        # was reset due to rotation/truncation (rotated). On a normal append
+        # the byte-offset checkpoint already guarantees we only read new bytes,
+        # so content-based overlap would wrongly collapse legitimate repeated
+        # events that happen to share text and timestamp.
+        if rotated:
+            dedup_since = min(
+                (e["timestamp"] for e in events),
+                default=_now_iso(),
+            )
+            existing_keys = _read_existing_keys(connection, dedup_since)
+            new_events = [
+                e
+                for e in events
+                if (e["timestamp"], e["host"], e["raw_message"]) not in existing_keys
+            ]
+        else:
+            new_events = events
 
         inserted, new_alerts, _new_incidents = siem._store_events_and_detect(
             new_events, connection
@@ -513,6 +584,7 @@ def collect_once(config: SuricataConfig | None = None) -> CollectResult:
             event_ts=advanced_ts,
             events_ingested=str(_count_suricata_events(connection)),
             run_at=_now_iso(),
+            generation=str(generation),
         )
 
     result.events_ingested = len(inserted)
