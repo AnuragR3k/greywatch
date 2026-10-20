@@ -19,6 +19,7 @@ Coverage targets from the task:
 
 import json
 import os
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -1173,6 +1174,226 @@ def test_collect_restart_resumes_from_persisted_checkpoint(_db, tmp_path):
     resumed = collect_once(SuricataConfig(eve_path=str(path)))
     assert resumed.events_ingested == 1
     assert len(_event_rows()) == 4
+
+
+# --------------------------------------------------------------------------- #
+# Suricata rotation & crash-recovery hardening
+# --------------------------------------------------------------------------- #
+
+
+def test_collect_restart_after_partial_line_then_complete(_db, tmp_path):
+    """A collector restart after holding back an incomplete final line must
+    ingest that line exactly once once the newline arrives."""
+    path = tmp_path / "eve.json"
+    line = _alert_line(0, ts="2024-10-12T08:00:01.220741Z")
+    path.write_text(line[:60], encoding="utf-8")  # mid-write, no newline
+    cfg = SuricataConfig(eve_path=str(path))
+
+    # First "cycle": partial line held back, nothing ingested, offset at 0.
+    partial = collect_once(cfg)
+    assert partial.events_ingested == 0
+    assert get_collector_setting("suricata_last_offset") == "0"
+    assert _event_rows() == []
+
+    # Simulate a restart: brand-new config object, same database + file.
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(line[60:] + "\n")  # complete the line
+    restarted = collect_once(SuricataConfig(eve_path=str(path)))
+    assert restarted.events_ingested == 1
+    assert len(_event_rows()) == 1
+    # Offset must have advanced past the now-complete line.
+    assert get_collector_setting("suricata_last_offset") == str(path.stat().st_size)
+
+    # Idle cycle: no duplicates from re-reading the tail.
+    idle = collect_once(SuricataConfig(eve_path=str(path)))
+    assert idle.events_ingested == 0
+    assert len(_event_rows()) == 1
+
+
+def test_collect_rename_rotation_detected_via_inode(_db, tmp_path):
+    """Rename-based rotation (new inode) whose replacement file has already
+    grown past the old offset must still be detected as rotation.
+
+    Rotation detection that relies only on ``offset > size`` misses this case:
+    the new file is larger than the old offset, so ``offset > size`` is false,
+    no generation bump occurs, and the collector seeks into the middle of the
+    new file -- skipping records at offsets [0, old_offset).
+    """
+    path = tmp_path / "eve.json"
+    _write_eve(path, [_alert_line(0)])
+    cfg = SuricataConfig(eve_path=str(path))
+
+    first = collect_once(cfg)
+    assert first.events_ingested == 1
+    old_offset = int(get_collector_setting("suricata_last_offset"))
+
+    # Rotate: rename the current file away (its inode), then write a larger
+    # replacement file at the same path (a new inode).
+    rotated = tmp_path / "eve.json.old"
+    os.rename(path, rotated)
+    _write_eve(path, [_alert_line(i) for i in range(1, 6)])  # 5 records
+
+    second = collect_once(cfg)
+    # All 5 new records must be ingested; none may be skipped.
+    assert second.events_ingested == 5, second
+    assert len(_event_rows()) == 6  # 1 old + 5 new
+    # The replacement file has a new inode; generation must have been bumped.
+    gen = get_collector_setting("suricata_file_generation")
+    assert gen is not None and int(gen) >= 1
+    new_offset = get_collector_setting("suricata_last_offset")
+    assert new_offset == str(path.stat().st_size)
+
+
+def test_collect_copytruncate_rotation(_db, tmp_path):
+    """Copy-truncate rotation: same inode, file truncated then rewritten.
+
+    The shrink below the stored offset is detected via ``offset > size``,
+    the generation is bumped, and new content written after the truncate is
+    ingested without colliding with the pre-truncate records' offsets.
+    """
+    path = tmp_path / "eve.json"
+    _write_eve(path, [_alert_line(0), _alert_line(1)])
+    cfg = SuricataConfig(eve_path=str(path))
+
+    first = collect_once(cfg)
+    assert first.events_ingested == 2
+    old_offset = int(get_collector_setting("suricata_last_offset"))
+    assert old_offset > 0
+
+    # Copy-truncate: truncate the same file (same inode) to 0, then rewrite.
+    path.write_text("", encoding="utf-8")
+    truncated = collect_once(cfg)
+    assert truncated.fallback_used is True
+    assert get_collector_setting("suricata_last_offset") == "0"
+    gen_after_truncate = int(get_collector_setting("suricata_file_generation"))
+
+    # Write fresh content (same inode, new generation).
+    _write_eve(path, [_alert_line(2), _alert_line(3)])
+    resumed = collect_once(cfg)
+    assert resumed.events_ingested == 2
+    assert resumed.fallback_used is False
+    assert len(_event_rows()) == 4  # 2 pre-truncate + 2 post-truncate
+    # Generation was already bumped by the truncation; a normal append from
+    # offset 0 does not re-bump it.
+    assert int(get_collector_setting("suricata_file_generation")) == gen_after_truncate
+    assert get_collector_setting("suricata_last_offset") == str(path.stat().st_size)
+
+
+def test_collect_malformed_then_valid_lines(_db, tmp_path):
+    """Malformed lines are skipped without aborting the batch; valid lines
+    around them are ingested and the offset advances past the garbage."""
+    path = tmp_path / "eve.json"
+    with path.open("w", encoding="utf-8") as fh:
+        fh.write("this is not json\n")
+        fh.write(_alert_line(0))
+        fh.write("\n")
+        fh.write("{not valid json either\n")
+        fh.write(_alert_line(1))
+        fh.write("\n")
+    cfg = SuricataConfig(eve_path=str(path))
+
+    result = collect_once(cfg)
+    assert result.errors == []
+    assert result.events_ingested == 2
+    assert len(_event_rows()) == 2
+    assert get_collector_setting("suricata_last_offset") == str(path.stat().st_size)
+
+
+def test_collect_concurrent_calls_do_not_duplicate(_db, tmp_path):
+    """Concurrent collection calls on the same file/database must not store
+    duplicate events: the (source, source_record_id) unique index lets exactly
+    one insert win per identifiable record."""
+    path = _write_eve(tmp_path / "eve.json", [_alert_line(i) for i in range(5)])
+    cfg = SuricataConfig(eve_path=str(path))
+
+    # Prime: one cycle stores all 5 and advances the offset to EOF.
+    first = collect_once(cfg)
+    assert first.events_ingested == 5
+
+    errors: list[BaseException] = []
+    results: list[dict] = []
+    lock = threading.Lock()
+
+    def worker(_tag: int) -> None:
+        try:
+            results.append(collect_once(cfg))
+        except BaseException as exc:  # noqa: BLE001 - collect failures
+            with lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert all(not t.is_alive() for t in threads), "a collector thread hung"
+    assert not errors, f"concurrent collect raised: {errors}"
+    # Offset already at EOF: every concurrent call finds nothing new.
+    assert all(r.events_ingested == 0 for r in results)
+    assert len(_event_rows()) == 5  # no duplicates
+
+
+def test_collect_concurrent_insert_race_dedupes(_db, tmp_path):
+    """Concurrent calls that read the same uncollected records: exactly one
+    insert wins per record (source_record_id uniqueness), no duplicates."""
+    import threading
+
+    path = tmp_path / "eve.json"
+    _write_eve(path, [_alert_line(i) for i in range(4)])
+    cfg = SuricataConfig(eve_path=str(path))
+
+    errors: list[BaseException] = []
+    lock = threading.Lock()
+
+    def worker(_tag: int) -> None:
+        try:
+            collect_once(cfg)
+        except BaseException as exc:  # noqa: BLE001
+            with lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert all(not t.is_alive() for t in threads), "a collector thread hung"
+    assert not errors, f"concurrent collect raised: {errors}"
+    # Exactly 4 events stored, no duplicates, despite 6 overlapping readers.
+    assert len(_event_rows()) == 4
+    rows = _event_rows()
+    assert len({r["source_record_id"] for r in rows}) == 4
+    assert all(r["source"] == "suricata" for r in rows)
+
+
+def test_http_and_journal_idempotency_unchanged(_db, monkeypatch):
+    """Regression guard: HTTP and journal idempotency from the prior milestone
+    still work alongside Suricata changes (shared dedup storage unaffected)."""
+    from backend.app.siem import ingest_lines
+
+    monkeypatch.setenv("GREYWATCH_DB", str(_db / "cross.db"))
+    initialize_database()
+    ip = "203.0.113.10"
+    lines = [
+        f"sshd[700]: Failed password for attacker from {ip} port 54000 ssh2"
+    ]
+    ids = ["http-shared-id"]
+
+    first = ingest_lines(lines, ids)
+    second = ingest_lines(lines, ids)  # replay
+
+    assert first["parsed"] == 1
+    assert second["parsed"] == 1
+    assert second["duplicates"] == 1  # replay skipped
+    assert second["alerts"] == []  # no new alert, count not inflated
+    assert len(list_events()) == 1  # one logical event
+
+
+# --------------------------------------------------------------------------- #
+# Suricata alert creation, severity mapping, field preservation
+# --------------------------------------------------------------------------- #
 
 
 def test_collect_db_failure_rolls_back_and_preserves_checkpoint(

@@ -177,6 +177,14 @@ def _state_key_generation() -> str:
     return _SURICATA_PREFIX + "file_generation"
 
 
+def _state_key_inode() -> str:
+    return _SURICATA_PREFIX + "file_inode"
+
+
+def _state_key_device() -> str:
+    return _SURICATA_PREFIX + "file_device"
+
+
 def _get_offset() -> str | None:
     return siem.get_collector_setting(_state_key_offset())
 
@@ -204,6 +212,14 @@ def _get_generation() -> int:
         return 0
 
 
+def _get_inode() -> str | None:
+    return siem.get_collector_setting(_state_key_inode())
+
+
+def _get_device() -> str | None:
+    return siem.get_collector_setting(_state_key_device())
+
+
 def _count_suricata_events(connection: sqlite3.Connection) -> int:
     """Count stored suricata-sourced events on an open connection.
 
@@ -223,6 +239,8 @@ def _set_state(connection: sqlite3.Connection, **values: object) -> None:
         _state_key_events_ingested(): values.get("events_ingested"),
         _state_key_last_run_at(): values.get("run_at"),
         _state_key_generation(): values.get("generation"),
+        _state_key_inode(): values.get("inode"),
+        _state_key_device(): values.get("device"),
     }
     for key, value in mapping.items():
         if value is None:
@@ -474,10 +492,12 @@ def collect_once(config: SuricataConfig | None = None) -> CollectResult:
     # detection (stored offset vs current size).
     try:
         _st = os.stat(config.eve_path)
-        _inode_dev = f"{_st.st_ino}:{_st.st_dev}"
+        _inode = str(_st.st_ino)
+        _device = str(_st.st_dev)
         _size = _st.st_size
     except OSError:
-        _inode_dev = ""
+        _inode = ""
+        _device = ""
         _size = None
 
     try:
@@ -486,13 +506,28 @@ def collect_once(config: SuricataConfig | None = None) -> CollectResult:
         offset = 0
     last_event_ts = _get_last_event_ts()
     generation = _get_generation()
+    stored_inode = _get_inode()
+    stored_device = _get_device()
 
     rotated = False
     if _size is not None and offset > _size:
-        # Truncation or rotation: the stored offset is past the end of the
+        # Truncation (same inode): the stored offset is past the end of the
         # file. Bump the generation so byte offsets from the previous file
         # incarnation never collide with new content at the same byte
         # position after truncation, then restart from the beginning.
+        generation += 1
+        offset = 0
+        rotated = True
+    elif stored_inode and stored_device and (
+        stored_inode != _inode or stored_device != _device
+    ):
+        # Replacement file (rename-based rotation or inode reuse): the path
+        # now refers to a different file incarnation than the one whose
+        # offset we stored. Relying only on ``offset > size`` would miss this
+        # case when the replacement file has already grown past the old
+        # offset, causing the collector to seek into the middle of the new
+        # file and skip records. Detect the inode/device change and treat it
+        # as rotation instead.
         generation += 1
         offset = 0
         rotated = True
@@ -529,9 +564,9 @@ def collect_once(config: SuricataConfig | None = None) -> CollectResult:
         event = parse_eve_record(record, raw_line=raw_line)
         if event is None:
             continue
-        if _inode_dev:
+        if _inode and _device:
             event["source_record_id"] = (
-                f"{generation}:{_inode_dev}:{byte_offset}"
+                f"{generation}:{_inode}:{_device}:{byte_offset}"
             )
         events.append(event)
         if len(events) >= config.max_records:
@@ -547,6 +582,8 @@ def collect_once(config: SuricataConfig | None = None) -> CollectResult:
                 events_ingested=str(_count_suricata_events(connection)),
                 run_at=_now_iso(),
                 generation=str(generation),
+                inode=str(_inode),
+                device=str(_device),
             )
         result.cursor_advanced = new_offset != offset
         return result
@@ -585,6 +622,8 @@ def collect_once(config: SuricataConfig | None = None) -> CollectResult:
             events_ingested=str(_count_suricata_events(connection)),
             run_at=_now_iso(),
             generation=str(generation),
+            inode=str(_inode),
+            device=str(_device),
         )
 
     result.events_ingested = len(inserted)
