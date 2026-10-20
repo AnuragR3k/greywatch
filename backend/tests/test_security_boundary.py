@@ -69,7 +69,7 @@ def _stub_backends(monkeypatch):
     monkeypatch.setattr(
         main,
         "ingest_lines",
-        lambda lines: {
+        lambda lines, event_ids=None: {
             "received": len(lines),
             "parsed": 0,
             "ignored": len(lines),

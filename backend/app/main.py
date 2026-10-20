@@ -446,6 +446,12 @@ app.add_middleware(MaxBodySizeMiddleware, max_bytes=get_max_request_bytes())
 
 class IngestRequest(BaseModel):
     lines: list[str] = Field(min_length=1, max_length=1000)
+    # Optional, client-generated idempotency key per event. ``event_ids[i]`` is
+    # the stable identifier for ``lines[i]``; entries may be ``None`` for events
+    # the client does not wish to idempotency-key (they keep the existing
+    # stateless, non-deduplicated behavior). When provided, the list must be the
+    # same length as ``lines``.
+    event_ids: list[str | None] | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -618,8 +624,16 @@ def ingest(request: IngestRequest):
     Access is governed by the Greywatch trust boundary (see
     :func:`_trust_boundary`); this endpoint is not gated by any
     ``GREYWATCH_*_ENABLED`` feature flag.
+
+    Each ``lines[i]`` may be idempotency-keyed by ``event_ids[i]`` (a
+    client-generated stable identifier). Replaying the same identifier does not
+    insert a duplicate event or increment detection counts; see
+    :func:`backend.app.siem.ingest_lines` for the count contract.
     """
-    return ingest_lines(request.lines)
+    try:
+        return ingest_lines(request.lines, request.event_ids)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.get("/api/v1/events", tags=["events"])

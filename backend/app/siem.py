@@ -1358,25 +1358,58 @@ def resolve_incident(incident_id: int) -> dict:
     return _transition_incident(incident_id, "resolved")
 
 
-def ingest_lines(lines: list[str]) -> dict:
+def ingest_lines(
+    lines: list[str], event_ids: list[str | None] | None = None
+) -> dict:
     """Parse and persist event lines, then evaluate the SSH brute-force rule.
 
     Behavior is unchanged from the original line-based ingestion path: each
     line is run through ``parse_auth_line`` and unrecognized lines are ignored.
+
+    Idempotency: when ``event_ids`` is provided, ``event_ids[i]`` is the
+    optional client-generated stable identifier for ``lines[i]``. Events that
+    carry an identifier are tagged ``source="http"`` and deduplicated against
+    the DB-enforced unique index on ``(source, source_record_id)``; replaying
+    the same identifier skips the insert and does not increment detection
+    counts. Events without an identifier keep the existing stateless behavior
+    (``source=None``, no deduplication) -- see the documented limitation in
+    :func:`_store_events_and_detect`.
+
+    ``parsed`` is the number of lines that parsed into valid events
+    (pre-deduplication); ``duplicates`` is the number of those skipped because
+    a prior request already inserted the same identifier; ``ignored`` is the
+    number of lines that did not parse.
     """
     initialize_database()
 
-    events = [event for line in lines if (event := parse_auth_line(line))]
+    if event_ids is not None and len(event_ids) != len(lines):
+        raise ValueError("event_ids must be the same length as lines")
+
+    parsed_events: list[dict] = []
+    for i, line in enumerate(lines):
+        event = parse_auth_line(line)
+        if event is None:
+            continue
+        eid = event_ids[i] if event_ids is not None else None
+        if eid:
+            # Tag idempotent HTTP events with a non-NULL source so the partial
+            # unique index on (source, source_record_id) enforces replay safety.
+            event["source_record_id"] = eid
+            event["source"] = "http"
+        parsed_events.append(event)
 
     with _connection() as connection:
         inserted_events, new_alerts, new_incidents = _store_events_and_detect(
-            events, connection
+            parsed_events, connection
         )
 
+    parsed = len(parsed_events)
+    duplicates = parsed - len(inserted_events)
     return {
         "received": len(lines),
-        "parsed": len(inserted_events),
-        "ignored": len(lines) - len(inserted_events),
+        "parsed": parsed,
+        "duplicates": duplicates,
+        "ignored": len(lines) - parsed,
         "events": inserted_events,
         "alerts": new_alerts,
         "incidents": new_incidents,

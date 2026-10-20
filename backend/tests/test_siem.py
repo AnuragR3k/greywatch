@@ -757,6 +757,200 @@ def test_concurrent_ingest_same_cursor_deduped(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# HTTP ingestion idempotency
+# --------------------------------------------------------------------------- #
+
+
+def _http_failed_lines(source_ip: str, count: int, port_base: int = 54000):
+    return [
+        f"sshd[700{i}]: Failed password for attacker{i} from {source_ip} "
+        f"port {port_base + i} ssh2"
+        for i in range(count)
+    ]
+
+
+def test_http_event_with_stable_id_inserted_once(tmp_path, monkeypatch):
+    """Replaying the same event id inserts the event once and counts it once."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "idempotent.db"))
+    ip = "203.0.113.10"
+    lines = _http_failed_lines(ip, 5)
+    ids = [f"evt-{i}" for i in range(5)]
+
+    first = client.post(
+        "/api/v1/events/ingest", json={"lines": lines, "event_ids": ids}
+    ).json()
+    second = client.post(
+        "/api/v1/events/ingest", json={"lines": lines, "event_ids": ids}
+    ).json()
+
+    assert first["parsed"] == 5
+    assert first["duplicates"] == 0
+    assert first["ignored"] == 0
+    assert len(first["events"]) == 5
+    assert len(first["alerts"]) == 1  # threshold reached
+
+    assert second["parsed"] == 5
+    assert second["duplicates"] == 5  # all skipped as replays
+    assert len(second["events"]) == 0
+    assert second["alerts"] == []  # no new alert, count not inflated
+
+    # Exactly 5 unique events stored; brute-force count stayed at 5.
+    assert len(list_events()) == 5
+    alert = client.get("/api/v1/alerts?status=all&limit=100").json()["alerts"][0]
+    assert alert["event_count"] == 5
+
+
+def test_http_distinct_ids_with_identical_messages_remain_distinct(
+    tmp_path, monkeypatch
+):
+    """Distinct ids preserve legitimate repeated events even when content and
+    timestamps are identical."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "distinctids.db"))
+    ip = "203.0.113.10"
+    line = f"sshd[700]: Failed password for root from {ip} port 54000 ssh2"
+    lines = [line] * 5
+    ids = [f"evt-distinct-{i}" for i in range(5)]
+
+    result = client.post(
+        "/api/v1/events/ingest", json={"lines": lines, "event_ids": ids}
+    ).json()
+
+    assert result["parsed"] == 5
+    assert result["duplicates"] == 0
+    assert len(result["events"]) == 5
+    assert len(result["alerts"]) == 1
+    assert result["alerts"][0]["event_count"] == 5
+    assert len(list_events()) == 5
+
+
+def test_http_mixed_batch_reports_accurate_counts(tmp_path, monkeypatch):
+    """A batch with new events, a duplicate, and an invalid line reports
+    accepted vs duplicate vs ignored counts accurately."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "mixed.db"))
+    ip = "203.0.113.10"
+    lines = [
+        f"sshd[701]: Failed password for a from {ip} port 54101 ssh2",  # new
+        f"sshd[702]: Failed password for b from {ip} port 54102 ssh2",  # new
+        f"sshd[701]: Failed password for a from {ip} port 54101 ssh2",  # dup id
+        "this is not a valid ssh log line",  # invalid -> ignored
+    ]
+    ids = ["evt-mix-1", "evt-mix-2", "evt-mix-1", None]
+
+    result = client.post(
+        "/api/v1/events/ingest", json={"lines": lines, "event_ids": ids}
+    ).json()
+
+    assert result["received"] == 4
+    assert result["parsed"] == 3  # 3 valid lines
+    assert result["duplicates"] == 1  # evt-mix-1 replayed
+    assert result["ignored"] == 1  # invalid line
+    assert len(result["events"]) == 2  # only the 2 new events inserted
+
+
+def test_http_event_ids_scoped_by_source(tmp_path, monkeypatch):
+    """The same id string from journal and http sources do not collide; each
+    source keeps its own identifier namespace."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "scoping.db"))
+    ip = "203.0.113.10"
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    # Journal event with id "shared-id".
+    journal_event = {
+        "timestamp": now,
+        "host": "lab-host",
+        "event_type": "ssh_login_failed",
+        "username": "u",
+        "source_ip": ip,
+        "severity": "medium",
+        "raw_message": f"journal: Failed password for u from {ip} port 1 ssh2",
+        "source": "journal",
+        "source_record_id": "shared-id",
+    }
+    ingest_events([journal_event])
+
+    # HTTP event with the same id "shared-id" must still be inserted (different
+    # source namespace).
+    lines = [f"sshd[703]: Failed password for u from {ip} port 54103 ssh2"]
+    result = client.post(
+        "/api/v1/events/ingest", json={"lines": lines, "event_ids": ["shared-id"]}
+    ).json()
+
+    assert result["parsed"] == 1
+    assert result["duplicates"] == 0
+    assert len(result["events"]) == 1
+    assert len(list_events()) == 2
+
+
+def test_http_length_mismatch_returns_400(tmp_path, monkeypatch):
+    """event_ids that do not match lines length is rejected with HTTP 400."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "mismatch.db"))
+    lines = ["sshd[704]: Failed password for x from 203.0.113.10 port 54104 ssh2"]
+
+    resp = client.post(
+        "/api/v1/events/ingest", json={"lines": lines, "event_ids": ["a", "b"]}
+    )
+    assert resp.status_code == 400
+
+
+def test_http_concurrent_same_id_cannot_insert_twice(tmp_path, monkeypatch):
+    """Concurrent retries of the same id: exactly one insert wins the unique
+    index; the rest are skipped as duplicates."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "httpconc.db"))
+    initialize_database()
+    ip = "203.0.113.10"
+    lines = [f"sshd[705]: Failed password for x from {ip} port 54105 ssh2"]
+    ids = ["evt-http-conc"]
+
+    errors: list[BaseException] = []
+    results: list[dict] = []
+    lock = threading.Lock()
+
+    def worker(_tag: int) -> None:
+        try:
+            results.append(
+                client.post(
+                    "/api/v1/events/ingest",
+                    json={"lines": lines, "event_ids": ids},
+                ).json()
+            )
+        except BaseException as exc:  # noqa: BLE001
+            with lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert all(not t.is_alive() for t in threads), "a thread hung"
+    assert not errors, f"concurrent ingest raised: {errors}"
+    total_inserted = sum(len(r["events"]) for r in results)
+    total_duplicates = sum(r["duplicates"] for r in results)
+    assert total_inserted == 1, f"expected exactly 1 insert, got {total_inserted}"
+    assert total_duplicates == 7, f"expected 7 duplicates, got {total_duplicates}"
+    assert len(list_events()) == 1
+
+
+def test_http_no_ids_retains_compatibility_behavior(tmp_path, monkeypatch):
+    """Requests without event_ids keep source=None and are not deduplicated:
+    replaying identical HTTP lines inflates the count (documented limitation)."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "nocompat.db"))
+    ip = "203.0.113.10"
+    lines = _http_failed_lines(ip, 5)
+
+    first = client.post("/api/v1/events/ingest", json={"lines": lines}).json()
+    second = client.post("/api/v1/events/ingest", json={"lines": lines}).json()
+
+    assert first["parsed"] == 5
+    assert first["duplicates"] == 0
+    assert all(e.get("source") is None for e in first["events"])
+    assert second["parsed"] == 5
+    assert second["duplicates"] == 0  # no ids -> no dedup
+    assert len(list_events()) == 10  # both batches stored (inflation documented)
+
+
+# --------------------------------------------------------------------------- #
 # SQLite concurrency and rollback-journal reliability (F3)
 # --------------------------------------------------------------------------- #
 
