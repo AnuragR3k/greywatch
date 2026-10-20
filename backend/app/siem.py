@@ -2,6 +2,7 @@
 
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -189,6 +190,8 @@ def _migrate_events_table(connection: sqlite3.Connection) -> None:
     }
     additions: list[tuple[str, str]] = [
         ("source", "TEXT"),
+        ("source_record_id", "TEXT"),
+        ("content_hash", "TEXT"),
         ("dest_ip", "TEXT"),
         ("src_port", "INTEGER"),
         ("dest_port", "INTEGER"),
@@ -200,6 +203,30 @@ def _migrate_events_table(connection: sqlite3.Connection) -> None:
     for column, dtype in additions:
         if column not in columns:
             connection.execute(f"ALTER TABLE events ADD COLUMN {column} {dtype}")
+
+    # Stable native record identifiers (e.g. journal __CURSOR) are unique per
+    # source so a replayed identifiable record can never create a second event.
+    # NULL source_record_id rows (HTTP lines, Suricata EVE records without a
+    # native id) are excluded from the constraint.
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_events_source_record
+            ON events(source, source_record_id)
+            WHERE source_record_id IS NOT NULL
+        """
+    )
+
+    # content_hash is stored for observability only and is intentionally not
+    # used as a dedup key: identical messages can represent separate genuine
+    # authentication failures, so content fingerprinting cannot safely
+    # distinguish replays from legitimate repeated events.
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_events_content_hash
+            ON events(content_hash)
+            WHERE content_hash IS NOT NULL
+        """
+    )
 
 
 def initialize_database() -> None:
@@ -217,6 +244,8 @@ def initialize_database() -> None:
                 severity TEXT NOT NULL,
                 raw_message TEXT NOT NULL,
                 source TEXT,
+                source_record_id TEXT,
+                content_hash TEXT,
                 dest_ip TEXT,
                 src_port INTEGER,
                 dest_port INTEGER,
@@ -555,6 +584,60 @@ def evaluate_detections(
     return new_alerts, new_incidents
 
 
+def _content_hash(event: dict) -> str | None:
+    """Content-derived fingerprint for an event without a stable native id.
+
+    Hashes ``(source, timestamp, host, raw_message)`` so that identical records
+    from the same source map to one fingerprint. Including ``source`` prevents
+    cross-source collisions (requirement: never dedupe unrelated sources).
+
+    Limitation documented in the module design: two genuinely distinct events
+    that happen to share source + timestamp + host + raw_message collide into
+    one fingerprint and would be treated as a duplicate. Sources with a stable
+    native identifier (journal ``__CURSOR``) use ``source_record_id`` instead
+    and are never subject to this collision risk.
+    """
+    source = event.get("source") or ""
+    timestamp = event.get("timestamp") or ""
+    host = event.get("host") or ""
+    raw_message = event.get("raw_message") or ""
+    payload = f"{source}|{timestamp}|{host}|{raw_message}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _is_duplicate_event(connection: sqlite3.Connection, event: dict) -> bool:
+    """Return True if ``event`` is a replay of an already-stored record.
+
+    Dedup is keyed on the stable native identifier (``source_record_id``,
+    e.g. journal ``__CURSOR``) enforced by the DB partial unique index on
+    ``(source, source_record_id) WHERE source_record_id IS NOT NULL``. This is
+    the only dedup key that is safe to enforce: content-derived fingerprints
+    are intentionally NOT used, because identical messages can represent
+    separate genuine authentication failures (requirement: legitimate repeated
+    events must remain distinguishable even when text and timestamp match).
+
+    Records without a native identifier (``source_record_id`` is NULL — HTTP
+    lines, Suricata EVE records) are not deduplicated here. They rely on
+    collector-side checkpointing (journal cursor / Suricata byte offset) to
+    avoid re-reading, and on application-level overlap checks in the
+    collectors. HTTP ingestion is stateless with no native id, so replaying
+    identical HTTP lines can inflate counts; this is a documented limitation.
+    """
+    source_record_id = event.get("source_record_id")
+    if not source_record_id:
+        return False
+
+    row = connection.execute(
+        """
+        SELECT 1 FROM events
+        WHERE source = ? AND source_record_id = ?
+        LIMIT 1
+        """,
+        (event.get("source"), source_record_id),
+    ).fetchone()
+    return row is not None
+
+
 def _store_events_and_detect(
     events: list[dict], connection: sqlite3.Connection
 ) -> tuple[list[dict], list[dict]]:
@@ -565,38 +648,67 @@ def _store_events_and_detect(
     inside the caller's transaction, so the failed-login count reflects the rows
     just inserted and a failure leaves nothing partially applied (events,
     alerts and the caller's checkpoint advance are committed or rolled back
-    together).     Returns ``(inserted_events, new_alerts, new_incidents)``.
+    together).
+
+    Replay safety: before inserting, each event is checked against already
+    stored records. Identifiable records (``source_record_id`` set, e.g. journal
+    ``__CURSOR``) are deduplicated against the DB-enforced unique index on
+    ``(source, source_record_id)``; a duplicate insert raises ``IntegrityError``
+    which is caught per-row so a single replayed record never rolls back an
+    entire batch. Records without a native identifier (``source_record_id`` is
+    NULL) are not deduplicated here; they rely on collector-side checkpointing.
+    Skipped duplicates are not inserted and therefore cannot inflate detection
+    counts. Returns ``(inserted_events, new_alerts, new_incidents)``.
     """
     inserted_events = []
 
     for event in events:
-        cursor = connection.execute(
-            """
-            INSERT INTO events (
-                timestamp, host, event_type, username,
-                source_ip, severity, raw_message, source,
-                dest_ip, src_port, dest_port, proto,
-                signature, signature_id, category
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                event["timestamp"],
-                event["host"],
-                event["event_type"],
-                event["username"],
-                event["source_ip"],
-                event["severity"],
-                event["raw_message"],
-                event.get("source"),
-                event.get("dest_ip"),
-                event.get("src_port"),
-                event.get("dest_port"),
-                event.get("proto"),
-                event.get("signature"),
-                event.get("signature_id"),
-                event.get("category"),
-            ),
-        )
+        # Normalize dedup fields so callers that omit them (e.g. ingest_events
+        # with hand-built dicts) still get safe defaults.
+        event.setdefault("source_record_id", None)
+        event.setdefault("content_hash", _content_hash(event))
+
+        if _is_duplicate_event(connection, event):
+            continue  # replayed record: do not insert, do not count
+
+        try:
+            cursor = connection.execute(
+                """
+                INSERT INTO events (
+                    timestamp, host, event_type, username,
+                    source_ip, severity, raw_message, source,
+                    source_record_id, content_hash,
+                    dest_ip, src_port, dest_port, proto,
+                    signature, signature_id, category
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event["timestamp"],
+                    event["host"],
+                    event["event_type"],
+                    event["username"],
+                    event["source_ip"],
+                    event["severity"],
+                    event["raw_message"],
+                    event.get("source"),
+                    event.get("source_record_id"),
+                    event.get("content_hash"),
+                    event.get("dest_ip"),
+                    event.get("src_port"),
+                    event.get("dest_port"),
+                    event.get("proto"),
+                    event.get("signature"),
+                    event.get("signature_id"),
+                    event.get("category"),
+                ),
+            )
+        except sqlite3.IntegrityError:
+            # Concurrent race on the (source, source_record_id) unique index:
+            # another transaction inserted the same identifiable record first.
+            # Treat this row as a duplicate and continue with the rest of the
+            # batch rather than rolling the whole batch back.
+            continue
+
         inserted_events.append({"id": cursor.lastrowid, **event})
 
     new_alerts, new_incidents = evaluate_detections(events, inserted_events, connection)

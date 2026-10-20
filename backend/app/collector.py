@@ -290,6 +290,7 @@ def parse_journal_record(record: dict) -> dict | None:
             "severity": "medium",
             "raw_message": raw_message,
             "source": source,
+            "source_record_id": record.get("__CURSOR"),
         }
     if invalid_user:
         return {
@@ -301,6 +302,7 @@ def parse_journal_record(record: dict) -> dict | None:
             "severity": "medium",
             "raw_message": raw_message,
             "source": source,
+            "source_record_id": record.get("__CURSOR"),
         }
     if successful:
         return {
@@ -312,6 +314,7 @@ def parse_journal_record(record: dict) -> dict | None:
             "severity": "low",
             "raw_message": raw_message,
             "source": source,
+            "source_record_id": record.get("__CURSOR"),
         }
 
     # --- sudo session / command events ---
@@ -326,6 +329,7 @@ def parse_journal_record(record: dict) -> dict | None:
             "severity": "info",
             "raw_message": raw_message,
             "source": source,
+            "source_record_id": record.get("__CURSOR"),
         }
 
     match = SUDO_SESSION_CLOSED.search(text)
@@ -339,6 +343,7 @@ def parse_journal_record(record: dict) -> dict | None:
             "severity": "info",
             "raw_message": raw_message,
             "source": source,
+            "source_record_id": record.get("__CURSOR"),
         }
 
     match = SUDO_COMMAND.match(text)
@@ -352,6 +357,7 @@ def parse_journal_record(record: dict) -> dict | None:
             "severity": "low",
             "raw_message": raw_message,
             "source": source,
+            "source_record_id": record.get("__CURSOR"),
         }
 
     # --- PAM authentication failures (sudo, login, gdm, ...) ---
@@ -371,6 +377,7 @@ def parse_journal_record(record: dict) -> dict | None:
             "severity": "high",
             "raw_message": raw_message,
             "source": source,
+            "source_record_id": record.get("__CURSOR"),
         }
 
     # An auth-relevant identifier that did not match any classifier is left

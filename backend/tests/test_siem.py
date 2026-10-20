@@ -8,8 +8,10 @@ from fastapi.testclient import TestClient
 from backend.app.main import app
 from backend.app.siem import (
     _connection,
+    ingest_events,
     ingest_lines,
     initialize_database,
+    list_events,
     parse_auth_line,
 )
 
@@ -609,6 +611,151 @@ def test_brute_force_threshold_is_per_source_ip(tmp_path, monkeypatch):
     assert client.get("/api/v1/alerts?status=all&limit=100").json()["count"] == 2
 
 
+def _ssh_failed_event(
+    source_ip: str,
+    timestamp: str,
+    *,
+    username: str = "user",
+    source: str = "test",
+    source_record_id: str | None = None,
+    raw_message: str | None = None,
+) -> dict:
+    """A normalized ssh_login_failed event for dedup regression tests."""
+    return {
+        "timestamp": timestamp,
+        "host": "lab-host",
+        "event_type": "ssh_login_failed",
+        "username": username,
+        "source_ip": source_ip,
+        "severity": "medium",
+        "raw_message": raw_message
+        or f"Failed password for {username} from {source_ip} port 22 ssh2",
+        "source": source,
+        "source_record_id": source_record_id,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Event deduplication / replay safety
+# --------------------------------------------------------------------------- #
+
+
+def test_dedup_replayed_identifiable_record_not_duplicated(
+    tmp_path, monkeypatch
+):
+    """Re-ingesting the same identifiable record (journal __CURSOR) creates no
+    second event and does not inflate the brute-force count."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "dedup.db"))
+    ip = "203.0.113.10"
+    ts = "2026-10-13T10:00:00+00:00"
+    event = _ssh_failed_event(
+        ip, ts, source="journal", source_record_id="cur-abc"
+    )
+
+    first = ingest_events([event])
+    second = ingest_events([event])  # exact replay of the same cursor
+
+    assert first["parsed"] == 1
+    assert second["parsed"] == 0  # replay skipped
+    assert len(list_events()) == 1  # no duplicate logical event
+
+    # One unique failure is below threshold -> no alert, count not inflated.
+    assert first["alerts"] == []
+    assert second["alerts"] == []
+    assert client.get("/api/v1/alerts?status=all&limit=100").json()["count"] == 0
+
+
+def test_dedup_distinct_source_record_ids_remain_distinct(
+    tmp_path, monkeypatch
+):
+    """Five failures with distinct native ids stay distinct and still trigger
+    the threshold (replay safety never collapses legitimate events)."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "distinct.db"))
+    ip = "203.0.113.10"
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    events = [
+        _ssh_failed_event(
+            ip,
+            now,
+            source="journal",
+            source_record_id=f"cur-{i}",
+        )
+        for i in range(5)
+    ]
+
+    result = ingest_events(events)
+
+    assert result["parsed"] == 5
+    assert len(result["alerts"]) == 1
+    assert result["alerts"][0]["rule_id"] == "SSH_BRUTE_FORCE"
+    assert result["alerts"][0]["event_count"] == 5
+    assert len(list_events()) == 5
+
+
+def test_dedup_null_source_record_id_not_deduped(
+    tmp_path, monkeypatch
+):
+    """Records without a stable native id (HTTP lines) are not deduplicated by
+    source_record_id; replaying identical HTTP lines inflates the count.
+
+    This is a documented limitation: HTTP ingestion is stateless and has no
+    stable record identifier, and content fingerprinting is intentionally not
+    used as a dedup key because identical messages can be separate genuine
+    authentication failures.
+    """
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "http.db"))
+    ip = "203.0.113.10"
+    lines = [
+        f"sshd[600{i}]: Failed password for attacker{i} from {ip} port {54000+i} ssh2"
+        for i in range(5)
+    ]
+
+    first = client.post("/api/v1/events/ingest", json={"lines": lines}).json()
+    second = client.post("/api/v1/events/ingest", json={"lines": lines}).json()
+
+    assert first["parsed"] == 5
+    assert second["parsed"] == 5  # replayed, not deduped (no native id)
+    assert len(list_events()) == 10
+    assert second["alerts"] == []  # aggregated into existing open alert
+    # The alert count reflects all 10 stored rows (inflation is the limitation).
+    detail = client.get(f"/api/v1/alerts/{first['alerts'][0]['id']}").json()
+    assert detail["alert"]["event_count"] == 10
+
+
+def test_concurrent_ingest_same_cursor_deduped(tmp_path, monkeypatch):
+    """Concurrent ingestion of the same identifiable record: exactly one insert
+    wins the DB-enforced unique index; the rest are skipped as duplicates."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "concurrence.db"))
+    initialize_database()
+    ip = "203.0.113.10"
+    event = _ssh_failed_event(
+        ip, "2026-10-13T10:00:00+00:00", source="journal", source_record_id="cur-conc"
+    )
+
+    errors: list[BaseException] = []
+    results: list[dict] = []
+    lock = threading.Lock()
+
+    def worker(_tag: int) -> None:
+        try:
+            results.append(ingest_events([event]))
+        except BaseException as exc:  # noqa: BLE001 - collect all failures
+            with lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert all(not t.is_alive() for t in threads), "a thread hung"
+    assert not errors, f"concurrent ingest raised: {errors}"
+    total_parsed = sum(r["parsed"] for r in results)
+    assert total_parsed == 1, f"expected exactly 1 insert, got {total_parsed}"
+    assert len(list_events()) == 1
+
+
 # --------------------------------------------------------------------------- #
 # SQLite concurrency and rollback-journal reliability (F3)
 # --------------------------------------------------------------------------- #
@@ -674,6 +821,73 @@ def test_concurrent_ingest_lines_succeeds(tmp_path, monkeypatch):
         count = conn.execute("SELECT COUNT(*) AS n FROM events").fetchone()["n"]
 
     assert count == total_events == 24, (count, total_events)
+
+
+def test_six_failures_sets_event_count_to_six(tmp_path, monkeypatch):
+    """Above-threshold scenario: 6 failures (>= 5) raise an alert with count 6."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "above.db"))
+    attack_ip = "203.0.113.10"
+    lines = [_failed_login_line(i, attack_ip) for i in range(6)]
+
+    res = client.post("/api/v1/events/ingest", json={"lines": lines})
+    body = res.json()
+
+    assert body["parsed"] == 6
+    assert len(body["alerts"]) == 1
+    assert body["alerts"][0]["event_count"] == 6
+    assert client.get("/api/v1/alerts?status=all&limit=100").json()["count"] == 1
+
+
+def test_duplicate_ingestion_updates_count_without_new_alert(
+    tmp_path, monkeypatch
+):
+    """Re-ingesting the same failures updates the alert count; no duplicate alert.
+
+    The rule aggregates into the existing open alert (one alert per IP), but the
+    stored event rows are not de-duplicated, so the count reflects every row
+    present in the window. This documents current behavior: duplicate ingestion
+    inflates event_count rather than creating a second alert.
+    """
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "dup.db"))
+    attack_ip = "203.0.113.10"
+    lines = [_failed_login_line(i, attack_ip) for i in range(5)]
+
+    first = client.post("/api/v1/events/ingest", json={"lines": lines}).json()
+    assert len(first["alerts"]) == 1
+    assert first["alerts"][0]["event_count"] == 5
+    alert_id = first["alerts"][0]["id"]
+
+    second = client.post("/api/v1/events/ingest", json={"lines": lines}).json()
+    assert second["alerts"] == []  # no new alert created
+    assert client.get("/api/v1/alerts?status=all&limit=100").json()["count"] == 1
+
+    detail = client.get(f"/api/v1/alerts/{alert_id}").json()
+    assert detail["alert"]["id"] == alert_id
+    assert detail["alert"]["event_count"] == 10  # 5 + 5 re-ingested rows
+
+
+def test_ingested_events_outside_detection_window_not_counted(
+    tmp_path, monkeypatch
+):
+    """Failed logins with timestamps outside the 5-minute window are not counted."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "oow.db"))
+    attack_ip = "203.0.113.10"
+    # Five failures stamped ten minutes ago -> outside [now-5min, now].
+    old = (
+        datetime.now(timezone.utc) - timedelta(minutes=10)
+    ).isoformat(timespec="seconds")
+    lines = [
+        f"{old} lab-host sshd[710{i}]: Failed password for user{i} "
+        f"from {attack_ip} port {57000 + i} ssh2"
+        for i in range(5)
+    ]
+
+    res = client.post("/api/v1/events/ingest", json={"lines": lines})
+    body = res.json()
+
+    assert body["parsed"] == 5
+    assert body["alerts"] == []  # not counted -> no alert
+    assert client.get("/api/v1/alerts?status=all&limit=100").json()["count"] == 0
 
 
 def test_rollback_on_failed_transaction_leaves_no_partial_data(

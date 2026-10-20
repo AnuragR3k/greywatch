@@ -500,6 +500,28 @@ def test_collect_within_batch_dedup_by_cursor(_db, patch_journal):
     assert len(_event_rows()) == 2
 
 
+def test_collect_cursor_replay_across_cycles_not_duplicated(_db, patch_journal):
+    """Re-ingesting the same journal cursor on a later cycle must not create a
+    duplicate event (source_record_id dedup enforced by the unique index)."""
+    same = rec("cREPLAY", "2026-10-13T10:00:00+00:00",
+               "Failed password for invalid user admin from 203.0.113.10 "
+               "port 54001 ssh2", ident="sshd")
+    # First cycle: no cursor stored -> bootstrap (--since) path ingests cREPLAY.
+    patch_journal.initial = [same]
+    first = collect_once(collector_mod.CollectorConfig())
+    assert first.events_ingested == 1
+    assert get_collector_setting("journal_last_cursor") == "cREPLAY"
+    assert len(_event_rows()) == 1
+
+    # Second cycle: cursor stored, incremental read returns cREPLAY again (a
+    # replay / re-fetch of the same identifiable record).
+    patch_journal.after = [same]
+    second = collect_once(collector_mod.CollectorConfig())
+    assert second.records_seen == 1
+    assert second.events_ingested == 0  # replay skipped by source_record_id dedup
+    assert len(_event_rows()) == 1  # still exactly one logical event
+
+
 def test_collect_fallback_on_invalid_cursor(_db, patch_journal):
     """When the cursor is invalid, fall back to --since and still advance."""
     patch_journal.initial = [
