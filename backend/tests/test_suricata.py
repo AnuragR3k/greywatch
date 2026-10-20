@@ -508,11 +508,130 @@ def test_status_endpoint(_db, tmp_path, monkeypatch):
     assert resp.status_code == 200
     body = resp.json()
     assert set(body) == {
-        "enabled", "eve_path", "last_offset", "last_event_ts",
-        "events_ingested", "last_run_at",
+        "enabled",
+        "eve_path",
+        "last_offset",
+        "last_event_ts",
+        "events_ingested",
+        "last_run_at",
+        "attempts",
+        "successful_runs",
+        "failed_runs",
+        "last_attempt_at",
+        "last_successful_run_at",
+        "records_seen",
+        "deduplicated",
+        "last_error",
+        "last_error_at",
     }
     assert body["enabled"] is False
     assert body["events_ingested"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# Suricata collector health / observability
+# --------------------------------------------------------------------------- #
+
+
+def test_suricata_status_health_fields_after_successful_run(_db, tmp_path, monkeypatch):
+    """A successful collection cycle records attempts, successful_runs,
+    last_successful_run_at, records_seen and deduplicated."""
+    monkeypatch.setenv("GREYWATCH_DB", str(_db / "health.db"))
+    path = _write_eve(tmp_path / "eve.json", [_alert_line(0)])
+    cfg = SuricataConfig(eve_path=str(path))
+    collect_once(cfg)
+
+    body = client.get("/api/v1/suricata/status").json()
+    assert body["attempts"] == 1
+    assert body["successful_runs"] == 1
+    assert body["failed_runs"] == 0
+    assert body["records_seen"] == 1
+    assert body["deduplicated"] == 0
+    assert body["last_error"] is None
+    assert body["last_attempt_at"] is not None
+    assert body["last_successful_run_at"] is not None
+    assert body["last_attempt_at"] == body["last_successful_run_at"]
+
+
+def test_suricata_failed_run_records_error_not_success(_db, tmp_path, monkeypatch):
+    """A failed cycle (missing EVE file) advances attempts/failed_runs and
+    last_error, but does NOT advance last_successful_run_at."""
+    monkeypatch.setenv("GREYWATCH_DB", str(_db / "fail.db"))
+    # First: a successful run to establish a baseline.
+    path = _write_eve(tmp_path / "eve.json", [_alert_line(0)])
+    cfg = SuricataConfig(eve_path=str(path))
+    collect_once(cfg)
+    before = client.get("/api/v1/suricata/status").json()
+    assert before["successful_runs"] == 1
+    assert before["failed_runs"] == 0
+    successful_run_at = before["last_successful_run_at"]
+
+    # Second: missing EVE file -> a genuinely failed cycle.
+    bad_cfg = SuricataConfig(eve_path=str(tmp_path / "does-not-exist.json"))
+    second = collect_once(bad_cfg)
+    assert second.errors
+
+    body = client.get("/api/v1/suricata/status").json()
+    assert body["attempts"] == 2
+    assert body["failed_runs"] == 1
+    assert body["successful_runs"] == 1  # unchanged by the failed cycle
+    assert body["last_error"] is not None
+    assert "EVE file not found" in body["last_error"]
+    assert body["last_error_at"] is not None
+    # last_successful_run_at must reflect the FIRST (successful) cycle only.
+    assert body["last_successful_run_at"] == successful_run_at
+
+
+def test_suricata_idle_run_is_successful(_db, tmp_path, monkeypatch):
+    """A cycle that finds nothing new is still a successful run (idle, not
+    failed): last_successful_run_at advances, failed_runs stays 0."""
+    monkeypatch.setenv("GREYWATCH_DB", str(_db / "idle.db"))
+    path = _write_eve(tmp_path / "eve.json", [_alert_line(0)])
+    cfg = SuricataConfig(eve_path=str(path))
+    first = collect_once(cfg)
+    assert first.events_ingested == 1
+
+    # Second cycle: offset at EOF -> nothing new, still successful.
+    second = collect_once(cfg)
+    assert second.events_ingested == 0
+    assert second.errors == []
+
+    body = client.get("/api/v1/suricata/status").json()
+    assert body["attempts"] == 2
+    assert body["successful_runs"] == 2
+    assert body["failed_runs"] == 0
+    assert body["last_successful_run_at"] == body["last_attempt_at"]
+
+
+def test_suricata_dedup_tracked_on_identical_replay(_db, tmp_path, monkeypatch):
+    """records_seen and deduplicated are tracked when the same EVE line is
+    replayed at a new byte offset (within-batch raw-line dedup)."""
+    monkeypatch.setenv("GREYWATCH_DB", str(_db / "dedup.db"))
+    line = _alert_line(0)
+    path = tmp_path / "eve.json"
+    path.write_text(line + "\n" + line + "\n", encoding="utf-8")
+    cfg = SuricataConfig(eve_path=str(path))
+
+    result = collect_once(cfg)
+    # Two identical lines in one batch: within-batch dedup stores one.
+    assert result.records_seen == 2
+    assert result.events_ingested == 1
+
+    body = client.get("/api/v1/suricata/status").json()
+    assert body["records_seen"] == 2
+    assert body["deduplicated"] == 1
+    assert body["attempts"] == 1
+    assert body["successful_runs"] == 1
+
+
+def test_suricata_disabled_collector_status(_db, monkeypatch):
+    """A disabled collector reports enabled=false without collecting."""
+    monkeypatch.setenv("GREYWATCH_DB", str(_db / "disabled.db"))
+    monkeypatch.setenv("GREYWATCH_SURICATA_ENABLED", "0")
+    assert suricata_mod.get_config().enabled is False
+
+    body = client.get("/api/v1/suricata/status").json()
+    assert body["enabled"] is False
 
 
 def test_collect_endpoint_missing_file_reports_error(_db, tmp_path, monkeypatch):

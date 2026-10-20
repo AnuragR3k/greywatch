@@ -738,6 +738,126 @@ def test_journal_status_endpoint(_db):
     assert "events_ingested" in body
 
 
+# --------------------------------------------------------------------------- #
+# Journal collector health / observability
+# --------------------------------------------------------------------------- #
+
+
+def test_journal_status_health_fields_after_successful_run(_db, patch_journal, monkeypatch):
+    """A successful collection cycle records attempts, successful_runs,
+    last_successful_run_at, records_seen and deduplicated."""
+    monkeypatch.setenv("GREYWATCH_DB", str(_db / "health.db"))
+    patch_journal.initial = [
+        rec("c1", "2026-10-13T10:00:00+00:00",
+            "pam_unix(sudo:session): session opened for user root by ry3k(uid=1000)"),
+    ]
+    collect_once(collector_mod.CollectorConfig())
+
+    body = client.get("/api/v1/journal/status").json()
+    assert body["attempts"] == 1
+    assert body["successful_runs"] == 1
+    assert body["failed_runs"] == 0
+    assert body["records_seen"] == 1
+    assert body["deduplicated"] == 0
+    assert body["last_error"] is None
+    assert body["last_attempt_at"] is not None
+    assert body["last_successful_run_at"] is not None
+    assert body["last_attempt_at"] == body["last_successful_run_at"]
+
+
+def test_journal_failed_run_records_error_not_success(_db, patch_journal, monkeypatch):
+    """A failed cycle (journalctl error) advances attempts/failed_runs and
+    last_error, but does NOT advance last_successful_run_at."""
+    monkeypatch.setenv("GREYWATCH_DB", str(_db / "fail.db"))
+    # First: a successful run to establish a baseline.
+    patch_journal.initial = [
+        rec("c1", "2026-10-13T10:00:00+00:00",
+            "pam_unix(sudo:session): session opened for user root by ry3k(uid=1000)"),
+    ]
+    first = collect_once(collector_mod.CollectorConfig())
+    assert first.events_ingested == 1
+    before = client.get("/api/v1/journal/status").json()
+    assert before["successful_runs"] == 1
+    assert before["failed_runs"] == 0
+    successful_run_at = before["last_successful_run_at"]
+
+    # Second: journalctl raises -> a genuinely failed cycle.
+    def _raise(args, **kw):
+        raise JournalctlError("journalctl is not available")
+    monkeypatch.setattr(collector_mod, "run_journalctl", _raise)
+    second = collect_once(collector_mod.CollectorConfig())
+    assert second.errors
+
+    body = client.get("/api/v1/journal/status").json()
+    assert body["attempts"] == 2
+    assert body["failed_runs"] == 1
+    assert body["successful_runs"] == 1  # unchanged by the failed cycle
+    assert body["last_error"] == "journalctl is not available"
+    assert body["last_error_at"] is not None
+    # last_successful_run_at must reflect the FIRST (successful) cycle only.
+    assert body["last_successful_run_at"] == successful_run_at
+
+
+def test_journal_idle_run_is_successful(_db, patch_journal, monkeypatch):
+    """A cycle that finds nothing new is still a successful run (idle, not
+    failed): last_successful_run_at advances, failed_runs stays 0."""
+    monkeypatch.setenv("GREYWATCH_DB", str(_db / "idle.db"))
+    # Seed a cursor so the incremental path is taken and returns nothing.
+    collector_mod.siem.set_collector_setting("journal_last_cursor", "cursor-prev")
+    patch_journal.after = []
+
+    result = collect_once(collector_mod.CollectorConfig())
+    assert result.events_ingested == 0
+    assert result.errors == []
+
+    body = client.get("/api/v1/journal/status").json()
+    assert body["attempts"] == 1
+    assert body["successful_runs"] == 1
+    assert body["failed_runs"] == 0
+    assert body["last_successful_run_at"] == body["last_attempt_at"]
+
+
+def test_journal_dedup_tracked_across_replay(_db, patch_journal, monkeypatch):
+    """records_seen and deduplicated are tracked when the same cursor is
+    replayed across cycles."""
+    monkeypatch.setenv("GREYWATCH_DB", str(_db / "dedup.db"))
+    same = rec("cREPLAY", "2026-10-13T10:00:00+00:00",
+               "Failed password for invalid user admin from 203.0.113.10 "
+               "port 54001 ssh2", ident="sshd")
+
+    patch_journal.initial = [same]
+    first = collect_once(collector_mod.CollectorConfig())
+    assert first.events_ingested == 1
+
+    patch_journal.after = [same]
+    second = collect_once(collector_mod.CollectorConfig())
+    assert second.events_ingested == 0  # replay skipped
+
+    body = client.get("/api/v1/journal/status").json()
+    assert body["records_seen"] == 1  # last cycle saw 1 record
+    assert body["deduplicated"] == 1  # that record was a replay
+    assert body["attempts"] == 2
+    assert body["successful_runs"] == 2
+
+
+def test_journal_disabled_collector_status(_db, monkeypatch):
+    """A disabled collector reports enabled=false without collecting."""
+    monkeypatch.setenv("GREYWATCH_DB", str(_db / "disabled.db"))
+    monkeypatch.setenv("GREYWATCH_JOURNAL_ENABLED", "0")
+    assert collector_mod.get_config().enabled is False
+
+    body = client.get("/api/v1/journal/status").json()
+    assert body["enabled"] is False
+
+
+def body_has_health(body):
+    """Helper: assert the status body carries health fields."""
+    assert "attempts" in body and "successful_runs" in body
+    assert "failed_runs" in body and "last_error" in body
+    assert "records_seen" in body and "deduplicated" in body
+    return True
+
+
 def test_journal_collect_endpoint_uses_collector(_db, monkeypatch):
     payload = {
         "__CURSOR": "ep1",

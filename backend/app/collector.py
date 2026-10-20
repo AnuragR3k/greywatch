@@ -406,12 +406,104 @@ def _state_key_last_run_at() -> str:
     return "journal_last_run_at"
 
 
+def _state_key_attempts() -> str:
+    return "journal_attempts"
+
+
+def _state_key_successful_runs() -> str:
+    return "journal_successful_runs"
+
+
+def _state_key_failed_runs() -> str:
+    return "journal_failed_runs"
+
+
+def _state_key_last_attempt_at() -> str:
+    return "journal_last_attempt_at"
+
+
+def _state_key_last_successful_run_at() -> str:
+    return "journal_last_successful_run_at"
+
+
+def _state_key_records_seen() -> str:
+    return "journal_records_seen"
+
+
+def _state_key_deduplicated() -> str:
+    return "journal_deduplicated"
+
+
+def _state_key_last_error() -> str:
+    return "journal_last_error"
+
+
+def _state_key_last_error_at() -> str:
+    return "journal_last_error_at"
+
+
 def _get_cursor() -> str | None:
     return siem.get_collector_setting(_state_key_last_cursor())
 
 
 def _get_last_event_ts() -> str | None:
     return siem.get_collector_setting(_state_key_last_event_ts())
+
+
+def _get_attempts() -> int:
+    value = siem.get_collector_setting(_state_key_attempts())
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _get_successful_runs() -> int:
+    value = siem.get_collector_setting(_state_key_successful_runs())
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _get_failed_runs() -> int:
+    value = siem.get_collector_setting(_state_key_failed_runs())
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _get_last_attempt_at() -> str | None:
+    return siem.get_collector_setting(_state_key_last_attempt_at())
+
+
+def _get_last_successful_run_at() -> str | None:
+    return siem.get_collector_setting(_state_key_last_successful_run_at())
+
+
+def _get_records_seen() -> int | None:
+    value = siem.get_collector_setting(_state_key_records_seen())
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _get_deduplicated() -> int | None:
+    value = siem.get_collector_setting(_state_key_deduplicated())
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _get_last_error() -> str | None:
+    return siem.get_collector_setting(_state_key_last_error())
+
+
+def _get_last_error_at() -> str | None:
+    return siem.get_collector_setting(_state_key_last_error_at())
 
 
 def _count_journal_events(connection: sqlite3.Connection) -> int:
@@ -433,6 +525,15 @@ def _set_state(connection: sqlite3.Connection, **values: str | None) -> None:
         _state_key_last_event_ts(): values.get("event_ts"),
         _state_key_events_ingested(): values.get("events_ingested"),
         _state_key_last_run_at(): values.get("run_at"),
+        _state_key_attempts(): values.get("attempts"),
+        _state_key_successful_runs(): values.get("successful_runs"),
+        _state_key_failed_runs(): values.get("failed_runs"),
+        _state_key_last_attempt_at(): values.get("last_attempt_at"),
+        _state_key_last_successful_run_at(): values.get("last_successful_run_at"),
+        _state_key_records_seen(): values.get("records_seen"),
+        _state_key_deduplicated(): values.get("deduplicated"),
+        _state_key_last_error(): values.get("last_error"),
+        _state_key_last_error_at(): values.get("last_error_at"),
     }
     for key, value in mapping.items():
         if value is None:
@@ -444,6 +545,38 @@ def _set_state(connection: sqlite3.Connection, **values: str | None) -> None:
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
             """,
             (key, value),
+        )
+
+
+def _persist_health_state(
+    *,
+    attempts: int,
+    successful_runs: int,
+    failed_runs: int,
+    last_attempt_at: str,
+    records_seen: int,
+    deduplicated: int,
+    last_error: str | None = None,
+    last_error_at: str | None = None,
+) -> None:
+    """Persist health/observability counters on their own connection.
+
+    Used by the early-return failure paths of :func:`collect_once` which exit
+    before the main checkpoint transaction opens. Wraps the upsert in a
+    transaction so the counters are committed atomically.
+    """
+    siem.initialize_database()
+    with siem._connection() as connection:
+        _set_state(
+            connection,
+            attempts=str(attempts),
+            successful_runs=str(successful_runs),
+            failed_runs=str(failed_runs),
+            last_attempt_at=last_attempt_at,
+            records_seen=str(records_seen),
+            deduplicated=str(deduplicated),
+            last_error=last_error,
+            last_error_at=last_error_at,
         )
 
 
@@ -534,6 +667,16 @@ def collect_once(config: CollectorConfig | None = None) -> CollectResult:
     parse them, de-duplicate against already-stored recent events, ingest the
     remainder through :func:`siem.ingest_events`, and persist the advanced
     cursor atomically with the inserts.
+
+    Health/observability counters (``attempts``, ``successful_runs``,
+    ``failed_runs``, ``last_attempt_at``, ``last_successful_run_at``,
+    ``records_seen``, ``deduplicated``, ``last_error``, ``last_error_at``) are
+    persisted in the same transaction as the checkpoint so a crash never
+    advances one without the other. A cycle that completes without errors is a
+    successful run even when it ingests zero events (idle); only a cycle that
+    records an error counts as a failed run. ``last_successful_run_at`` is
+    therefore the honest signal for distinguishing a live-but-idle collector
+    from a failed or stale one.
     """
     config = config or get_config()
     result = CollectResult()
@@ -541,6 +684,15 @@ def collect_once(config: CollectorConfig | None = None) -> CollectResult:
 
     cursor = _get_cursor()
     last_event_ts = _get_last_event_ts()
+
+    now = _now_iso()
+    attempts = _get_attempts() + 1
+    successful_runs = _get_successful_runs() + 1
+    failed_runs = _get_failed_runs()
+    last_attempt_at = now
+
+    cursor_deduped = 0
+    inserted_events: list[dict] = []
 
     try:
         records = run_journalctl(_build_args(config, cursor), command=config.command)
@@ -556,11 +708,31 @@ def collect_once(config: CollectorConfig | None = None) -> CollectResult:
                 )
             except JournalctlError as exc2:
                 result.errors.append(str(exc2))
+                _persist_health_state(
+                    attempts=attempts,
+                    successful_runs=successful_runs - 1,
+                    failed_runs=failed_runs + 1,
+                    last_attempt_at=last_attempt_at,
+                    records_seen=result.records_seen,
+                    deduplicated=0,
+                    last_error=result.errors[0],
+                    last_error_at=now,
+                )
                 return result
             # Advance past the invalid cursor by forgetting it.
             cursor = None
         else:
             result.errors.append(str(exc))
+            _persist_health_state(
+                attempts=attempts,
+                successful_runs=successful_runs - 1,
+                failed_runs=failed_runs + 1,
+                last_attempt_at=last_attempt_at,
+                records_seen=result.records_seen,
+                deduplicated=0,
+                last_error=result.errors[0],
+                last_error_at=now,
+            )
             return result
 
     result.records_seen = len(records)
@@ -572,6 +744,7 @@ def collect_once(config: CollectorConfig | None = None) -> CollectResult:
         cursor_value = record.get("__CURSOR")
         # Within-batch de-duplication by journal cursor.
         if cursor_value and cursor_value in seen_cursors:
+            cursor_deduped += 1
             continue
         if cursor_value:
             seen_cursors.add(cursor_value)
@@ -590,6 +763,7 @@ def collect_once(config: CollectorConfig | None = None) -> CollectResult:
     # Nothing recognizable happened; still advance the cursor if we saw any
     # records, so unrecognized entries are not re-processed forever.
     if not events and last_cursor:
+        deduplicated = cursor_deduped
         with siem._connection() as connection:
             _set_state(
                 connection,
@@ -597,6 +771,13 @@ def collect_once(config: CollectorConfig | None = None) -> CollectResult:
                 event_ts=last_event_ts,
                 events_ingested=str(_count_journal_events(connection)),
                 run_at=_now_iso(),
+                attempts=str(attempts),
+                successful_runs=str(successful_runs),
+                failed_runs=str(failed_runs),
+                last_attempt_at=last_attempt_at,
+                last_successful_run_at=_now_iso(),
+                records_seen=str(result.records_seen),
+                deduplicated=str(deduplicated),
             )
         result.cursor_advanced = True
         result.events_ingested = 0
@@ -608,6 +789,7 @@ def collect_once(config: CollectorConfig | None = None) -> CollectResult:
         # endpoint reflects a live, continuously-polling collector instead of
         # a frozen checkpoint. The cursor and last_event_ts are left
         # unchanged: with no new records there is nothing to advance past.
+        deduplicated = cursor_deduped
         with siem._connection() as connection:
             _set_state(
                 connection,
@@ -615,6 +797,13 @@ def collect_once(config: CollectorConfig | None = None) -> CollectResult:
                 event_ts=last_event_ts,
                 events_ingested=str(_count_journal_events(connection)),
                 run_at=_now_iso(),
+                attempts=str(attempts),
+                successful_runs=str(successful_runs),
+                failed_runs=str(failed_runs),
+                last_attempt_at=last_attempt_at,
+                last_successful_run_at=_now_iso(),
+                records_seen=str(result.records_seen),
+                deduplicated=str(deduplicated),
             )
         return result
 
@@ -633,23 +822,34 @@ def collect_once(config: CollectorConfig | None = None) -> CollectResult:
             if (e["timestamp"], e["host"], e["raw_message"]) not in existing_keys
         ]
 
-        inserted, new_alerts, _new_incidents = siem._store_events_and_detect(
+        inserted_events, new_alerts, _new_incidents = siem._store_events_and_detect(
             new_events, connection
         )
+
+        # Deduplicated = parsed candidates not stored (cursor dupes + content
+        # overlap + DB source_record_id uniqueness).
+        deduplicated = cursor_deduped + len(events) - len(inserted_events)
 
         # Advance the checkpoint in the same transaction as the inserts so a
         # crash cannot leave events stored but the cursor un-advanced.
         advanced_cursor = last_cursor or cursor
-        advanced_ts = inserted[-1]["timestamp"] if inserted else last_event_ts
+        advanced_ts = inserted_events[-1]["timestamp"] if inserted_events else last_event_ts
         _set_state(
             connection,
             cursor=advanced_cursor or cursor,
             event_ts=advanced_ts or last_event_ts,
             events_ingested=str(_count_journal_events(connection)),
             run_at=_now_iso(),
+            attempts=str(attempts),
+            successful_runs=str(successful_runs),
+            failed_runs=str(failed_runs),
+            last_attempt_at=last_attempt_at,
+            last_successful_run_at=_now_iso(),
+            records_seen=str(result.records_seen),
+            deduplicated=str(deduplicated),
         )
 
-    result.events_ingested = len(inserted)
+    result.events_ingested = len(inserted_events)
     result.new_alerts = new_alerts
     result.cursor_advanced = advanced_cursor is not None
     return result
@@ -726,7 +926,14 @@ def run_loop(config: CollectorConfig | None = None) -> None:
 
 
 def status() -> dict:
-    """Return the current collector checkpoint/state for reporting."""
+    """Return the current collector checkpoint/state for reporting.
+
+    In addition to the checkpoint fields, the response carries health and
+    observability counters so the frontend can distinguish an idle collector
+    (successful run, zero ingested) from a failed or stale one. ``last_error``
+    is the most recent safe error summary; it is never a credential, token, or
+    raw log message.
+    """
     siem.initialize_database()
     ingested_value = siem.get_collector_setting(_state_key_events_ingested(), "0")
     try:
@@ -739,6 +946,17 @@ def status() -> dict:
         "last_event_ts": siem.get_collector_setting(_state_key_last_event_ts()),
         "events_ingested": events_ingested,
         "last_run_at": siem.get_collector_setting(_state_key_last_run_at()),
+        "attempts": _get_attempts(),
+        "successful_runs": _get_successful_runs(),
+        "failed_runs": _get_failed_runs(),
+        "last_attempt_at": siem.get_collector_setting(_state_key_last_attempt_at()),
+        "last_successful_run_at": siem.get_collector_setting(
+            _state_key_last_successful_run_at()
+        ),
+        "records_seen": _get_records_seen(),
+        "deduplicated": _get_deduplicated(),
+        "last_error": _get_last_error(),
+        "last_error_at": siem.get_collector_setting(_state_key_last_error_at()),
     }
 
 

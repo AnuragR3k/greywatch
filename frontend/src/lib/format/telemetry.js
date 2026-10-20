@@ -226,18 +226,57 @@ export function alertSearchText(alert) {
 
 /* ------------------------------------------------------------ collectors */
 
-// An enabled-but-silent collector is "Stale" once its last run ages past this.
+// An enabled-but-silent collector is "Stale" once its last successful run
+// ages past this. last_run_at updates on every cycle (including failures), so
+// freshness is judged against last_successful_run_at where available.
 export const COLLECTOR_FRESH_MS = 30 * 60 * 1000
 
 /* Derive an honest collector state. tone: healthy | degraded | disabled |
-   unavailable | unknown. `stale` marks enabled-but-not-recently-run. */
+   unavailable | unknown. `stale` marks enabled-but-not-recently-run. `error`
+   carries the most recent safe error summary when a recent failure occurred. */
 export function collectorState(status, { freshMs = COLLECTOR_FRESH_MS } = {}) {
   if (status == null) return { tone: 'unavailable', label: 'Unavailable', stale: false }
   if (!status.enabled) return { tone: 'disabled', label: 'Disabled', stale: false }
   if (!hasValue(status.last_run_at)) return { tone: 'unknown', label: 'Awaiting first run', stale: false }
-  const age = ageMs(status.last_run_at)
+
   const ingested = Number(status.events_ingested) || 0
-  if (age != null && age > freshMs) return { tone: 'degraded', label: 'Stale', stale: true, ageMs: age, ingested }
-  if (ingested > 0) return { tone: 'healthy', label: 'Active', stale: false, ageMs: age, ingested }
-  return { tone: 'unknown', label: 'Idle', stale: false, ageMs: age, ingested }
+  const seen = Number(status.records_seen) || 0
+  const deduplicated = Number(status.deduplicated) || 0
+  const attempts = Number(status.attempts) || 0
+  const successful = Number(status.successful_runs) || 0
+  const failed = Number(status.failed_runs) || 0
+  const error = status.last_error || null
+
+  // Freshness is judged against the last *successful* run: last_run_at is
+  // updated on every cycle including failures, so it would mask a stuck /
+  // failing collector as "live".
+  const lastSuccessful = status.last_successful_run_at || status.last_run_at
+  const age = ageMs(lastSuccessful)
+
+  const errorAge = error && status.last_error_at ? ageMs(status.last_error_at) : null
+  const recentlyFailed = error != null && errorAge != null && errorAge <= freshMs
+
+  if (recentlyFailed) {
+    return {
+      tone: 'degraded',
+      label: 'Degraded',
+      stale: false,
+      ageMs: age,
+      ingested,
+      seen,
+      deduplicated,
+      attempts,
+      successful,
+      failed,
+      error,
+      errorAgeMs: errorAge,
+    }
+  }
+  if (age != null && age > freshMs) {
+    return { tone: 'degraded', label: 'Stale', stale: true, ageMs: age, ingested, seen, deduplicated, attempts, successful, failed }
+  }
+  if (ingested > 0) {
+    return { tone: 'healthy', label: 'Active', stale: false, ageMs: age, ingested, seen, deduplicated, attempts, successful, failed }
+  }
+  return { tone: 'unknown', label: 'Idle', stale: false, ageMs: age, ingested, seen, deduplicated, attempts, successful, failed }
 }

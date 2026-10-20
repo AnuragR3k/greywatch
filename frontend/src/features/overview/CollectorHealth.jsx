@@ -1,6 +1,9 @@
 // Collector health (overview) — journal and Suricata shown separately. A
 // disabled collector is shown as disabled, not broken; an unreachable status
 // endpoint shows "Unavailable" with a retry (never "0 ingested").
+//
+// Freshness is judged against the last *successful* run so a failing collector
+// is never mistaken for a live one.
 
 import { BookLock, Radar } from 'lucide-react'
 import { Panel, PanelHeader } from '@/components/ui/Panel'
@@ -16,6 +19,8 @@ function CollectorSummary({ title, icon, status, loading, error, onRetry, disabl
   const unavailable = status == null && !loading
   const state = collectorState(status)
   const ingested = Number.isFinite(Number(status?.events_ingested)) ? Number(status.events_ingested) : null
+  const seen = Number.isFinite(Number(status?.records_seen)) ? Number(status.records_seen) : null
+  const deduplicated = Number.isFinite(Number(status?.deduplicated)) ? Number(status.deduplicated) : null
 
   return (
     <Panel>
@@ -35,8 +40,12 @@ function CollectorSummary({ title, icon, status, loading, error, onRetry, disabl
             <dd className="font-mono text-sm text-text-primary">{ingested == null ? '—' : ingested.toLocaleString()}</dd>
           </div>
           <div>
+            <dt className="text-[10px] uppercase tracking-wider text-text-muted">Records seen</dt>
+            <dd className="font-mono text-sm text-text-primary">{seen == null ? '—' : seen.toLocaleString()}</dd>
+          </div>
+          <div>
             <dt className="text-[10px] uppercase tracking-wider text-text-muted">Last run</dt>
-            <dd className="font-mono text-sm text-text-primary">{status?.last_run_at ? formatCompact(status.last_run_at) : '—'}</dd>
+            <dd className="font-mono text-sm text-text-primary">{status?.last_successful_run_at ?? status?.last_run_at ? formatCompact(status?.last_successful_run_at ?? status?.last_run_at) : '—'}</dd>
           </div>
           {evePath && (
             <div className="col-span-2">
@@ -44,11 +53,17 @@ function CollectorSummary({ title, icon, status, loading, error, onRetry, disabl
               <dd className="truncate font-mono text-xs text-text-secondary" title={status?.eve_path || ''}>{status?.eve_path || '—'}</dd>
             </div>
           )}
+          {deduplicated != null && deduplicated > 0 && (
+            <div className="col-span-2">
+              <dt className="text-[10px] uppercase tracking-wider text-text-muted">Deduplicated (last cycle)</dt>
+              <dd className="font-mono text-sm text-text-secondary">{deduplicated.toLocaleString()}</dd>
+            </div>
+          )}
         </dl>
 
-        {status?.errors?.length > 0 && (
+        {state.error && (
           <ul className="mt-3 space-y-1 rounded-md border border-[#7f1d1d]/40 bg-[#7f1d1d]/10 p-2.5 text-[11px] text-[#fca5a5]">
-            {status.errors.map((e, i) => <li key={i} className="truncate" title={e}>{e}</li>)}
+            <li className="truncate" title={state.error}>{state.error}</li>
           </ul>
         )}
 

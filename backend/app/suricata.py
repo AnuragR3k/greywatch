@@ -185,6 +185,42 @@ def _state_key_device() -> str:
     return _SURICATA_PREFIX + "file_device"
 
 
+def _state_key_attempts() -> str:
+    return _SURICATA_PREFIX + "attempts"
+
+
+def _state_key_successful_runs() -> str:
+    return _SURICATA_PREFIX + "successful_runs"
+
+
+def _state_key_failed_runs() -> str:
+    return _SURICATA_PREFIX + "failed_runs"
+
+
+def _state_key_last_attempt_at() -> str:
+    return _SURICATA_PREFIX + "last_attempt_at"
+
+
+def _state_key_last_successful_run_at() -> str:
+    return _SURICATA_PREFIX + "last_successful_run_at"
+
+
+def _state_key_records_seen() -> str:
+    return _SURICATA_PREFIX + "records_seen"
+
+
+def _state_key_deduplicated() -> str:
+    return _SURICATA_PREFIX + "deduplicated"
+
+
+def _state_key_last_error() -> str:
+    return _SURICATA_PREFIX + "last_error"
+
+
+def _state_key_last_error_at() -> str:
+    return _SURICATA_PREFIX + "last_error_at"
+
+
 def _get_offset() -> str | None:
     return siem.get_collector_setting(_state_key_offset())
 
@@ -220,6 +256,62 @@ def _get_device() -> str | None:
     return siem.get_collector_setting(_state_key_device())
 
 
+def _get_attempts() -> int:
+    value = siem.get_collector_setting(_state_key_attempts())
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _get_successful_runs() -> int:
+    value = siem.get_collector_setting(_state_key_successful_runs())
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _get_failed_runs() -> int:
+    value = siem.get_collector_setting(_state_key_failed_runs())
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _get_last_attempt_at() -> str | None:
+    return siem.get_collector_setting(_state_key_last_attempt_at())
+
+
+def _get_last_successful_run_at() -> str | None:
+    return siem.get_collector_setting(_state_key_last_successful_run_at())
+
+
+def _get_records_seen() -> int | None:
+    value = siem.get_collector_setting(_state_key_records_seen())
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _get_deduplicated() -> int | None:
+    value = siem.get_collector_setting(_state_key_deduplicated())
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _get_last_error() -> str | None:
+    return siem.get_collector_setting(_state_key_last_error())
+
+
+def _get_last_error_at() -> str | None:
+    return siem.get_collector_setting(_state_key_last_error_at())
+
+
 def _count_suricata_events(connection: sqlite3.Connection) -> int:
     """Count stored suricata-sourced events on an open connection.
 
@@ -241,6 +333,15 @@ def _set_state(connection: sqlite3.Connection, **values: object) -> None:
         _state_key_generation(): values.get("generation"),
         _state_key_inode(): values.get("inode"),
         _state_key_device(): values.get("device"),
+        _state_key_attempts(): values.get("attempts"),
+        _state_key_successful_runs(): values.get("successful_runs"),
+        _state_key_failed_runs(): values.get("failed_runs"),
+        _state_key_last_attempt_at(): values.get("last_attempt_at"),
+        _state_key_last_successful_run_at(): values.get("last_successful_run_at"),
+        _state_key_records_seen(): values.get("records_seen"),
+        _state_key_deduplicated(): values.get("deduplicated"),
+        _state_key_last_error(): values.get("last_error"),
+        _state_key_last_error_at(): values.get("last_error_at"),
     }
     for key, value in mapping.items():
         if value is None:
@@ -252,6 +353,38 @@ def _set_state(connection: sqlite3.Connection, **values: object) -> None:
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
             """,
             (key, str(value)),
+        )
+
+
+def _persist_health_state(
+    *,
+    attempts: int,
+    successful_runs: int,
+    failed_runs: int,
+    last_attempt_at: str,
+    records_seen: int,
+    deduplicated: int,
+    last_error: str | None = None,
+    last_error_at: str | None = None,
+) -> None:
+    """Persist health/observability counters on their own connection.
+
+    Used by the early-return failure path of :func:`collect_once` which exits
+    before the main checkpoint transaction opens. Wraps the upsert in a
+    transaction so the counters are committed atomically.
+    """
+    siem.initialize_database()
+    with siem._connection() as connection:
+        _set_state(
+            connection,
+            attempts=str(attempts),
+            successful_runs=str(successful_runs),
+            failed_runs=str(failed_runs),
+            last_attempt_at=last_attempt_at,
+            records_seen=str(records_seen),
+            deduplicated=str(deduplicated),
+            last_error=last_error,
+            last_error_at=last_error_at,
         )
 
 
@@ -483,6 +616,17 @@ def collect_once(config: SuricataConfig | None = None) -> CollectResult:
     them, de-duplicate against already-stored recent events, ingest the
     remainder through :func:`siem._store_events_and_detect`, and persist the
     advanced offset atomically with the inserts.
+
+    Health/observability counters (``attempts``, ``successful_runs``,
+    ``failed_runs``, ``last_attempt_at``, ``last_successful_run_at``,
+    ``records_seen``, ``deduplicated``, ``last_error``, ``last_error_at``) are
+    persisted in the same transaction as the checkpoint so a crash never
+    advances one without the other. A cycle that completes without errors is a
+    successful run even when it ingests zero events (idle); only a cycle that
+    records an error counts as a failed run. ``last_successful_run_at`` is
+    therefore the honest signal for distinguishing a live-but-idle collector
+    from a failed or stale one. ``last_error`` is the most recent safe error
+    summary; it never exposes the EVE filesystem path or credentials.
     """
     config = config or get_config()
     result = CollectResult()
@@ -532,6 +676,15 @@ def collect_once(config: SuricataConfig | None = None) -> CollectResult:
         offset = 0
         rotated = True
 
+    now = _now_iso()
+    attempts = _get_attempts() + 1
+    successful_runs = _get_successful_runs() + 1
+    failed_runs = _get_failed_runs()
+    last_attempt_at = now
+
+    line_deduped = 0
+    inserted_events: list[dict] = []
+
     try:
         raw_records, new_offset, read_rotated = _read_eve_records(
             config.eve_path, offset, config.max_records
@@ -540,6 +693,18 @@ def collect_once(config: SuricataConfig | None = None) -> CollectResult:
         # Missing/unreadable EVE file is reported, not raised: the collector
         # keeps running and will pick the file up on the next cycle.
         result.errors.append(str(exc))
+        # Persist the failed attempt so the status endpoint reflects a failed
+        # run rather than a stale or healthy one.
+        _persist_health_state(
+            attempts=attempts,
+            successful_runs=successful_runs - 1,
+            failed_runs=failed_runs + 1,
+            last_attempt_at=last_attempt_at,
+            records_seen=result.records_seen,
+            deduplicated=0,
+            last_error=result.errors[0],
+            last_error_at=now,
+        )
         return result
 
     rotated = rotated or read_rotated
@@ -559,6 +724,7 @@ def collect_once(config: SuricataConfig | None = None) -> CollectResult:
     seen_lines: set[str] = set()
     for raw_line, record, byte_offset in raw_records:
         if raw_line in seen_lines:
+            line_deduped += 1
             continue
         seen_lines.add(raw_line)
         event = parse_eve_record(record, raw_line=raw_line)
@@ -574,6 +740,7 @@ def collect_once(config: SuricataConfig | None = None) -> CollectResult:
 
     # Nothing recognizable happened; still record progress + last_run_at.
     if not events:
+        deduplicated = line_deduped
         with siem._connection() as connection:
             _set_state(
                 connection,
@@ -584,6 +751,13 @@ def collect_once(config: SuricataConfig | None = None) -> CollectResult:
                 generation=str(generation),
                 inode=str(_inode),
                 device=str(_device),
+                attempts=str(attempts),
+                successful_runs=str(successful_runs),
+                failed_runs=str(failed_runs),
+                last_attempt_at=last_attempt_at,
+                last_successful_run_at=_now_iso(),
+                records_seen=str(result.records_seen),
+                deduplicated=str(line_deduped),
             )
         result.cursor_advanced = new_offset != offset
         return result
@@ -610,11 +784,11 @@ def collect_once(config: SuricataConfig | None = None) -> CollectResult:
         else:
             new_events = events
 
-        inserted, new_alerts, _new_incidents = siem._store_events_and_detect(
+        inserted_events, new_alerts, _new_incidents = siem._store_events_and_detect(
             new_events, connection
         )
 
-        advanced_ts = inserted[-1]["timestamp"] if inserted else last_event_ts
+        advanced_ts = inserted_events[-1]["timestamp"] if inserted_events else last_event_ts
         _set_state(
             connection,
             offset=str(new_offset),
@@ -624,9 +798,16 @@ def collect_once(config: SuricataConfig | None = None) -> CollectResult:
             generation=str(generation),
             inode=str(_inode),
             device=str(_device),
+            attempts=str(attempts),
+            successful_runs=str(successful_runs),
+            failed_runs=str(failed_runs),
+            last_attempt_at=last_attempt_at,
+            last_successful_run_at=_now_iso(),
+            records_seen=str(result.records_seen),
+            deduplicated=str(line_deduped + len(events) - len(inserted_events)),
         )
 
-    result.events_ingested = len(inserted)
+    result.events_ingested = len(inserted_events)
     result.new_alerts = new_alerts
     result.cursor_advanced = new_offset != offset
     return result
@@ -638,7 +819,14 @@ def collect_once(config: SuricataConfig | None = None) -> CollectResult:
 
 
 def status() -> dict:
-    """Return Suricata collector checkpoint state and the enabled flag."""
+    """Return Suricata collector checkpoint state and the enabled flag.
+
+    In addition to the checkpoint fields, the response carries health and
+    observability counters so the frontend can distinguish an idle collector
+    (successful run, zero ingested) from a failed or stale one. ``last_error``
+    is the most recent safe error summary; it never exposes the EVE filesystem
+    path, credentials, or tokens.
+    """
     siem.initialize_database()
     ingested_value = siem.get_collector_setting(_state_key_events_ingested(), "0")
     try:
@@ -652,6 +840,17 @@ def status() -> dict:
         "last_event_ts": _get_last_event_ts(),
         "events_ingested": events_ingested,
         "last_run_at": siem.get_collector_setting(_state_key_last_run_at()),
+        "attempts": _get_attempts(),
+        "successful_runs": _get_successful_runs(),
+        "failed_runs": _get_failed_runs(),
+        "last_attempt_at": siem.get_collector_setting(_state_key_last_attempt_at()),
+        "last_successful_run_at": siem.get_collector_setting(
+            _state_key_last_successful_run_at()
+        ),
+        "records_seen": _get_records_seen(),
+        "deduplicated": _get_deduplicated(),
+        "last_error": _get_last_error(),
+        "last_error_at": siem.get_collector_setting(_state_key_last_error_at()),
     }
 
 
