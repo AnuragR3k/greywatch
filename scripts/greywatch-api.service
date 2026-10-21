@@ -1,0 +1,32 @@
+[Unit]
+Description=Greywatch FastAPI API
+After=network.target
+Wants=network.target
+
+# Run as a dedicated, unprivileged service user (see docs/DEPLOYMENT.md).
+User=greywatch
+Group=greywatch
+
+# Working directory is the repository checkout.
+WorkingDirectory=/opt/greywatch
+
+# Environment: secrets come from the protected env file (mode 0600).
+EnvironmentFile=/etc/greywatch/greywatch.env
+
+# Bind to loopback ONLY — never a public interface. Caddy (public HTTPS)
+# proxies to this address.
+ExecStart=/opt/greywatch/.venv/bin/uvicorn backend.app.main:app \
+    --host 127.0.0.1 --port 8000 --log-level warning
+
+# Restart policy.
+Restart=on-failure
+RestartSec=5
+
+# Hardening (systemd).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/greywatch /opt/greywatch/backend/app/__pycache__ /opt/greywatch/backend/.pytest_cache /opt/greywatch/backend/.ruff_cache
+
+[Install]
+WantedBy=multi-user.target

@@ -39,6 +39,10 @@ from . import suricata
 # silently disable the protection.
 MAX_REQUEST_BYTES_DEFAULT = 1024 * 1024  # 1 MiB = 1,048,576 bytes
 
+#: Sentinel distinguishing "no explicit limit passed" (resolve from the
+#: environment on every request) from an explicit ``None`` ("disabled").
+_UNSET = object()
+
 
 def get_max_request_bytes() -> int | None:
     """Return the max request-body size in bytes, or ``None`` to disable.
@@ -140,6 +144,24 @@ def get_api_token() -> str | None:
     return token
 
 
+def _credentials_match(provided: str, expected: str) -> bool:
+    """Constant-time credential comparison tolerant of non-ASCII input.
+
+    ``hmac.compare_digest`` raises ``TypeError`` when handed ``str`` arguments
+    containing non-ASCII characters. HTTP header values are decoded as latin-1,
+    so a remote client can deliver non-ASCII bytes and a denied request
+    previously surfaced as an unhandled 500 instead of a fail-closed 401.
+    Comparing UTF-8 *bytes* keeps the comparison constant-time and makes any
+    non-matching input simply compare as unequal.
+    """
+    try:
+        return hmac.compare_digest(
+            provided.encode("utf-8"), expected.encode("utf-8")
+        )
+    except (AttributeError, UnicodeError):
+        return False
+
+
 class MaxBodySizeMiddleware:
     """ASGI middleware that rejects request bodies exceeding a byte limit.
 
@@ -154,19 +176,28 @@ class MaxBodySizeMiddleware:
     is not exceeded, the bounded body is replayed to the inner application.
     """
 
-    def __init__(self, app, max_bytes: int | None = None):
+    def __init__(self, app, max_bytes=_UNSET):
         self.app = app
-        # A limit of 0 or negative is treated as "disabled" (no limit).
-        if max_bytes is not None and max_bytes <= 0:
-            max_bytes = None
-        self.max_bytes = max_bytes
+        # When no explicit limit is supplied, the effective limit is resolved
+        # from ``GREYWATCH_MAX_REQUEST_BYTES`` on every request (mirroring
+        # RateLimitMiddleware's config=None pattern), so a running process
+        # honors operator configuration without a code change. Passing an
+        # explicit value (including ``None`` for "disabled") pins the limit.
+        if max_bytes is _UNSET:
+            self._read_env = True
+            self.max_bytes = None
+        else:
+            self._read_env = False
+            # A limit of 0 or negative is treated as "disabled" (no limit).
+            if max_bytes is not None and max_bytes <= 0:
+                max_bytes = None
+            self.max_bytes = max_bytes
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or self.max_bytes is None:
+        max_bytes = get_max_request_bytes() if self._read_env else self.max_bytes
+        if scope["type"] != "http" or max_bytes is None:
             await self.app(scope, receive, send)
             return
-
-        max_bytes = self.max_bytes
         received = 0
         chunks: list[bytes] = []
 
@@ -442,7 +473,7 @@ app = FastAPI(
 
 app.add_middleware(RateLimitMiddleware)
 
-app.add_middleware(MaxBodySizeMiddleware, max_bytes=get_max_request_bytes())
+app.add_middleware(MaxBodySizeMiddleware)
 
 
 class IngestRequest(BaseModel):
@@ -537,13 +568,13 @@ def _check_trust_boundary(request: Request) -> tuple[int, str] | None:
         provided = request.headers.get("Authorization", "")
         credentials_ok = False
         if provided.startswith("Bearer "):
-            credentials_ok = hmac.compare_digest(
+            credentials_ok = _credentials_match(
                 provided[len("Bearer "):].strip(), token
             )
         if not credentials_ok:
             api_key = request.headers.get("X-API-Key", "")
             if api_key:
-                credentials_ok = hmac.compare_digest(api_key, token)
+                credentials_ok = _credentials_match(api_key, token)
         if not credentials_ok:
             return 401, "Authentication required"
         return None
