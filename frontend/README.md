@@ -51,10 +51,14 @@ src/
 
 All HTTP access goes through `lib/api/client.js`:
 
-- configurable base URL (Vite proxy by default)
+- configurable base URL (`VITE_API_BASE_URL`, falling back to `VITE_API_URL`;
+  empty = same-origin via the Vite proxy). See `.env.example`.
 - request timeouts + abort-signal cancellation
 - bounded retries with backoff, `Retry-After` handling
 - JSON parse guards and structured `ApiError` / `NetworkError`
+- clear handling of 401/403 (unauthorized/forbidden) and 5xx/network failures
+- optional runtime bearer token, injected as `window.__GREYWATCH_API_TOKEN__`
+  (in-memory only, never a build-time `VITE_*` secret and never persisted)
 - no secrets in the bundle
 
 `hooks/useResource.js` prevents the historic request-loop bugs: stable callback

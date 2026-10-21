@@ -139,7 +139,7 @@ Only features verified in the codebase are documented below:
   - **Security Events:** Tabular event explorer displaying Event ID, Timestamp, Host, Type, Username, Source IP, Severity, and Raw Log Message.
   - **Alerts:** Full alert feed with columns Last triggered, Alert (rule chip + signature + signature ID + title/description), Network (`src:port → dst:port · proto`), Severity (Greywatch tier + original Suricata tier), Events (count), Status (with resolved time), Actions (Investigate / Resolve). Alert rows for `SSH_BRUTE_FORCE` degrade gracefully to the source-IP-only layout when the Suricata-only fields are absent.
 - Real-time client-side search filtering across both events and alerts.
-- Auto-refresh mechanism: Polls `/api/v1/events`, `/api/v1/alerts?status=all`, and `/health` every 10 seconds.
+- Auto-refresh mechanism: Polls `/api/v1/events`, `/api/v1/alerts?status=all`, and `/health` every 15 seconds.
 - Live backend connection status indicator (Online / Offline), plus a Suricata EVE collector status badge (idle / error / disabled) sourced from `GET /api/v1/suricata/status`.
 - Event provenance badges: each event's `source` field is rendered as a colored badge — `NULL`→`HTTP ingest` (grey), `journal`→`systemd journal` (teal), `suricata`→`Suricata` (purple), `test`→`Test` (grey) — so synthetic HTTP-ingested events are visually distinct from genuine journal/Suricata telemetry.
 - Event-type category badges (SSH, sudo, Suricata alert/DNS/TLS/HTTP/flow) with dedicated color tones.

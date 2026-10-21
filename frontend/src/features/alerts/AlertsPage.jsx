@@ -35,12 +35,19 @@ const SORT_OPTIONS = [
 ]
 
 export function AlertsPage() {
-  const { data: alerts, loading, error, refetch } = useAlerts({ status: 'all', limit: 500 })
+  // The backend returns ``count`` (this page) and ``total`` (all matching
+  // pages). Filtering by status/severity/source IP/search is applied
+  // client-side over the fetched set and labelled as such.
+  const { data: alerts, loading, error, refetch, total } = useAlerts({
+    status: 'all',
+    limit: 500,
+  })
   const closeAlert = useCloseAlert()
 
   const [search, setSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState('open')
   const [severityFilter, setSeverityFilter] = useState('all')
+  const [sourceIpFilter, setSourceIpFilter] = useState('')
   const [sortKey, setSortKey] = useState('last_triggered_at')
   const [sortDir, setSortDir] = useState('desc')
   const [page, setPage] = useState(1)
@@ -49,9 +56,11 @@ export function AlertsPage() {
 
   const filtered = useMemo(() => {
     const term = search.trim().toLowerCase()
+    const sourceIp = sourceIpFilter.trim()
     const list = (alerts || []).filter((a) => {
       if (statusFilter !== 'all' && a.status !== statusFilter) return false
       if (severityFilter !== 'all' && a.severity !== severityFilter) return false
+      if (sourceIp && String(a.source_ip).toLowerCase() !== sourceIp.toLowerCase()) return false
       if (term && !alertSearchText(a).some((v) => v.includes(term))) return false
       return true
     })
@@ -62,7 +71,7 @@ export function AlertsPage() {
       if (av > bv) return sortDir === 'asc' ? 1 : -1
       return 0
     })
-  }, [alerts, statusFilter, severityFilter, search, sortKey, sortDir])
+  }, [alerts, statusFilter, severityFilter, sourceIpFilter, search, sortKey, sortDir])
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE))
   const currentPage = Math.min(page, totalPages)
@@ -87,6 +96,14 @@ export function AlertsPage() {
           <SelectMenu label="Severity" value={severityFilter} onChange={(v) => { setSeverityFilter(v); setPage(1) }} options={SEVERITY_OPTIONS} className="w-44" />
           <input
             type="search"
+            value={sourceIpFilter}
+            onChange={(e) => { setSourceIpFilter(e.target.value); setPage(1) }}
+            placeholder="Source IP…"
+            aria-label="Filter by source IP"
+            className="h-8 w-full min-w-[160px] rounded-md border border-border-card bg-card px-3 text-xs text-text-primary placeholder:text-text-muted outline-none focus:border-accent"
+          />
+          <input
+            type="search"
             value={search}
             onChange={(e) => { setSearch(e.target.value); setPage(1) }}
             placeholder="Search alerts…"
@@ -101,7 +118,7 @@ export function AlertsPage() {
             {sortDir === 'asc' ? 'Ascending' : 'Descending'}
           </Button>
           <span className="text-[11px] text-text-muted">
-            {filtered.length} of {(alerts || []).length} · {openCount} open
+            {total || (alerts?.length ?? 0)} total · {openCount} open
             <span className="hidden sm:inline"> · filters applied client-side</span>
           </span>
         </div>

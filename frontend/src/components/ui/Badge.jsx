@@ -22,6 +22,7 @@ const TONE = {
 
 const STATUS_TONE = {
   open: 'critical',
+  acknowledged: 'degraded',
   closed: 'healthy',
   healthy: 'healthy',
   degraded: 'degraded',

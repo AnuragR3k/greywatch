@@ -1,7 +1,7 @@
 // Central HTTP client. All network access goes through here so timeout,
 // cancellation, retry, and error handling live in exactly one place.
 
-import { API_CONFIG } from './config'
+import { API_CONFIG, getRuntimeToken } from './config'
 import { ApiError, NetworkError } from './errors'
 
 /* Resolve a path against the configured base URL. */
@@ -9,12 +9,15 @@ function resolveUrl(path) {
   return API_CONFIG.baseUrl ? `${API_CONFIG.baseUrl}${path}` : path
 }
 
-/* Build request headers. No token is added by default; a caller may supply one
-   via `options.token` for reverse-proxy / token-mode deployments. */
+/* Build request headers. A caller may pass an explicit `options.token`; when
+   none is given, a runtime-injected token (`window.__GREYWATCH_API_TOKEN__`)
+   is used if present. In the loopback/local default neither exists and no
+   Authorization header is sent. */
 function buildHeaders({ token, contentType = true } = {}) {
   const headers = { Accept: 'application/json' }
   if (contentType) headers['Content-Type'] = 'application/json'
-  if (token) headers.Authorization = `Bearer ${token}`
+  const authToken = token ?? getRuntimeToken()
+  if (authToken) headers.Authorization = `Bearer ${authToken}`
   return headers
 }
 

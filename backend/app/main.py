@@ -17,11 +17,17 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger("greywatch.api")
 
 from .siem import (
+    acknowledge_incident,
     close_alert,
+    count_alerts,
+    count_incidents,
     get_alert_detail,
+    get_incident,
     ingest_lines,
+    list_incidents,
     list_alerts,
     list_events,
+    resolve_incident,
 )
 from . import collector
 from . import suricata
@@ -291,6 +297,7 @@ def get_rate_limit_config() -> RateLimitConfig:
 # Category of each protected path, used to select the per-category limit.
 _PATH_CATEGORIES: dict[str, str] = {
     "/api/v1/events/ingest": "ingestion",
+    "/api/v1/incidents": "reads",
     "/api/v1/journal/collect": "collector",
     "/api/v1/suricata/collect": "collector",
     "/api/v1/alerts/{alert_id}/close": "alert_close",
@@ -302,6 +309,10 @@ def _category_for_path(path: str) -> str | None:
     if path in PUBLIC_PATHS:
         return None
     if path.startswith("/api/v1/alerts/") and path.endswith("/close"):
+        return "alert_close"
+    if path.startswith("/api/v1/incidents/") and (
+        path.endswith("/acknowledge") or path.endswith("/resolve")
+    ):
         return "alert_close"
     return _PATH_CATEGORIES.get(path, "reads")
 
@@ -436,6 +447,12 @@ app.add_middleware(MaxBodySizeMiddleware, max_bytes=get_max_request_bytes())
 
 class IngestRequest(BaseModel):
     lines: list[str] = Field(min_length=1, max_length=1000)
+    # Optional, client-generated idempotency key per event. ``event_ids[i]`` is
+    # the stable identifier for ``lines[i]``; entries may be ``None`` for events
+    # the client does not wish to idempotency-key (they keep the existing
+    # stateless, non-deduplicated behavior). When provided, the list must be the
+    # same length as ``lines``.
+    event_ids: list[str | None] | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -608,8 +625,16 @@ def ingest(request: IngestRequest):
     Access is governed by the Greywatch trust boundary (see
     :func:`_trust_boundary`); this endpoint is not gated by any
     ``GREYWATCH_*_ENABLED`` feature flag.
+
+    Each ``lines[i]`` may be idempotency-keyed by ``event_ids[i]`` (a
+    client-generated stable identifier). Replaying the same identifier does not
+    insert a duplicate event or increment detection counts; see
+    :func:`backend.app.siem.ingest_lines` for the count contract.
     """
-    return ingest_lines(request.lines)
+    try:
+        return ingest_lines(request.lines, request.event_ids)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.get("/api/v1/events", tags=["events"])
@@ -624,9 +649,20 @@ def get_events(
 def get_alerts(
     status: Literal["open", "closed", "all"] = "open",
     limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    source_ip: str | None = Query(default=None),
 ):
-    alerts = list_alerts(status=status, limit=limit)
-    return {"count": len(alerts), "alerts": alerts}
+    """List alerts with server-side pagination and optional source-IP filter.
+
+    ``count`` is the number of alerts on this page; ``total`` is the number of
+    alerts matching ``status``/``source_ip`` across all pages.
+    """
+    alerts = list_alerts(status=status, limit=limit, offset=offset, source_ip=source_ip)
+    return {
+        "count": len(alerts),
+        "total": count_alerts(status=status, source_ip=source_ip),
+        "alerts": alerts,
+    }
 
 
 @app.get("/api/v1/alerts/{alert_id}", tags=["alerts"])
@@ -646,6 +682,78 @@ def resolve_alert(alert_id: int):
         )
 
     return {"id": alert_id, "status": "closed"}
+
+
+@app.get("/api/v1/incidents", tags=["incidents"])
+def get_incidents(
+    status: Literal["open", "acknowledged", "resolved", "all"] = "open",
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    source_ip: str | None = Query(default=None),
+):
+    """List correlated incidents.
+
+    Supports server-side pagination via ``limit`` and ``offset`` and optional
+    filtering by ``source_ip``. ``count`` is the number of incidents on this
+    page; ``total`` is the number of incidents matching ``status``/``source_ip``
+    across all pages.
+
+    Access is governed by the Greywatch trust boundary (see
+    :func:`_trust_boundary`).
+    """
+    incidents = list_incidents(
+        status=status, limit=limit, offset=offset, source_ip=source_ip
+    )
+    return {
+        "count": len(incidents),
+        "total": count_incidents(status=status, source_ip=source_ip),
+        "incidents": incidents,
+    }
+
+
+@app.get("/api/v1/incidents/{incident_id}", tags=["incidents"])
+def get_incident_endpoint(incident_id: int):
+    """Return a single incident with its related events in chronological order."""
+    result = get_incident(incident_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    return result
+
+
+@app.post("/api/v1/incidents/{incident_id}/acknowledge", tags=["incidents"])
+def acknowledge_incident_endpoint(incident_id: int):
+    """Acknowledge an open incident (open -> acknowledged)."""
+    result = acknowledge_incident(incident_id)
+    if not result["ok"]:
+        if result["error"] == "not_found":
+            raise HTTPException(status_code=404, detail="Incident not found")
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot acknowledge incident in status "
+                f"'{result.get('status', 'unknown')}'"
+            ),
+        )
+    incident = get_incident(incident_id)
+    return {"id": incident_id, "status": incident["status"]}
+
+
+@app.post("/api/v1/incidents/{incident_id}/resolve", tags=["incidents"])
+def resolve_incident_endpoint(incident_id: int):
+    """Resolve an open or acknowledged incident (-> resolved)."""
+    result = resolve_incident(incident_id)
+    if not result["ok"]:
+        if result["error"] == "not_found":
+            raise HTTPException(status_code=404, detail="Incident not found")
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot resolve incident in status "
+                f"'{result.get('status', 'unknown')}'"
+            ),
+        )
+    incident = get_incident(incident_id)
+    return {"id": incident_id, "status": incident["status"]}
 
 
 @app.get("/api/v1/journal/status", tags=["journal"])

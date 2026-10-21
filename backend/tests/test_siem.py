@@ -8,8 +8,10 @@ from fastapi.testclient import TestClient
 from backend.app.main import app
 from backend.app.siem import (
     _connection,
+    ingest_events,
     ingest_lines,
     initialize_database,
+    list_events,
     parse_auth_line,
 )
 
@@ -609,6 +611,394 @@ def test_brute_force_threshold_is_per_source_ip(tmp_path, monkeypatch):
     assert client.get("/api/v1/alerts?status=all&limit=100").json()["count"] == 2
 
 
+def test_alerts_listing_pagination_offset_and_total(tmp_path, monkeypatch):
+    """The alerts listing returns a true total and honors limit/offset."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "page.db"))
+    ip_a, ip_b, ip_c = "203.0.113.10", "198.51.100.7", "198.51.100.8"
+    lines = (
+        [_failed_login_line(i, ip_a) for i in range(5)]
+        + [_failed_login_line(i, ip_b, port=55000) for i in range(5)]
+        + [_failed_login_line(i, ip_c, port=56000) for i in range(5)]
+    )
+    client.post("/api/v1/events/ingest", json={"lines": lines})
+
+    first = client.get("/api/v1/alerts?status=all&limit=2&offset=0").json()
+    assert first["count"] == 2
+    assert first["total"] == 3
+    assert len(first["alerts"]) == 2
+
+    second = client.get("/api/v1/alerts?status=all&limit=2&offset=2").json()
+    assert second["count"] == 1
+    assert second["total"] == 3
+    assert {a["id"] for a in second["alerts"]}.isdisjoint({a["id"] for a in first["alerts"]})
+
+    third = client.get("/api/v1/alerts?status=all&limit=2&offset=4").json()
+    assert third["count"] == 0
+    assert third["total"] == 3
+    assert third["alerts"] == []
+
+
+def test_alerts_listing_source_ip_filter(tmp_path, monkeypatch):
+    """The alerts listing can be narrowed to a single source IP."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "filter.db"))
+    ip_a, ip_b = "203.0.113.10", "198.51.100.7"
+    lines = (
+        [_failed_login_line(i, ip_a) for i in range(5)]
+        + [_failed_login_line(i, ip_b, port=55000) for i in range(5)]
+    )
+    client.post("/api/v1/events/ingest", json={"lines": lines})
+
+    filtered = client.get(f"/api/v1/alerts?status=all&limit=100&source_ip={ip_a}").json()
+    assert filtered["count"] == 1
+    assert filtered["total"] == 1
+    assert filtered["alerts"][0]["source_ip"] == ip_a
+
+    # A source IP with no alerts returns an empty page with total 0.
+    none = client.get("/api/v1/alerts?status=all&limit=100&source_ip=10.0.0.99").json()
+    assert none["count"] == 0
+    assert none["total"] == 0
+    assert none["alerts"] == []
+
+
+def _ssh_failed_event(
+    source_ip: str,
+    timestamp: str,
+    *,
+    username: str = "user",
+    source: str = "test",
+    source_record_id: str | None = None,
+    raw_message: str | None = None,
+) -> dict:
+    """A normalized ssh_login_failed event for dedup regression tests."""
+    return {
+        "timestamp": timestamp,
+        "host": "lab-host",
+        "event_type": "ssh_login_failed",
+        "username": username,
+        "source_ip": source_ip,
+        "severity": "medium",
+        "raw_message": raw_message
+        or f"Failed password for {username} from {source_ip} port 22 ssh2",
+        "source": source,
+        "source_record_id": source_record_id,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Event deduplication / replay safety
+# --------------------------------------------------------------------------- #
+
+
+def test_dedup_replayed_identifiable_record_not_duplicated(
+    tmp_path, monkeypatch
+):
+    """Re-ingesting the same identifiable record (journal __CURSOR) creates no
+    second event and does not inflate the brute-force count."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "dedup.db"))
+    ip = "203.0.113.10"
+    ts = "2026-10-13T10:00:00+00:00"
+    event = _ssh_failed_event(
+        ip, ts, source="journal", source_record_id="cur-abc"
+    )
+
+    first = ingest_events([event])
+    second = ingest_events([event])  # exact replay of the same cursor
+
+    assert first["parsed"] == 1
+    assert second["parsed"] == 0  # replay skipped
+    assert len(list_events()) == 1  # no duplicate logical event
+
+    # One unique failure is below threshold -> no alert, count not inflated.
+    assert first["alerts"] == []
+    assert second["alerts"] == []
+    assert client.get("/api/v1/alerts?status=all&limit=100").json()["count"] == 0
+
+
+def test_dedup_distinct_source_record_ids_remain_distinct(
+    tmp_path, monkeypatch
+):
+    """Five failures with distinct native ids stay distinct and still trigger
+    the threshold (replay safety never collapses legitimate events)."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "distinct.db"))
+    ip = "203.0.113.10"
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    events = [
+        _ssh_failed_event(
+            ip,
+            now,
+            source="journal",
+            source_record_id=f"cur-{i}",
+        )
+        for i in range(5)
+    ]
+
+    result = ingest_events(events)
+
+    assert result["parsed"] == 5
+    assert len(result["alerts"]) == 1
+    assert result["alerts"][0]["rule_id"] == "SSH_BRUTE_FORCE"
+    assert result["alerts"][0]["event_count"] == 5
+    assert len(list_events()) == 5
+
+
+def test_dedup_null_source_record_id_not_deduped(
+    tmp_path, monkeypatch
+):
+    """Records without a stable native id (HTTP lines) are not deduplicated by
+    source_record_id; replaying identical HTTP lines inflates the count.
+
+    This is a documented limitation: HTTP ingestion is stateless and has no
+    stable record identifier, and content fingerprinting is intentionally not
+    used as a dedup key because identical messages can be separate genuine
+    authentication failures.
+    """
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "http.db"))
+    ip = "203.0.113.10"
+    lines = [
+        f"sshd[600{i}]: Failed password for attacker{i} from {ip} port {54000+i} ssh2"
+        for i in range(5)
+    ]
+
+    first = client.post("/api/v1/events/ingest", json={"lines": lines}).json()
+    second = client.post("/api/v1/events/ingest", json={"lines": lines}).json()
+
+    assert first["parsed"] == 5
+    assert second["parsed"] == 5  # replayed, not deduped (no native id)
+    assert len(list_events()) == 10
+    assert second["alerts"] == []  # aggregated into existing open alert
+    # The alert count reflects all 10 stored rows (inflation is the limitation).
+    detail = client.get(f"/api/v1/alerts/{first['alerts'][0]['id']}").json()
+    assert detail["alert"]["event_count"] == 10
+
+
+def test_concurrent_ingest_same_cursor_deduped(tmp_path, monkeypatch):
+    """Concurrent ingestion of the same identifiable record: exactly one insert
+    wins the DB-enforced unique index; the rest are skipped as duplicates."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "concurrence.db"))
+    initialize_database()
+    ip = "203.0.113.10"
+    event = _ssh_failed_event(
+        ip, "2026-10-13T10:00:00+00:00", source="journal", source_record_id="cur-conc"
+    )
+
+    errors: list[BaseException] = []
+    results: list[dict] = []
+    lock = threading.Lock()
+
+    def worker(_tag: int) -> None:
+        try:
+            results.append(ingest_events([event]))
+        except BaseException as exc:  # noqa: BLE001 - collect all failures
+            with lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert all(not t.is_alive() for t in threads), "a thread hung"
+    assert not errors, f"concurrent ingest raised: {errors}"
+    total_parsed = sum(r["parsed"] for r in results)
+    assert total_parsed == 1, f"expected exactly 1 insert, got {total_parsed}"
+    assert len(list_events()) == 1
+
+
+# --------------------------------------------------------------------------- #
+# HTTP ingestion idempotency
+# --------------------------------------------------------------------------- #
+
+
+def _http_failed_lines(source_ip: str, count: int, port_base: int = 54000):
+    return [
+        f"sshd[700{i}]: Failed password for attacker{i} from {source_ip} "
+        f"port {port_base + i} ssh2"
+        for i in range(count)
+    ]
+
+
+def test_http_event_with_stable_id_inserted_once(tmp_path, monkeypatch):
+    """Replaying the same event id inserts the event once and counts it once."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "idempotent.db"))
+    ip = "203.0.113.10"
+    lines = _http_failed_lines(ip, 5)
+    ids = [f"evt-{i}" for i in range(5)]
+
+    first = client.post(
+        "/api/v1/events/ingest", json={"lines": lines, "event_ids": ids}
+    ).json()
+    second = client.post(
+        "/api/v1/events/ingest", json={"lines": lines, "event_ids": ids}
+    ).json()
+
+    assert first["parsed"] == 5
+    assert first["duplicates"] == 0
+    assert first["ignored"] == 0
+    assert len(first["events"]) == 5
+    assert len(first["alerts"]) == 1  # threshold reached
+
+    assert second["parsed"] == 5
+    assert second["duplicates"] == 5  # all skipped as replays
+    assert len(second["events"]) == 0
+    assert second["alerts"] == []  # no new alert, count not inflated
+
+    # Exactly 5 unique events stored; brute-force count stayed at 5.
+    assert len(list_events()) == 5
+    alert = client.get("/api/v1/alerts?status=all&limit=100").json()["alerts"][0]
+    assert alert["event_count"] == 5
+
+
+def test_http_distinct_ids_with_identical_messages_remain_distinct(
+    tmp_path, monkeypatch
+):
+    """Distinct ids preserve legitimate repeated events even when content and
+    timestamps are identical."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "distinctids.db"))
+    ip = "203.0.113.10"
+    line = f"sshd[700]: Failed password for root from {ip} port 54000 ssh2"
+    lines = [line] * 5
+    ids = [f"evt-distinct-{i}" for i in range(5)]
+
+    result = client.post(
+        "/api/v1/events/ingest", json={"lines": lines, "event_ids": ids}
+    ).json()
+
+    assert result["parsed"] == 5
+    assert result["duplicates"] == 0
+    assert len(result["events"]) == 5
+    assert len(result["alerts"]) == 1
+    assert result["alerts"][0]["event_count"] == 5
+    assert len(list_events()) == 5
+
+
+def test_http_mixed_batch_reports_accurate_counts(tmp_path, monkeypatch):
+    """A batch with new events, a duplicate, and an invalid line reports
+    accepted vs duplicate vs ignored counts accurately."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "mixed.db"))
+    ip = "203.0.113.10"
+    lines = [
+        f"sshd[701]: Failed password for a from {ip} port 54101 ssh2",  # new
+        f"sshd[702]: Failed password for b from {ip} port 54102 ssh2",  # new
+        f"sshd[701]: Failed password for a from {ip} port 54101 ssh2",  # dup id
+        "this is not a valid ssh log line",  # invalid -> ignored
+    ]
+    ids = ["evt-mix-1", "evt-mix-2", "evt-mix-1", None]
+
+    result = client.post(
+        "/api/v1/events/ingest", json={"lines": lines, "event_ids": ids}
+    ).json()
+
+    assert result["received"] == 4
+    assert result["parsed"] == 3  # 3 valid lines
+    assert result["duplicates"] == 1  # evt-mix-1 replayed
+    assert result["ignored"] == 1  # invalid line
+    assert len(result["events"]) == 2  # only the 2 new events inserted
+
+
+def test_http_event_ids_scoped_by_source(tmp_path, monkeypatch):
+    """The same id string from journal and http sources do not collide; each
+    source keeps its own identifier namespace."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "scoping.db"))
+    ip = "203.0.113.10"
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    # Journal event with id "shared-id".
+    journal_event = {
+        "timestamp": now,
+        "host": "lab-host",
+        "event_type": "ssh_login_failed",
+        "username": "u",
+        "source_ip": ip,
+        "severity": "medium",
+        "raw_message": f"journal: Failed password for u from {ip} port 1 ssh2",
+        "source": "journal",
+        "source_record_id": "shared-id",
+    }
+    ingest_events([journal_event])
+
+    # HTTP event with the same id "shared-id" must still be inserted (different
+    # source namespace).
+    lines = [f"sshd[703]: Failed password for u from {ip} port 54103 ssh2"]
+    result = client.post(
+        "/api/v1/events/ingest", json={"lines": lines, "event_ids": ["shared-id"]}
+    ).json()
+
+    assert result["parsed"] == 1
+    assert result["duplicates"] == 0
+    assert len(result["events"]) == 1
+    assert len(list_events()) == 2
+
+
+def test_http_length_mismatch_returns_400(tmp_path, monkeypatch):
+    """event_ids that do not match lines length is rejected with HTTP 400."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "mismatch.db"))
+    lines = ["sshd[704]: Failed password for x from 203.0.113.10 port 54104 ssh2"]
+
+    resp = client.post(
+        "/api/v1/events/ingest", json={"lines": lines, "event_ids": ["a", "b"]}
+    )
+    assert resp.status_code == 400
+
+
+def test_http_concurrent_same_id_cannot_insert_twice(tmp_path, monkeypatch):
+    """Concurrent retries of the same id: exactly one insert wins the unique
+    index; the rest are skipped as duplicates."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "httpconc.db"))
+    initialize_database()
+    ip = "203.0.113.10"
+    lines = [f"sshd[705]: Failed password for x from {ip} port 54105 ssh2"]
+    ids = ["evt-http-conc"]
+
+    errors: list[BaseException] = []
+    results: list[dict] = []
+    lock = threading.Lock()
+
+    def worker(_tag: int) -> None:
+        try:
+            results.append(
+                client.post(
+                    "/api/v1/events/ingest",
+                    json={"lines": lines, "event_ids": ids},
+                ).json()
+            )
+        except BaseException as exc:  # noqa: BLE001
+            with lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert all(not t.is_alive() for t in threads), "a thread hung"
+    assert not errors, f"concurrent ingest raised: {errors}"
+    total_inserted = sum(len(r["events"]) for r in results)
+    total_duplicates = sum(r["duplicates"] for r in results)
+    assert total_inserted == 1, f"expected exactly 1 insert, got {total_inserted}"
+    assert total_duplicates == 7, f"expected 7 duplicates, got {total_duplicates}"
+    assert len(list_events()) == 1
+
+
+def test_http_no_ids_retains_compatibility_behavior(tmp_path, monkeypatch):
+    """Requests without event_ids keep source=None and are not deduplicated:
+    replaying identical HTTP lines inflates the count (documented limitation)."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "nocompat.db"))
+    ip = "203.0.113.10"
+    lines = _http_failed_lines(ip, 5)
+
+    first = client.post("/api/v1/events/ingest", json={"lines": lines}).json()
+    second = client.post("/api/v1/events/ingest", json={"lines": lines}).json()
+
+    assert first["parsed"] == 5
+    assert first["duplicates"] == 0
+    assert all(e.get("source") is None for e in first["events"])
+    assert second["parsed"] == 5
+    assert second["duplicates"] == 0  # no ids -> no dedup
+    assert len(list_events()) == 10  # both batches stored (inflation documented)
+
+
 # --------------------------------------------------------------------------- #
 # SQLite concurrency and rollback-journal reliability (F3)
 # --------------------------------------------------------------------------- #
@@ -674,6 +1064,73 @@ def test_concurrent_ingest_lines_succeeds(tmp_path, monkeypatch):
         count = conn.execute("SELECT COUNT(*) AS n FROM events").fetchone()["n"]
 
     assert count == total_events == 24, (count, total_events)
+
+
+def test_six_failures_sets_event_count_to_six(tmp_path, monkeypatch):
+    """Above-threshold scenario: 6 failures (>= 5) raise an alert with count 6."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "above.db"))
+    attack_ip = "203.0.113.10"
+    lines = [_failed_login_line(i, attack_ip) for i in range(6)]
+
+    res = client.post("/api/v1/events/ingest", json={"lines": lines})
+    body = res.json()
+
+    assert body["parsed"] == 6
+    assert len(body["alerts"]) == 1
+    assert body["alerts"][0]["event_count"] == 6
+    assert client.get("/api/v1/alerts?status=all&limit=100").json()["count"] == 1
+
+
+def test_duplicate_ingestion_updates_count_without_new_alert(
+    tmp_path, monkeypatch
+):
+    """Re-ingesting the same failures updates the alert count; no duplicate alert.
+
+    The rule aggregates into the existing open alert (one alert per IP), but the
+    stored event rows are not de-duplicated, so the count reflects every row
+    present in the window. This documents current behavior: duplicate ingestion
+    inflates event_count rather than creating a second alert.
+    """
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "dup.db"))
+    attack_ip = "203.0.113.10"
+    lines = [_failed_login_line(i, attack_ip) for i in range(5)]
+
+    first = client.post("/api/v1/events/ingest", json={"lines": lines}).json()
+    assert len(first["alerts"]) == 1
+    assert first["alerts"][0]["event_count"] == 5
+    alert_id = first["alerts"][0]["id"]
+
+    second = client.post("/api/v1/events/ingest", json={"lines": lines}).json()
+    assert second["alerts"] == []  # no new alert created
+    assert client.get("/api/v1/alerts?status=all&limit=100").json()["count"] == 1
+
+    detail = client.get(f"/api/v1/alerts/{alert_id}").json()
+    assert detail["alert"]["id"] == alert_id
+    assert detail["alert"]["event_count"] == 10  # 5 + 5 re-ingested rows
+
+
+def test_ingested_events_outside_detection_window_not_counted(
+    tmp_path, monkeypatch
+):
+    """Failed logins with timestamps outside the 5-minute window are not counted."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "oow.db"))
+    attack_ip = "203.0.113.10"
+    # Five failures stamped ten minutes ago -> outside [now-5min, now].
+    old = (
+        datetime.now(timezone.utc) - timedelta(minutes=10)
+    ).isoformat(timespec="seconds")
+    lines = [
+        f"{old} lab-host sshd[710{i}]: Failed password for user{i} "
+        f"from {attack_ip} port {57000 + i} ssh2"
+        for i in range(5)
+    ]
+
+    res = client.post("/api/v1/events/ingest", json={"lines": lines})
+    body = res.json()
+
+    assert body["parsed"] == 5
+    assert body["alerts"] == []  # not counted -> no alert
+    assert client.get("/api/v1/alerts?status=all&limit=100").json()["count"] == 0
 
 
 def test_rollback_on_failed_transaction_leaves_no_partial_data(

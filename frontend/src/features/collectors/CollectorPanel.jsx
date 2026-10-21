@@ -24,6 +24,8 @@ export function CollectorPanel({
   const state = collectorState(status)
   const isEnabled = status?.enabled === true
   const ingested = Number.isFinite(Number(status?.events_ingested)) ? Number(status.events_ingested) : null
+  const seen = Number.isFinite(Number(status?.records_seen)) ? Number(status.records_seen) : null
+  const deduplicated = Number.isFinite(Number(status?.deduplicated)) ? Number(status.deduplicated) : null
 
   return (
     <Panel>
@@ -41,6 +43,8 @@ export function CollectorPanel({
       <div className="flex flex-col gap-4 p-4">
         <dl className="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <Field label="Events ingested" value={ingested == null ? null : ingested.toLocaleString()} mono />
+          {seen != null && <Field label="Records seen" value={seen.toLocaleString()} mono />}
+          {deduplicated != null && deduplicated > 0 && <Field label="Deduplicated" value={deduplicated.toLocaleString()} mono />}
           <Field label="Last run" value={status?.last_run_at ? formatDateTime(status.last_run_at) : null} mono />
           <Field label="Last event" value={status?.last_event_ts ? formatDateTime(status.last_event_ts) : null} mono />
           {evePath && <Field label="EVE path" value={status?.eve_path} mono />}

@@ -173,12 +173,143 @@ def _state_key_last_run_at() -> str:
     return _SURICATA_PREFIX + "last_run_at"
 
 
+def _state_key_generation() -> str:
+    return _SURICATA_PREFIX + "file_generation"
+
+
+def _state_key_inode() -> str:
+    return _SURICATA_PREFIX + "file_inode"
+
+
+def _state_key_device() -> str:
+    return _SURICATA_PREFIX + "file_device"
+
+
+def _state_key_attempts() -> str:
+    return _SURICATA_PREFIX + "attempts"
+
+
+def _state_key_successful_runs() -> str:
+    return _SURICATA_PREFIX + "successful_runs"
+
+
+def _state_key_failed_runs() -> str:
+    return _SURICATA_PREFIX + "failed_runs"
+
+
+def _state_key_last_attempt_at() -> str:
+    return _SURICATA_PREFIX + "last_attempt_at"
+
+
+def _state_key_last_successful_run_at() -> str:
+    return _SURICATA_PREFIX + "last_successful_run_at"
+
+
+def _state_key_records_seen() -> str:
+    return _SURICATA_PREFIX + "records_seen"
+
+
+def _state_key_deduplicated() -> str:
+    return _SURICATA_PREFIX + "deduplicated"
+
+
+def _state_key_last_error() -> str:
+    return _SURICATA_PREFIX + "last_error"
+
+
+def _state_key_last_error_at() -> str:
+    return _SURICATA_PREFIX + "last_error_at"
+
+
 def _get_offset() -> str | None:
     return siem.get_collector_setting(_state_key_offset())
 
 
 def _get_last_event_ts() -> str | None:
     return siem.get_collector_setting(_state_key_event_ts())
+
+
+def _get_generation() -> int:
+    """Return the current file-generation counter.
+
+    The generation is incremented whenever the EVE file is truncated or
+    rotated (stored offset exceeds the file size), so byte offsets from a
+    previous file incarnation never collide with new content at the same
+    byte position after truncation. Suricata EVE has no globally stable
+    record id, so ``(generation, inode, device, byte_offset)`` is the
+    closest stable identity we can enforce within a file incarnation.
+    """
+    value = siem.get_collector_setting(_state_key_generation())
+    if value is None:
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _get_inode() -> str | None:
+    return siem.get_collector_setting(_state_key_inode())
+
+
+def _get_device() -> str | None:
+    return siem.get_collector_setting(_state_key_device())
+
+
+def _get_attempts() -> int:
+    value = siem.get_collector_setting(_state_key_attempts())
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _get_successful_runs() -> int:
+    value = siem.get_collector_setting(_state_key_successful_runs())
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _get_failed_runs() -> int:
+    value = siem.get_collector_setting(_state_key_failed_runs())
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _get_last_attempt_at() -> str | None:
+    return siem.get_collector_setting(_state_key_last_attempt_at())
+
+
+def _get_last_successful_run_at() -> str | None:
+    return siem.get_collector_setting(_state_key_last_successful_run_at())
+
+
+def _get_records_seen() -> int | None:
+    value = siem.get_collector_setting(_state_key_records_seen())
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _get_deduplicated() -> int | None:
+    value = siem.get_collector_setting(_state_key_deduplicated())
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _get_last_error() -> str | None:
+    return siem.get_collector_setting(_state_key_last_error())
+
+
+def _get_last_error_at() -> str | None:
+    return siem.get_collector_setting(_state_key_last_error_at())
 
 
 def _count_suricata_events(connection: sqlite3.Connection) -> int:
@@ -199,6 +330,18 @@ def _set_state(connection: sqlite3.Connection, **values: object) -> None:
         _state_key_event_ts(): values.get("event_ts"),
         _state_key_events_ingested(): values.get("events_ingested"),
         _state_key_last_run_at(): values.get("run_at"),
+        _state_key_generation(): values.get("generation"),
+        _state_key_inode(): values.get("inode"),
+        _state_key_device(): values.get("device"),
+        _state_key_attempts(): values.get("attempts"),
+        _state_key_successful_runs(): values.get("successful_runs"),
+        _state_key_failed_runs(): values.get("failed_runs"),
+        _state_key_last_attempt_at(): values.get("last_attempt_at"),
+        _state_key_last_successful_run_at(): values.get("last_successful_run_at"),
+        _state_key_records_seen(): values.get("records_seen"),
+        _state_key_deduplicated(): values.get("deduplicated"),
+        _state_key_last_error(): values.get("last_error"),
+        _state_key_last_error_at(): values.get("last_error_at"),
     }
     for key, value in mapping.items():
         if value is None:
@@ -210,6 +353,38 @@ def _set_state(connection: sqlite3.Connection, **values: object) -> None:
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
             """,
             (key, str(value)),
+        )
+
+
+def _persist_health_state(
+    *,
+    attempts: int,
+    successful_runs: int,
+    failed_runs: int,
+    last_attempt_at: str,
+    records_seen: int,
+    deduplicated: int,
+    last_error: str | None = None,
+    last_error_at: str | None = None,
+) -> None:
+    """Persist health/observability counters on their own connection.
+
+    Used by the early-return failure path of :func:`collect_once` which exits
+    before the main checkpoint transaction opens. Wraps the upsert in a
+    transaction so the counters are committed atomically.
+    """
+    siem.initialize_database()
+    with siem._connection() as connection:
+        _set_state(
+            connection,
+            attempts=str(attempts),
+            successful_runs=str(successful_runs),
+            failed_runs=str(failed_runs),
+            last_attempt_at=last_attempt_at,
+            records_seen=str(records_seen),
+            deduplicated=str(deduplicated),
+            last_error=last_error,
+            last_error_at=last_error_at,
         )
 
 
@@ -345,15 +520,19 @@ def parse_eve_record(record: object, *, raw_line: str) -> dict | None:
 
 def _read_eve_records(
     path: str, offset: int, max_records: int
-) -> tuple[list[tuple[str, dict]], int, bool]:
+) -> tuple[list[tuple[str, dict, int]], int, bool]:
     """Read EVE JSON lines from ``path`` starting at byte ``offset``.
 
     Returns ``(records, new_offset, rotated)`` where ``records`` is a list of
-    ``(raw_line, parsed_dict)`` tuples. Malformed JSON lines are skipped (not
-    returned) so one corrupt line cannot abort the batch. Only complete,
-    newline-terminated lines are processed; a trailing line without a newline
-    is held back (and re-read next cycle) so a record Suricata is mid-writing
-    is never parsed half-complete.
+    ``(raw_line, parsed_dict, byte_offset)`` tuples. ``byte_offset`` is the
+    starting byte position of the line within the file and, combined with the
+    file's inode and device (``source_record_id``), forms a stable record
+    identity across collector restarts within a single file incarnation.
+
+    Malformed JSON lines are skipped (not returned) so one corrupt line cannot
+    abort the batch. Only complete, newline-terminated lines are processed; a
+    trailing line without a newline is held back (and re-read next cycle) so a
+    record Suricata is mid-writing is never parsed half-complete.
 
     ``rotated`` is True when the file shrank below ``offset`` (log rotation /
     truncation) and the offset was reset to 0.
@@ -370,12 +549,13 @@ def _read_eve_records(
         offset = 0
         rotated = True
 
-    records: list[tuple[str, dict]] = []
+    records: list[tuple[str, dict, int]] = []
     last_complete = offset  # byte position after the last complete line
 
     with file_path.open("rb") as fh:
         fh.seek(offset)
         for raw_bytes in fh:
+            line_start = fh.tell() - len(raw_bytes)
             if raw_bytes.endswith(b"\n"):
                 last_complete = fh.tell()
             else:
@@ -392,7 +572,7 @@ def _read_eve_records(
                 # Skip malformed lines; the next record is unaffected.
                 continue
             if isinstance(record, dict):
-                records.append((line, record))
+                records.append((line, record, line_start))
                 if len(records) >= max_records:
                     break
 
@@ -436,46 +616,131 @@ def collect_once(config: SuricataConfig | None = None) -> CollectResult:
     them, de-duplicate against already-stored recent events, ingest the
     remainder through :func:`siem._store_events_and_detect`, and persist the
     advanced offset atomically with the inserts.
+
+    Health/observability counters (``attempts``, ``successful_runs``,
+    ``failed_runs``, ``last_attempt_at``, ``last_successful_run_at``,
+    ``records_seen``, ``deduplicated``, ``last_error``, ``last_error_at``) are
+    persisted in the same transaction as the checkpoint so a crash never
+    advances one without the other. A cycle that completes without errors is a
+    successful run even when it ingests zero events (idle); only a cycle that
+    records an error counts as a failed run. ``last_successful_run_at`` is
+    therefore the honest signal for distinguishing a live-but-idle collector
+    from a failed or stale one. ``last_error`` is the most recent safe error
+    summary; it never exposes the EVE filesystem path or credentials.
     """
     config = config or get_config()
     result = CollectResult()
     siem.initialize_database()
+
+    # File stats for identity (inode:device) and rotation/truncation
+    # detection (stored offset vs current size).
+    try:
+        _st = os.stat(config.eve_path)
+        _inode = str(_st.st_ino)
+        _device = str(_st.st_dev)
+        _size = _st.st_size
+    except OSError:
+        _inode = ""
+        _device = ""
+        _size = None
 
     try:
         offset = int(_get_offset() or 0)
     except (TypeError, ValueError):
         offset = 0
     last_event_ts = _get_last_event_ts()
+    generation = _get_generation()
+    stored_inode = _get_inode()
+    stored_device = _get_device()
+
+    rotated = False
+    if _size is not None and offset > _size:
+        # Truncation (same inode): the stored offset is past the end of the
+        # file. Bump the generation so byte offsets from the previous file
+        # incarnation never collide with new content at the same byte
+        # position after truncation, then restart from the beginning.
+        generation += 1
+        offset = 0
+        rotated = True
+    elif stored_inode and stored_device and (
+        stored_inode != _inode or stored_device != _device
+    ):
+        # Replacement file (rename-based rotation or inode reuse): the path
+        # now refers to a different file incarnation than the one whose
+        # offset we stored. Relying only on ``offset > size`` would miss this
+        # case when the replacement file has already grown past the old
+        # offset, causing the collector to seek into the middle of the new
+        # file and skip records. Detect the inode/device change and treat it
+        # as rotation instead.
+        generation += 1
+        offset = 0
+        rotated = True
+
+    now = _now_iso()
+    attempts = _get_attempts() + 1
+    successful_runs = _get_successful_runs() + 1
+    failed_runs = _get_failed_runs()
+    last_attempt_at = now
+
+    line_deduped = 0
+    inserted_events: list[dict] = []
 
     try:
-        raw_records, new_offset, rotated = _read_eve_records(
+        raw_records, new_offset, read_rotated = _read_eve_records(
             config.eve_path, offset, config.max_records
         )
     except (OSError, SuricataError) as exc:
         # Missing/unreadable EVE file is reported, not raised: the collector
         # keeps running and will pick the file up on the next cycle.
         result.errors.append(str(exc))
+        # Persist the failed attempt so the status endpoint reflects a failed
+        # run rather than a stale or healthy one.
+        _persist_health_state(
+            attempts=attempts,
+            successful_runs=successful_runs - 1,
+            failed_runs=failed_runs + 1,
+            last_attempt_at=last_attempt_at,
+            records_seen=result.records_seen,
+            deduplicated=0,
+            last_error=result.errors[0],
+            last_error_at=now,
+        )
         return result
 
+    rotated = rotated or read_rotated
     result.records_seen = len(raw_records)
     result.fallback_used = rotated
 
+    # Stable record identity: (generation, inode, device, byte_offset)
+    # uniquely identifies a record within a single file incarnation and
+    # survives truncation (generation bumps). Combined with source="suricata"
+    # this is enforced by the DB partial unique index on
+    # (source, source_record_id) so replays within the same file are never
+    # stored twice. On move-rotation (new inode) the identity changes; that
+    # is a documented limitation (Suricata EVE has no globally stable record
+    # id).
     # Normalize + within-batch de-duplication by raw line.
     events: list[dict] = []
     seen_lines: set[str] = set()
-    for raw_line, record in raw_records:
+    for raw_line, record, byte_offset in raw_records:
         if raw_line in seen_lines:
+            line_deduped += 1
             continue
         seen_lines.add(raw_line)
         event = parse_eve_record(record, raw_line=raw_line)
         if event is None:
             continue
+        if _inode and _device:
+            event["source_record_id"] = (
+                f"{generation}:{_inode}:{_device}:{byte_offset}"
+            )
         events.append(event)
         if len(events) >= config.max_records:
             break
 
     # Nothing recognizable happened; still record progress + last_run_at.
     if not events:
+        deduplicated = line_deduped
         with siem._connection() as connection:
             _set_state(
                 connection,
@@ -483,6 +748,16 @@ def collect_once(config: SuricataConfig | None = None) -> CollectResult:
                 event_ts=last_event_ts,
                 events_ingested=str(_count_suricata_events(connection)),
                 run_at=_now_iso(),
+                generation=str(generation),
+                inode=str(_inode),
+                device=str(_device),
+                attempts=str(attempts),
+                successful_runs=str(successful_runs),
+                failed_runs=str(failed_runs),
+                last_attempt_at=last_attempt_at,
+                last_successful_run_at=_now_iso(),
+                records_seen=str(result.records_seen),
+                deduplicated=str(line_deduped),
             )
         result.cursor_advanced = new_offset != offset
         return result
@@ -490,30 +765,49 @@ def collect_once(config: SuricataConfig | None = None) -> CollectResult:
     # Ingest + detect, then advance the offset in the same transaction so a
     # crash cannot leave events inserted but the offset un-advanced.
     with siem._connection() as connection:
-        # De-duplicate against recently-stored events (rotation/reset overlap).
-        dedup_since = min(
-            (e["timestamp"] for e in events),
-            default=_now_iso(),
+        # De-duplicate against recently-stored events, but only when the offset
+        # was reset due to rotation/truncation (rotated). On a normal append
+        # the byte-offset checkpoint already guarantees we only read new bytes,
+        # so content-based overlap would wrongly collapse legitimate repeated
+        # events that happen to share text and timestamp.
+        if rotated:
+            dedup_since = min(
+                (e["timestamp"] for e in events),
+                default=_now_iso(),
+            )
+            existing_keys = _read_existing_keys(connection, dedup_since)
+            new_events = [
+                e
+                for e in events
+                if (e["timestamp"], e["host"], e["raw_message"]) not in existing_keys
+            ]
+        else:
+            new_events = events
+
+        inserted_events, new_alerts, _new_incidents = siem._store_events_and_detect(
+            new_events, connection
         )
-        existing_keys = _read_existing_keys(connection, dedup_since)
-        new_events = [
-            e
-            for e in events
-            if (e["timestamp"], e["host"], e["raw_message"]) not in existing_keys
-        ]
 
-        inserted, new_alerts = siem._store_events_and_detect(new_events, connection)
-
-        advanced_ts = inserted[-1]["timestamp"] if inserted else last_event_ts
+        advanced_ts = inserted_events[-1]["timestamp"] if inserted_events else last_event_ts
         _set_state(
             connection,
             offset=str(new_offset),
             event_ts=advanced_ts,
             events_ingested=str(_count_suricata_events(connection)),
             run_at=_now_iso(),
+            generation=str(generation),
+            inode=str(_inode),
+            device=str(_device),
+            attempts=str(attempts),
+            successful_runs=str(successful_runs),
+            failed_runs=str(failed_runs),
+            last_attempt_at=last_attempt_at,
+            last_successful_run_at=_now_iso(),
+            records_seen=str(result.records_seen),
+            deduplicated=str(line_deduped + len(events) - len(inserted_events)),
         )
 
-    result.events_ingested = len(inserted)
+    result.events_ingested = len(inserted_events)
     result.new_alerts = new_alerts
     result.cursor_advanced = new_offset != offset
     return result
@@ -525,7 +819,14 @@ def collect_once(config: SuricataConfig | None = None) -> CollectResult:
 
 
 def status() -> dict:
-    """Return Suricata collector checkpoint state and the enabled flag."""
+    """Return Suricata collector checkpoint state and the enabled flag.
+
+    In addition to the checkpoint fields, the response carries health and
+    observability counters so the frontend can distinguish an idle collector
+    (successful run, zero ingested) from a failed or stale one. ``last_error``
+    is the most recent safe error summary; it never exposes the EVE filesystem
+    path, credentials, or tokens.
+    """
     siem.initialize_database()
     ingested_value = siem.get_collector_setting(_state_key_events_ingested(), "0")
     try:
@@ -539,6 +840,17 @@ def status() -> dict:
         "last_event_ts": _get_last_event_ts(),
         "events_ingested": events_ingested,
         "last_run_at": siem.get_collector_setting(_state_key_last_run_at()),
+        "attempts": _get_attempts(),
+        "successful_runs": _get_successful_runs(),
+        "failed_runs": _get_failed_runs(),
+        "last_attempt_at": siem.get_collector_setting(_state_key_last_attempt_at()),
+        "last_successful_run_at": siem.get_collector_setting(
+            _state_key_last_successful_run_at()
+        ),
+        "records_seen": _get_records_seen(),
+        "deduplicated": _get_deduplicated(),
+        "last_error": _get_last_error(),
+        "last_error_at": siem.get_collector_setting(_state_key_last_error_at()),
     }
 
 

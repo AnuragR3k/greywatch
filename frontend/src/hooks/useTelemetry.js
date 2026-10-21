@@ -9,6 +9,10 @@ import {
   fetchAlerts,
   fetchAlertDetail,
   closeAlert,
+  fetchIncidents,
+  fetchIncidentDetail,
+  acknowledgeIncident,
+  resolveIncident,
   fetchJournalStatus,
   fetchSuricataStatus,
   collectJournal,
@@ -26,17 +30,58 @@ export function useEvents({ limit = 100 } = {}) {
   )
 }
 
-export function useAlerts({ status = 'all', limit = 100 } = {}) {
-  return useResource(
-    (o = {}) => fetchAlerts({ status, limit, signal: o.signal }),
-    `alerts:${status}:${limit}`,
+export function useAlerts({
+  status = 'all',
+  limit = 100,
+  offset = 0,
+  source_ip,
+} = {}) {
+  const resource = useResource(
+    (o = {}) =>
+      fetchAlerts({ status, limit, offset, source_ip, signal: o.signal }),
+    `alerts:${status}:${limit}:${offset}:${source_ip ?? ''}`,
   )
+  return {
+    ...resource,
+    // `data` stays an alerts array so existing consumers (Dashboard) are
+    // unaffected; `count`/`total` expose server-side pagination.
+    data: resource.data?.alerts ?? null,
+    count: resource.data?.count ?? 0,
+    total: resource.data?.total ?? 0,
+  }
 }
 
 export function useAlertDetail(id) {
   return useResource(
     (o = {}) => (id != null ? fetchAlertDetail(id, { signal: o.signal }) : null),
     `alert-detail:${id}`,
+    { immediate: id != null },
+  )
+}
+
+export function useIncidents({
+  status = 'all',
+  limit = 100,
+  offset = 0,
+  source_ip,
+} = {}) {
+  const resource = useResource(
+    (o = {}) =>
+      fetchIncidents({ status, limit, offset, source_ip, signal: o.signal }),
+    `incidents:${status}:${limit}:${offset}:${source_ip ?? ''}`,
+  )
+  return {
+    ...resource,
+    data: resource.data?.incidents ?? null,
+    count: resource.data?.count ?? 0,
+    total: resource.data?.total ?? 0,
+  }
+}
+
+export function useIncidentDetail(id) {
+  return useResource(
+    (o = {}) => (id != null ? fetchIncidentDetail(id, { signal: o.signal }) : null),
+    `incident-detail:${id}`,
     { immediate: id != null },
   )
 }
@@ -81,6 +126,14 @@ function useMutation(fn) {
 
 export function useCloseAlert() {
   return useMutation((id) => closeAlert(id))
+}
+
+export function useAcknowledgeIncident() {
+  return useMutation((id) => acknowledgeIncident(id))
+}
+
+export function useResolveIncident() {
+  return useMutation((id) => resolveIncident(id))
 }
 
 export function useCollectJournal() {

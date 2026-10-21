@@ -69,7 +69,7 @@ def _stub_backends(monkeypatch):
     monkeypatch.setattr(
         main,
         "ingest_lines",
-        lambda lines: {
+        lambda lines, event_ids=None: {
             "received": len(lines),
             "parsed": 0,
             "ignored": len(lines),
@@ -83,7 +83,7 @@ def _stub_backends(monkeypatch):
     # read backends
     monkeypatch.setattr(main, "list_events", lambda limit=100: [{"x": 1}])
     monkeypatch.setattr(
-        main, "list_alerts", lambda status="open", limit=100: [{"x": 1}]
+        main, "list_alerts", lambda status="open", limit=100, offset=0, source_ip=None: [{"x": 1}]
     )
     monkeypatch.setattr(
         main, "get_alert_detail", lambda alert_id: {"alert": {"id": alert_id}}
