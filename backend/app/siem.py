@@ -1005,7 +1005,9 @@ def _correlate_ssh_brute_force_then_success(
     updates the existing incident in place (idempotent) rather than creating
     duplicates. All writes use the caller's connection and transaction.
 
-    Returns newly-created incident dicts.
+    Returns only newly-created incident dicts; an update to an existing open
+    incident is silent (matching the ``SSH_BRUTE_FORCE``/``SURICATA_ALERT``
+    alert-aggregation contract).
     """
     new_incidents: list[dict] = []
     window = timedelta(minutes=get_correlation_window_minutes())
@@ -1108,7 +1110,7 @@ def _correlate_ssh_brute_force_then_success(
         if success_id is not None:
             related_event_ids.append(success_id["id"])
 
-        incident = _upsert_incident(
+        incident, created = _upsert_incident(
             rule_id=SSH_BRUTE_FORCE_THEN_SUCCESS_RULE,
             title="SSH brute force followed by successful login",
             severity="critical",
@@ -1120,7 +1122,8 @@ def _correlate_ssh_brute_force_then_success(
             related_event_ids=related_event_ids,
             connection=connection,
         )
-        new_incidents.append(incident)
+        if created:
+            new_incidents.append(incident)
 
     return new_incidents
 
@@ -1142,13 +1145,15 @@ def _upsert_incident(
     last_seen_at: str,
     related_event_ids: list[int],
     connection: sqlite3.Connection,
-) -> dict:
+) -> tuple[dict, bool]:
     """Create or update the open incident for ``(rule_id, source_ip)``.
 
     Re-evaluation updates the existing open incident in place (event count,
     last seen, description) so repeated collection never creates duplicate
-    incidents. Related events are attached idempotently. Returns the incident
-    dict.
+    incidents. Related events are attached idempotently. Returns
+    ``(incident, created)`` where ``created`` is ``True`` only when a new
+    incident row was inserted, so callers can honor the documented contract
+    that an update is not reported as a newly-created incident.
     """
     now_text = _now_iso()
 
@@ -1160,6 +1165,8 @@ def _upsert_incident(
         """,
         (rule_id, source_ip),
     ).fetchone()
+
+    created = existing is None
 
     if existing:
         incident_id = existing["id"]
@@ -1202,7 +1209,7 @@ def _upsert_incident(
     ).fetchone()
     incident = dict(row)
     incident["related_event_ids"] = sorted(set(related_event_ids))
-    return incident
+    return incident, created
 
 
 def list_incidents(
@@ -1397,6 +1404,14 @@ def ingest_lines(
     (pre-deduplication); ``duplicates`` is the number of those skipped because
     a prior request already inserted the same identifier; ``ignored`` is the
     number of lines that did not parse.
+
+    Idempotency keys are matched on ``(source, source_record_id)`` only; the
+    event content is not compared. Reusing an identifier for *different*
+    content is therefore treated as a replay of the first content: the later
+    event is skipped and counted in ``duplicates`` (no error). Callers must use
+    a stable identifier per distinct event. Detecting key/content conflicts
+    would require comparing stored content and is intentionally out of scope to
+    keep ingestion backward-compatible.
     """
     initialize_database()
 

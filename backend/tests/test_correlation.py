@@ -215,9 +215,97 @@ def test_duplicate_evaluation_no_duplicate_incident(tmp_path, _window_env, monke
     second = ingest_events(events)
 
     assert len(first["incidents"]) == 1
-    assert len(second["incidents"]) == 1
-    assert first["incidents"][0]["id"] == second["incidents"][0]["id"]
-    assert len(list_incidents(status="all")) == 1
+    # Documented contract: re-evaluation updates the existing open incident in
+    # place and the update is NOT reported as a newly-created incident (same
+    # rule as alert aggregation). The incident still exists exactly once.
+    assert second["incidents"] == []
+    incidents = list_incidents(status="all")
+    assert len(incidents) == 1
+    assert incidents[0]["id"] == first["incidents"][0]["id"]
+
+
+def test_success_alone_without_preceding_failures_no_incident(
+    tmp_path, _window_env, monkeypatch
+):
+    """A successful login with no preceding brute-force failures yields nothing.
+
+    Negative case: the missing failed-login signal is not fabricated, so a bare
+    success is neither an alert nor an incident.
+    """
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "successalone.db"))
+    result = ingest_events([_ssh_event("ssh_login_success", ATTACK_IP, -14)])
+
+    assert result["incidents"] == []
+    assert result["alerts"] == []
+    assert list_incidents(status="all") == []
+
+
+def test_correlation_at_exact_window_boundary_incident(
+    tmp_path, monkeypatch
+):
+    """Failures exactly one correlation window before the success are counted
+    (the failure window's lower bound is inclusive). The success is placed well
+    inside the now-relative window to avoid clock-drift flakiness."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "boundary.db"))
+    monkeypatch.setenv("GREYWATCH_CORRELATION_WINDOW_MINUTES", "60")
+    success = _ssh_event("ssh_login_success", ATTACK_IP, -30)
+    success_dt = datetime.fromisoformat(
+        success["timestamp"].replace("Z", "+00:00")
+    )
+    window = timedelta(minutes=60)
+    # Failures exactly at success - window (lower bound, inclusive).
+    boundary_ts = (success_dt - window).isoformat(timespec="seconds")
+    events = [
+        {**_ssh_event("ssh_login_failed", ATTACK_IP, 0), "timestamp": boundary_ts}
+        for _ in range(5)
+    ] + [success]
+    result = ingest_events(events)
+
+    assert len(result["incidents"]) == 1
+    assert result["incidents"][0]["event_count"] == 5
+
+
+def test_correlation_failures_just_outside_window_no_incident(
+    tmp_path, monkeypatch
+):
+    """Failures just before the window lower bound are not counted."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "boundaryoo.db"))
+    monkeypatch.setenv("GREYWATCH_CORRELATION_WINDOW_MINUTES", "60")
+    success = _ssh_event("ssh_login_success", ATTACK_IP, -30)
+    success_dt = datetime.fromisoformat(
+        success["timestamp"].replace("Z", "+00:00")
+    )
+    window = timedelta(minutes=60)
+    # Failures one minute before the lower bound -> excluded.
+    outside_ts = (
+        success_dt - window - timedelta(minutes=1)
+    ).isoformat(timespec="seconds")
+    events = [
+        {**_ssh_event("ssh_login_failed", ATTACK_IP, 0), "timestamp": outside_ts}
+        for _ in range(5)
+    ] + [success]
+    result = ingest_events(events)
+
+    assert result["incidents"] == []
+    assert list_incidents(status="all") == []
+
+
+def test_correlation_out_of_order_events_incident(
+    tmp_path, _window_env, monkeypatch
+):
+    """Event list order does not matter; correlation is driven by stored
+    timestamps, so a success listed before earlier failures still correlates."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "ooo.db"))
+    events = [
+        _ssh_event("ssh_login_success", ATTACK_IP, -14),
+        *_failures(5, ATTACK_IP, start_minutes_ago=20),
+    ]
+    result = ingest_events(events)
+
+    assert len(result["incidents"]) == 1
+    assert result["incidents"][0]["event_count"] == 5
+    detail = get_incident(result["incidents"][0]["id"])
+    assert len(detail["related_events"]) == 6
 
 
 # --------------------------------------------------------------------------- #
@@ -511,6 +599,47 @@ def test_list_incidents_offset_clamps_negative(tmp_path, _window_env, monkeypatc
     initialize_database()
 
     assert len(list_incidents(status="all", limit=5, offset=-5)) == 1
+
+
+def test_list_incidents_source_ip_filter(tmp_path, _window_env, monkeypatch):
+    """list_incidents and count_incidents can be narrowed to a single source IP."""
+    db_path = tmp_path / "filter.db"
+    ips = ["203.0.113.10", "198.51.100.7", "198.51.100.8"]
+    for ip in ips:
+        _make_incident(db_path, ip, monkeypatch)
+
+    monkeypatch.setenv("GREYWATCH_DB", str(db_path))
+    initialize_database()
+
+    assert count_incidents(status="all") == 3
+    assert count_incidents(status="all", source_ip=ips[0]) == 1
+    assert count_incidents(status="all", source_ip="10.0.0.99") == 0
+
+    filtered = list_incidents(status="all", limit=100, source_ip=ips[0])
+    assert len(filtered) == 1
+    assert filtered[0]["source_ip"] == ips[0]
+
+    none = list_incidents(status="all", limit=100, source_ip="10.0.0.99")
+    assert none == []
+
+
+def test_incidents_api_source_ip_filter(tmp_path, _window_env, monkeypatch):
+    """GET /api/v1/incidents honors the source_ip query parameter."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "api_filter.db"))
+    initialize_database()
+    ip_a, ip_b = "203.0.113.10", "198.51.100.7"
+    _make_incident(tmp_path / "api_filter.db", ip_a, monkeypatch)
+    _make_incident(tmp_path / "api_filter.db", ip_b, monkeypatch)
+
+    filtered = client.get(f"/api/v1/incidents?status=all&limit=100&source_ip={ip_a}").json()
+    assert filtered["count"] == 1
+    assert filtered["total"] == 1
+    assert filtered["incidents"][0]["source_ip"] == ip_a
+
+    none = client.get("/api/v1/incidents?status=all&limit=100&source_ip=10.0.0.99").json()
+    assert none["count"] == 0
+    assert none["total"] == 0
+    assert none["incidents"] == []
 
 
 def test_incidents_api_pagination_returns_total_and_offset(

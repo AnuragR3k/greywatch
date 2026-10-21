@@ -227,3 +227,63 @@ def test_empty_token_falls_back_to_loopback(_no_token_env):
 def test_get_api_token_none_when_no_token(_no_token_env):
     """get_api_token() returns None when no token is configured."""
     assert get_api_token() is None
+
+
+# --------------------------------------------------------------------------- #
+# Non-ASCII credentials must fail closed (401), never raise (500)
+# --------------------------------------------------------------------------- #
+
+
+def test_non_ascii_bearer_token_returns_401_not_500(_token_env):
+    """A non-ASCII Authorization value is denied with 401, not 500.
+
+    Regression guard: ``hmac.compare_digest`` raises ``TypeError`` on
+    non-ASCII ``str`` input and HTTP header bytes decode as latin-1, so a
+    crafted header previously turned a denied request into an unhandled 500.
+    """
+    client = TestClient(base_app)
+    resp = client.get(
+        "/api/v1/events", headers=[(b"authorization", b"Bearer \xe9bad")]
+    )
+    assert resp.status_code == 401
+
+
+def test_non_ascii_api_key_returns_401_not_500(_token_env):
+    """A non-ASCII X-API-Key value is denied with 401, not 500."""
+    client = TestClient(base_app)
+    resp = client.get("/api/v1/events", headers=[(b"x-api-key", b"\xe9bad")])
+    assert resp.status_code == 401
+
+
+def test_non_ascii_configured_token_matches_at_boundary(monkeypatch):
+    """A non-ASCII configured token still compares correctly at the boundary.
+
+    Exercised directly against ``_check_trust_boundary`` (httpx re-encodes
+    non-ASCII byte headers, so the transport layer cannot carry the exact byte
+    sequence): a mismatch fails closed, an exact match is allowed, and neither
+    raises.
+    """
+    monkeypatch.setenv("GREYWATCH_API_TOKEN", "s\xe9cret")
+    monkeypatch.setenv("GREYWATCH_API_LOOPBACK_ONLY", "1")
+
+    from backend.app.main import _check_trust_boundary
+
+    class _FakeRequest:
+        class _Client:
+            host = "testclient"
+
+        def __init__(self, headers):
+            self.client = self._Client()
+            self.headers = headers
+            self.url = type("url", (), {"path": "/api/v1/events"})()
+
+    # No credentials and a wrong non-ASCII credential both fail closed.
+    assert _check_trust_boundary(_FakeRequest({})) == (401, "Authentication required")
+    assert _check_trust_boundary(
+        _FakeRequest({"Authorization": "Bearer wr\xf6ng"})
+    ) == (401, "Authentication required")
+    # Exact match is allowed (returns None).
+    assert _check_trust_boundary(
+        _FakeRequest({"Authorization": "Bearer s\xe9cret"})
+    ) is None
+    assert _check_trust_boundary(_FakeRequest({"X-API-Key": "s\xe9cret"})) is None

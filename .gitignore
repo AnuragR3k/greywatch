@@ -10,3 +10,6 @@ dist/
 *.db-shm
 *.db-journal
 *.sqlite*
+
+# Generated Playwright test output
+/frontend/test-results/

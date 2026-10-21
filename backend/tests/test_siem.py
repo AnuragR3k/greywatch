@@ -896,6 +896,45 @@ def test_http_mixed_batch_reports_accurate_counts(tmp_path, monkeypatch):
     assert len(result["events"]) == 2  # only the 2 new events inserted
 
 
+def test_http_reused_id_with_different_content_treated_as_replay(
+    tmp_path, monkeypatch
+):
+    """Reusing an id for different content is treated as a replay (documented).
+
+    Idempotency matches on ``(source, source_record_id)`` only; content is not
+    compared. The later, different event is skipped and counted in
+    ``duplicates`` -- callers must use a stable id per distinct event. This
+    pins the documented behavior so it cannot change silently.
+    """
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "reuse.db"))
+
+    first = client.post(
+        "/api/v1/events/ingest",
+        json={
+            "lines": [
+                "sshd[706]: Failed password for a from 203.0.113.10 port 1 ssh2"
+            ],
+            "event_ids": ["evt-reused"],
+        },
+    ).json()
+    assert first["duplicates"] == 0
+    assert len(first["events"]) == 1
+
+    second = client.post(
+        "/api/v1/events/ingest",
+        json={
+            "lines": [
+                "sshd[707]: Failed password for b from 198.51.100.7 port 2 ssh2"
+            ],
+            "event_ids": ["evt-reused"],
+        },
+    ).json()
+    assert second["duplicates"] == 1
+    assert second["events"] == []
+    # The conflicting event was not stored; only the original is present.
+    assert all(e["source_ip"] != "198.51.100.7" for e in list_events())
+
+
 def test_http_event_ids_scoped_by_source(tmp_path, monkeypatch):
     """The same id string from journal and http sources do not collide; each
     source keeps its own identifier namespace."""

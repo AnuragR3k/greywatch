@@ -1,0 +1,111 @@
+# Greywatch staging reverse proxy (Caddy).
+#
+# Terminates HTTPS on the public interface and proxies the API to the FastAPI
+# uvicorn instance bound to 127.0.0.1:8000 (loopback only). uvicorn is NEVER
+# bound to a public interface.
+#
+# Authentication architecture:
+#   * Caddy basicauth on the dashboard shell (/) authenticates the human user
+#     before the SPA can load.
+#   * Caddy injects the upstream API credential (GREYWATCH_API_TOKEN) server-side
+#     when proxying /api/* to the backend. The browser NEVER sees the API token.
+#   * The backend validates the token on every non-public endpoint (token mode).
+#   * /docs and /openapi.json are not proxied by Caddy and return 404.
+#
+# Usage:
+#   1. Copy to /etc/caddy/Caddyfile.
+#   2. Replace every REPLACE_ME_ placeholder.
+#   3. Set GREYWATCH_API_TOKEN in Caddy's environment (systemd EnvironmentFile
+#      or caddy service env). This same token must be set in the backend's
+#      environment (backend/.env or /etc/greywatch/greywatch.env).
+#   4. Provide TLS certs (see docs/DEPLOYMENT.md) or enable auto_https with
+#      DNS pointing at this host.
+#   5. Reload: caddy reload --config /etc/caddy/Caddyfile
+#
+# See docs/DEPLOYMENT.md for the full deployment runbook.
+{
+	# Disable automatic HTTPS management for this staging template.
+	# Enable `auto_https` (and add an email below) for production Let's Encrypt
+	# once DNS for {REPLACE_ME_WITH_DOMAIN} points at this host.
+	auto_https off
+
+	# Admin API on loopback only (never public).
+	admin 127.0.0.1:2019
+
+	log {
+		output stdout
+		format console
+	}
+}
+
+# Redirect HTTP -> HTTPS
+http://{REPLACE_ME_WITH_DOMAIN} {
+	redir https://{host}{uri} 308
+}
+
+# HTTPS site
+https://{REPLACE_ME_WITH_DOMAIN} {
+	# TLS:
+	#   Staging: provide your own certs (self-signed or internal CA), e.g.
+	#       tls /etc/caddy/certs/{REPLACE_ME_WITH_DOMAIN}.crt \
+	#           /etc/caddy/certs/{REPLACE_ME_WITH_DOMAIN}.key
+	#   Production: replace `auto_https off` above with `auto_https`, add an
+	#       email to the global block, and ensure DNS resolves to this host.
+	tls /etc/caddy/certs/{REPLACE_ME_WITH_DOMAIN}.crt \
+ /etc/caddy/certs/{REPLACE_ME_WITH_DOMAIN}.key
+
+	# ------------------------------------------------------------------
+	# Dashboard shell — protected by HTTP Basic Auth (defense in depth).
+	# HTTPS alone does NOT authenticate the dashboard; this basicauth gate
+	# requires the operator to log in before the SPA can load.
+	# Generate the hash with:  caddy hash-password
+	# ------------------------------------------------------------------
+	handle {
+		basic_auth {
+			{REPLACE_ME_WITH_DASHBOARD_USER} $2y$10${REPLACE_ME_WITH_BCRYPT_HASH}
+		}
+		root * /var/www/greywatch/dist
+		try_files {path} /index.html
+		file_server
+	}
+
+	# ------------------------------------------------------------------
+	# API proxy -> FastAPI uvicorn on loopback only.
+	# basicauth is required BEFORE the upstream token is injected, so an
+	# unauthenticated request never reaches the backend with Caddy's
+	# privileged credential. The browser NEVER sees the token.
+	# The backend validates the token on every non-public endpoint.
+	#
+	# NOTE: use `handle` (not `handle_path`) so the URL path prefix is NOT
+	# stripped before forwarding to the backend. `handle_path` would strip
+	# /api/ and the backend would receive /v1/alerts instead of
+	# /api/v1/alerts, returning 404.
+	# ------------------------------------------------------------------
+	handle /api/* {
+		basic_auth {
+			{REPLACE_ME_WITH_DASHBOARD_USER} $2y$10${REPLACE_ME_WITH_BCRYPT_HASH}
+		}
+		reverse_proxy 127.0.0.1:8000 {
+			header_up Authorization "Bearer {env.GREYWATCH_API_TOKEN}"
+			header_up Host {upstream_hostport}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Forwarded-For {remote}
+		}
+	}
+
+	# ------------------------------------------------------------------
+	# /docs and /openapi.json are intentionally NOT proxied: no handle block
+	# matches them, so Caddy returns 404 on the public listener. This matches
+	# the authentication-architecture note at the top of this file and
+	# docs/DEPLOYMENT.md. The backend still gates them in token mode, but they
+	# must never be reachable from the public internet (the dashboard shell has
+	# basicauth; a schema dump does not warrant it).
+	# ------------------------------------------------------------------
+
+	# ------------------------------------------------------------------
+	# Health endpoint — public, no auth required.
+	# ------------------------------------------------------------------
+	handle /health {
+		reverse_proxy 127.0.0.1:8000
+	}
+}

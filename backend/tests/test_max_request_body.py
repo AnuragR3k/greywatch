@@ -517,3 +517,36 @@ def test_asgi_misleading_content_length_actual_bytes_enforced(
     messages = anyio.run(run)
 
     assert messages[0]["status"] == 413
+
+
+# --------------------------------------------------------------------------- #
+# Runtime configuration of the global app
+# --------------------------------------------------------------------------- #
+
+
+def test_global_app_reads_max_bytes_env_per_request(tmp_path, monkeypatch):
+    """The global app resolves ``GREYWATCH_MAX_REQUEST_BYTES`` on each request.
+
+    Regression guard for the previously import-time-captured limit: changing
+    the environment variable must take effect without re-importing the app.
+    """
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "runtime.db"))
+    initialize_database()
+    client = TestClient(base_app)
+
+    monkeypatch.setenv("GREYWATCH_MAX_REQUEST_BYTES", "16")
+    oversized = client.post(
+        "/api/v1/events/ingest",
+        content=b"x" * 64,
+        headers={"content-type": "application/json"},
+    )
+    assert oversized.status_code == 413
+
+    # Raising/unsetting the limit is honored on the next request.
+    monkeypatch.delenv("GREYWATCH_MAX_REQUEST_BYTES", raising=False)
+    ok = client.post(
+        "/api/v1/events/ingest",
+        json={"lines": ["this line does not parse as an ssh event"]},
+    )
+    assert ok.status_code == 200
+    assert ok.json()["parsed"] == 0
