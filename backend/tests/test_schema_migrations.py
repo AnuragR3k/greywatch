@@ -1,4 +1,4 @@
-"""Tests for the schema-migration ledger foundation (backend/app/migrations.py).
+"""Tests for the schema-migration ledger foundation (backend/app/migration_ledger.py).
 
 These exercise only the ledger-table creation: that the table can be created,
 that creation is idempotent, that pre-existing tables and data are untouched,
