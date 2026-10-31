@@ -268,6 +268,117 @@ The static JavaScript dashboard cannot safely store a server-side secret. Remote
 
 Do not expose Greywatch directly to an untrusted network without deliberate authentication and network-security controls.
 
+
+## Database Lifecycle Management
+
+### Event retention
+
+Greywatch's SQLite database grows as events are ingested. To prevent
+unbounded growth, Greywatch provides a **safe, configurable event-retention
+mechanism** that only removes events proven to be dispensable.
+
+**Default behavior:** retention is **disabled** when `GREYWATCH_EVENT_RETENTION_DAYS`
+is unset — nothing is ever deleted. This is the safe default; operators must
+opt in by setting the variable.
+
+When enabled, events older than `GREYWATCH_EVENT_RETENTION_DAYS` days are
+**eligible** for deletion, subject to these preservation rules:
+
+1. **Events referenced by incidents** — any event linked via `incident_events`
+   (open, acknowledged, or resolved incidents) is always preserved.
+2. **Evidence for open alerts** — events matching the evidence query of any
+   open alert (SSH brute-force failures within the 5-minute window; Suricata
+   alerts within their lifetime window) are always preserved.
+
+If an event's relationship to forensic evidence cannot be established
+safely, it is retained. **Alerts and incidents are never deleted** — only
+the `events` table is pruned.
+
+#### Configuration
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `GREYWATCH_EVENT_RETENTION_DAYS` | unset (disabled) | Positive integer = retention period in days. `0`, negative, or non-numeric values disable retention. |
+| `GREYWATCH_RETENTION_BATCH_SIZE` | `1000` | Events deleted per transaction (smaller = less lock contention). |
+
+Invalid values (zero, negative, non-numeric) **disable** retention rather
+than silently deleting everything.
+
+#### Maintenance commands
+
+```bash
+# Preview what would be deleted (safe, read-only — default mode)
+python -m backend.app.retention --dry-run
+
+# Actually delete eligible events
+python -m backend.app.retention --execute
+
+# Compact the database after deletions (REQUIRES SERVICE DOWNTIME — see below)
+python -m backend.app.retention --vacuum
+```
+
+Or via the shell wrapper:
+
+```bash
+sudo ./scripts/gw_retention.sh dry-run          # preview
+sudo ./scripts/gw_retention.sh execute          # delete
+sudo ./scripts/gw_retention.sh vacuum           # compact (stops prompted)
+```
+
+The dry-run output reports:
+- Configured retention period
+- Number of eligible events (older than the cutoff)
+- Number of protected events (incident-referenced or open-alert evidence)
+- Number of deletable events (eligible minus protected)
+
+Retention uses explicit transactions with bounded deletion batches and
+enables `PRAGMA foreign_keys = ON` as a safety net — any attempt to delete
+an event still referenced by `incident_events` raises a hard error rather
+than leaving an orphaned row.
+
+### SQLite VACUUM (database compaction)
+
+Deleting rows frees pages for reuse within the same table, but the database
+**file size does not shrink** until `VACUUM` is run. Greywatch does **not**
+run VACUUM automatically — it requires an **exclusive lock** and must be
+done with the service stopped.
+
+```bash
+# 1. Stop the service
+sudo systemctl stop greywatch-api
+
+# 2. (Recommended) Take a backup first
+sudo ./scripts/gw_db_backup.sh backup
+
+# 3. Run VACUUM
+sudo ./scripts/gw_retention.sh vacuum
+
+# 4. Restart
+sudo systemctl start greywatch-api
+```
+
+**Limitations:**
+- VACUUM cannot run while any process holds the database open (WAL readers
+  are excluded by the exclusive lock).
+- Greywatch uses the default `auto_vacuum=NONE`, so incremental vacuum is
+  not available; only full `VACUUM` works.
+- After VACUUM, the WAL file is reset to empty and subsequent checkpoints
+  start fresh.
+
+### Backup recommendations
+
+Always take a backup **before** running retention or VACUUM:
+
+```bash
+sudo ./scripts/gw_db_backup.sh backup
+```
+
+Backups use SQLite's online backup API (safe while the service is running)
+and are verified with `integrity_check` and `foreign_key_check` before
+being reported as successful. See [Database backup, restore, and disaster
+recovery](docs/DEPLOYMENT.md#database-backup-restore-and-disaster-recovery).
+
+
 ## Testing
 
 Run the backend tests from the repository root:
