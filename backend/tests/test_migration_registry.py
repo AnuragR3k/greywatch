@@ -85,11 +85,13 @@ def test_empty_registry_is_valid():
     assert latest_version(()) == 0
 
 
-def test_default_registry_is_empty():
-    """The shipped registry is explicit and starts empty until files exist."""
-    assert MIGRATIONS == ()
-    assert validate_registry(MIGRATIONS) == ()
-    assert latest_version() == 0
+def test_default_registry_contains_baseline():
+    """The shipped registry contains exactly one migration: version 1 'baseline'."""
+    assert len(MIGRATIONS) == 1
+    assert MIGRATIONS[0].version == 1
+    assert MIGRATIONS[0].name == "baseline"
+    assert validate_registry(MIGRATIONS) == MIGRATIONS
+    assert latest_version() == 1
 
 
 def test_valid_registry_is_returned_sorted_by_version():

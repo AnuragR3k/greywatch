@@ -270,7 +270,7 @@ def test_special_char_paths_never_open_wrong_database(tmp_path, monkeypatch, nam
     conn.commit()
     conn.close()
 
-    report = inspect_path(db_path)
+    report = inspect_path(db_path, entries=())
     assert report.state is DatabaseState.UNVERSIONED
 
     # confirm the sentinel really lives in the inspected file (not elsewhere)
@@ -364,7 +364,7 @@ def test_complete_legacy_database_is_legacy_ready(tmp_path):
     conn.commit()
     conn.close()
 
-    report = inspect_path(path)
+    report = inspect_path(path, entries=())
     assert report.state is DatabaseState.LEGACY_READY
     for table in APP_TABLES:
         assert table in report.tables
@@ -525,13 +525,46 @@ def test_ledger_only_with_invalid_ledger_schema_is_inconsistent(tmp_path):
 
 
 def test_unversioned_current_schema(tmp_path, monkeypatch):
-    """Current schema, no ledger, empty registry -> UNVERSIONED (M4)."""
+    """Current schema, no ledger, empty registry -> UNVERSIONED (M4).
+
+    Uses an explicit empty registry so UNVERSIONED (current schema + no ledger
+    + no migrations registered) is well-defined regardless of the shipped
+    baseline migration.
+    """
     db_path = _current_db(tmp_path, monkeypatch)
-    report = inspect_path(db_path)
+    report = inspect_path(db_path, entries=())
     assert report.state is DatabaseState.UNVERSIONED
     assert report.applied_version == 0
     assert report.latest_version == 0
     assert report.ledger_present is False
+
+
+def test_current_schema_no_ledger_is_pending_with_baseline(tmp_path, monkeypatch):
+    """Complete schema, no ledger, v1 registered -> PENDING (actual behavior).
+
+    Per M4, UNVERSIONED requires an empty registry; with v1 registered,
+    ``applied_version (0) < latest (1)`` yields PENDING.
+    """
+    db_path = _current_db(tmp_path, monkeypatch)
+    report = inspect_path(db_path)  # default MIGRATIONS now contains v1
+    assert report.state is DatabaseState.PENDING
+    assert report.applied_version == 0
+    assert report.latest_version == 1
+    assert report.ledger_present is False
+
+
+def test_current_schema_with_baseline_ledger_is_current(tmp_path, monkeypatch):
+    """Complete schema + ledger (1, 'baseline') + v1 registered -> CURRENT."""
+    db_path = _current_db(tmp_path, monkeypatch)
+    conn = _connect(db_path)
+    _insert_ledger(conn, (1, "baseline", "t"))
+    conn.close()
+
+    report = inspect_path(db_path)  # default MIGRATIONS
+    assert report.state is DatabaseState.CURRENT
+    assert report.applied_version == 1
+    assert report.latest_version == 1
+    assert report.ledger_present is True
 
 
 def test_current_with_registered_and_applied(tmp_path, monkeypatch):
@@ -1060,7 +1093,7 @@ def test_m4_states_report_consistent_versions(tmp_path, monkeypatch):
     db_path = fresh_db()
 
     # UNVERSIONED: current schema, no ledger, empty registry.
-    report = inspect_path(db_path)
+    report = inspect_path(db_path, entries=())
     assert report.state is DatabaseState.UNVERSIONED
     assert report.applied_version == 0
     assert report.latest_version == 0
@@ -1201,7 +1234,7 @@ def test_c2_rollback_journal_inspect_is_side_effect_free(tmp_path, monkeypatch):
     """A rollback-journal db inspected in-place leaves no sidecar files."""
     db_path = _current_db(tmp_path, monkeypatch)
     before = sorted(os.listdir(tmp_path))
-    report = inspect_path(db_path)
+    report = inspect_path(db_path, entries=())
     after = sorted(os.listdir(tmp_path))
     assert before == after
     assert report.state is DatabaseState.UNVERSIONED
@@ -1255,7 +1288,7 @@ def test_inspect_never_creates_schema_migrations(tmp_path, monkeypatch):
     # Snapshot after setup (ledger is absent; inspect_path will not create it).
     before_dir = sorted(os.listdir(tmp_path))
 
-    report = inspect_path(db_path)
+    report = inspect_path(db_path, entries=())
     assert report.state is DatabaseState.UNVERSIONED
     # The report proves inspect_path never observed a ledger table.
     assert report.ledger_present is False
@@ -1273,7 +1306,7 @@ def test_inspect_connection_bytes_factory(tmp_path, monkeypatch):
     conn = sqlite3.connect(db_path)
     conn.text_factory = bytes
     try:
-        report = inspect_connection(conn)
+        report = inspect_connection(conn, entries=())
         assert report.state is DatabaseState.UNVERSIONED
     finally:
         conn.close()
@@ -1284,7 +1317,7 @@ def test_inspect_connection_custom_row_factory(tmp_path, monkeypatch):
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
-        report = inspect_connection(conn)
+        report = inspect_connection(conn, entries=())
         assert report.state is DatabaseState.UNVERSIONED
     finally:
         conn.close()
@@ -1296,7 +1329,7 @@ def test_inspect_connection_with_existing_transaction(tmp_path, monkeypatch):
     conn.execute("BEGIN")
     conn.execute("INSERT INTO collector_state(key,value) VALUES('k','v')")
     try:
-        report = inspect_connection(conn)
+        report = inspect_connection(conn, entries=())
         assert report.state is DatabaseState.UNVERSIONED
     finally:
         conn.rollback()
@@ -1898,3 +1931,74 @@ def test_genuine_corrupt_still_classified_as_corrupt(tmp_path, monkeypatch):
     db_path.write_bytes(b"not a sqlite file at all")
     report = inspect_path(db_path)
     assert report.state is DatabaseState.CORRUPT
+
+
+# --------------------------------------------------------------------------- #
+# Task 2A: Baseline migration v1
+# --------------------------------------------------------------------------- #
+
+
+def test_baseline_registry_contains_exactly_v1():
+    """MIGRATIONS contains exactly one entry: version 1 named 'baseline'."""
+    from backend.app.migration_registry import MIGRATIONS
+
+    assert len(MIGRATIONS) == 1
+    assert MIGRATIONS[0].version == 1
+    assert MIGRATIONS[0].name == "baseline"
+
+
+def test_baseline_registry_latest_version_is_1():
+    """latest_version() returns 1 with the shipped baseline."""
+    from backend.app.migration_registry import latest_version
+
+    assert latest_version() == 1
+
+
+def test_baseline_registry_validation_accepts_it():
+    """validate_registry accepts the shipped baseline."""
+    from backend.app.migration_registry import MIGRATIONS, validate_registry
+
+    assert validate_registry(MIGRATIONS) == MIGRATIONS
+
+
+def test_baseline_ledger_name_mismatch_is_rejected(tmp_path, monkeypatch):
+    """A ledger entry with a name mismatch (e.g. 'init_schema') is INCONSISTENT."""
+    db_path = _current_db(tmp_path, monkeypatch)
+    conn = _connect(db_path)
+    _insert_ledger(conn, (1, "init_schema", "t"))  # name mismatch with 'baseline'
+    conn.close()
+
+    report = inspect_path(db_path)  # default MIGRATIONS
+    assert report.state is DatabaseState.INCONSISTENT
+    assert report.applied_version == 1
+
+
+def test_baseline_ledger_unknown_version_is_rejected(tmp_path, monkeypatch):
+    """A ledger entry for an unregistered version is rejected, not silently accepted.
+
+    Applied version 5 > latest (1) is classified as NEWER (not silently accepted
+    as CURRENT). An invalid applied version (0) is INCONSISTENT.
+    """
+    db_path = _current_db(tmp_path, monkeypatch)
+    conn = _connect(db_path)
+    _insert_ledger(conn, (5, "something", "t"))  # unknown to the registry, > latest
+    conn.close()
+
+    report = inspect_path(db_path)  # default MIGRATIONS
+    assert report.state is DatabaseState.NEWER  # not silently accepted as current
+    assert report.applied_version == 5
+    assert report.latest_version == 1
+
+
+def test_initialize_database_fingerprint_matches_expected(tmp_path, monkeypatch):
+    """A database created via initialize_database() matches EXPECTED_SCHEMA."""
+    db_path = _current_db(tmp_path, monkeypatch)
+    conn = _connect(db_path)
+    try:
+        diffs = compare_schema(conn)
+        assert diffs.complete
+        # Fingerprint is a stable hash for an unchanged current schema.
+        fp = schema_fingerprint(conn)
+        assert isinstance(fp, str) and fp
+    finally:
+        conn.close()
