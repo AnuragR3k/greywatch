@@ -40,7 +40,7 @@ greywatch/
 │       ├── test_collector.py # 41 cases: parsing, checkpoint recovery, dedup, malformed, SSH brute-force, journal→alert→evidence (new)
 │       ├── test_suricata.py  # 61 cases: parsing/normalization, malformed, dedup, rotation, progress, max-records, SSH-isolation, API, alert creation/evidence, unknown-signature keying, reliability/recovery
 │       ├── test_live_threat_workflow.py # 3 cases: live-detection contract + provenance distinction (new)
-│       └── test_retention.py # 37 cases: config validation, dry-run, execute, retention boundaries, incident protection, open/closed-alert evidence, batch deletion, FK integrity, rollback, concurrent access, CLI (new)
+│       └── test_retention.py # 50 cases: config validation incl. batch-size env var, dry-run, execute, retention boundaries, incident protection, open/closed-alert evidence, batch deletion, FK integrity, rollback, concurrent access, CLI (new)
 ├── frontend/                # React + Vite SOC dashboard
 │   ├── index.html           # HTML template
 │   ├── package.json         # React 19, Vite 8, Oxlint scripts and dependencies
@@ -282,17 +282,18 @@ deleted.
     protect the full lifetime window (fail-safe).
   - **Closed** alerts do **not** protect their old evidence.
 - **Safe execution:** dry-run is the default; `--execute` deletes in bounded
-  batches (`GREYWATCH_RETENTION_BATCH_SIZE`, default 1000) inside explicit
-  transactions, with `PRAGMA foreign_keys = ON` as a safety net and a
-  `PRAGMA foreign_key_check` verification afterward. Any failure rolls back and
-  deletes nothing; concurrent ingestion in WAL mode is supported.
+  batches (`GREYWATCH_RETENTION_BATCH_SIZE`, validated: zero, negative and
+  non-numeric values fall back to the default of 1000 so batching is never
+  disabled) inside explicit transactions. An explicit CLI `--batch-size`
+  overrides the env var; any failure rolls back and deletes nothing; concurrent
+  ingestion in WAL mode is supported.
 - **VACUUM** is a separate, explicit maintenance operation (`--vacuum`) requiring
   the service to be stopped (exclusive lock); it is never run on the API hot
   path or at startup. Backups use `scripts/gw_db_backup.sh` (verified before and
   after).
-- **Verified:** 37 hermetic cases in `backend/tests/test_retention.py` use
+- **Verified:** 50 hermetic cases in `backend/tests/test_retention.py` use
   isolated temp databases (`GREYWATCH_DB` redirected); the production database
-  is never touched. Full backend suite: **401 passed** (see §4).
+  is never touched. Full backend suite: **414 passed** (see §4).
 
 Operational procedures and scheduling (daily dry-run preview, weekly execute,
 monthly VACUUM during downtime) are documented in `docs/DEPLOYMENT.md`
@@ -383,7 +384,7 @@ re-verified.
 
 | Verification Target | Command | Rerun? | Status | Result / Details |
 |---------------------|---------|--------|--------|------------------|
-| **Backend Tests** | `python -m pytest backend/tests -q` | Rerun 2026-10-31 | **PASSING** | `401 passed, 1 warning`, exit code 0. Added 37 `test_retention.py` cases (config validation, dry-run, execute, retention boundaries, incident protection, open/closed-alert evidence, batch deletion, FK integrity, rollback, concurrent access, CLI). See §2.14. |
+| **Backend Tests** | `python -m pytest backend/tests -q` | Rerun 2026-10-31 | **PASSING** | `414 passed, 1 warning`, exit code 0. Added 50 `test_retention.py` cases (config validation incl. batch-size env var, dry-run, execute, retention boundaries, incident protection, open/closed-alert evidence, batch deletion, FK integrity, rollback, concurrent access, CLI). See §2.14. |
 | **Frontend Lint** | `npm run lint` (in `frontend/`) | Rerun 2026-10-31 | **PASSING (n warnings)** | exit code 0 (Oxlint 1.87.0). No new warnings; retention work touched no frontend files. |
 | **Frontend Production Build** | `npm run build` (in `frontend/`) | Rerun 2026-10-31 | **PASSING** | exit code 0 (Vite 8.3.4). Output: `dist/index.html` + `dist/assets/index-*.{css,js}`. |
 | **Backend Tests** | `.venv/bin/python -m pytest backend/tests -q` | Rerun 2026-10-15 | **PASSING** | `124 passed, 1 warning`, exit code 0 — verified by `--collect-only` per file: 16 `test_siem.py` + 41 `test_collector.py` + **61 `test_suricata.py`** + 3 `test_live_threat_workflow.py` + 3 `test_db_safety.py`. The Day-5 increase (108 → 121) is +13 hermetic cases: initially-empty EVE file, partial-record hold-back, unreadable file (skipped as root), truncation-to-zero, restart-from-checkpoint, invalid-neighbour robustness, no-silent-enable CLI behaviour, unknown-signature keying (distinct categories, scoped evidence, same-category aggregation, cross-cycle aggregation, out-of-window), and a signature-bearing-dedup regression guard. No regressions; the line-based SSH brute-force tests are unchanged and still green. (The 91→108 increase is +17 new hermetic cases for Suricata alert creation, severity mapping on alerts, invalid field types, missing optional fields, dedup aggregation, distinct-alert disambiguation, and evidence/investigation — added in the Day-4 Suricata alert/dedup change; see §6 item 9.) Adds 35 new cases (31 `test_suricata.py` + 4 journal end-to-end): `test_end_to_end_http_detection_flow` (full HTTP→alert→evidence chain, below/at-threshold + per-IP isolation, duplicate-alert prevention, unrelated/out-of-window evidence exclusion), `test_below_threshold_does_not_create_alert` (4 failures → no alert), `test_brute_force_threshold_is_per_source_ip` (two IPs at threshold → two alerts), and `test_journal_records_produce_brute_force_evidence` (journal record → parsed event → SQLite → SSH_BRUTE_FORCE → evidence via `/api/v1/alerts/{id}` with `source=journal` provenance). A root `pyproject.toml` (`[tool.pytest.ini_options]` with `pythonpath = ["."]`) lets `pytest` resolve the `backend` package without `PYTHONPATH="$PWD"`, so `.venv/bin/pytest -v`, `python -m pytest -v`, and `PYTHONPATH="$PWD" .venv/bin/pytest -v` are all equivalent.<br>*Warning: StarletteDeprecationWarning regarding httpx with testclient (pre-existing, from Starlette/FastAPI — not actionable until `httpx2` is released).*<br>Added `backend/tests/test_live_threat_workflow.py` (3 cases) codifying `docs/LIVE_THREAT_TEST.md` as a permanent regression: the live-detection contract (5 synthetic failures &rarr; 1 `SSH_BRUTE_FORCE` alert &rarr; 5 evidence events via `/alerts/{id}`) and the provenance distinction (`source=NULL`/`journal`/`suricata`). Run: `.venv/bin/python -m pytest -q backend/tests/test_live_threat_workflow.py -v` (expect 3 passed). |
