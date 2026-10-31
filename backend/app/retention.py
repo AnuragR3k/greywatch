@@ -192,7 +192,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     dry_run = not args.execute
-    summary = prune_events(dry_run=dry_run, batch_size=args.batch_size)
+    try:
+        summary = prune_events(dry_run=dry_run, batch_size=args.batch_size)
+    except ValueError as exc:
+        # Explicit --batch-size validation failed (e.g. 0 or negative forwarded
+        # by gw_retention.sh). Surface a clear error and exit non-zero rather
+        # than letting an invalid value reach the deletion loop.
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
     print(format_summary(summary))
 

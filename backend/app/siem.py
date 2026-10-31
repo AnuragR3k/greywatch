@@ -2119,6 +2119,20 @@ def prune_events(
 
     if batch_size is None:
         batch_size = get_retention_batch_size()
+    elif batch_size <= 0:
+        # Reject explicit non-positive batch sizes at the library boundary so a
+        # misconfigured CLI / shell-wrapper value (e.g.
+        # GREYWATCH_RETENTION_BATCH_SIZE=0 forwarded by gw_retention.sh as an
+        # explicit --batch-size) can never reach the DELETE ... LIMIT clause.
+        # Such a value would delete all eligible events in a single unbounded
+        # transaction and hold the write lock indefinitely. The env-var path
+        # above already falls back to DEFAULT_RETENTION_BATCH_SIZE (>= 1), so
+        # this only guards explicitly supplied values (e.g. --batch-size).
+        raise ValueError(
+            f"batch_size must be a positive integer or None (got {batch_size!r}); "
+            "a non-positive batch size would delete all eligible events in a "
+            "single unbounded transaction."
+        )
 
     if config.retention_days is None:
         return RetentionSummary(

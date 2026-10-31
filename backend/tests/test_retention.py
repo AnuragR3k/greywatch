@@ -1427,3 +1427,143 @@ def test_cli_parser_batch_size_defaults_to_none(tmp_path, monkeypatch):
     assert opts.batch_size is None  # sentinel: prune_events resolves it
     opts2 = _build_parser().parse_args(["--batch-size", "9"])
     assert opts2.batch_size == 9
+
+
+# --------------------------------------------------------------------------- #
+# Explicit batch-size validation (zero/negative rejection)
+# --------------------------------------------------------------------------- #
+
+
+def test_prune_events_rejects_zero_batch_size_explicit(tmp_path, monkeypatch):
+    """An explicit batch_size of 0 is rejected at the library boundary before any
+    database access or deletion, even in dry-run mode."""
+    db_path = tmp_path / "test.db"
+    monkeypatch.setenv("GREYWATCH_DB", str(db_path))
+    monkeypatch.setenv(RETENTION_DAYS_ENV, "30")
+    initialize_database()
+
+    with _connection() as conn:
+        _insert_event(conn, timestamp=_old_timestamp(100))
+        conn.commit()
+
+    with pytest.raises(ValueError, match="batch_size"):
+        prune_events(dry_run=True, batch_size=0)
+
+
+def test_prune_events_rejects_negative_batch_size_explicit(tmp_path, monkeypatch):
+    """A negative explicit batch_size is rejected at the library boundary."""
+    db_path = tmp_path / "test.db"
+    monkeypatch.setenv("GREYWATCH_DB", str(db_path))
+    monkeypatch.setenv(RETENTION_DAYS_ENV, "30")
+    initialize_database()
+
+    with pytest.raises(ValueError, match="batch_size"):
+        prune_events(dry_run=False, batch_size=-5)
+
+
+def test_explicit_zero_batch_size_deletes_nothing(tmp_path, monkeypatch):
+    """Even with retention enabled, an explicit zero batch size raises before
+    deletion and leaves all eligible events in place (no unbounded deletion)."""
+    db_path = tmp_path / "test.db"
+    monkeypatch.setenv("GREYWATCH_DB", str(db_path))
+    monkeypatch.setenv(RETENTION_DAYS_ENV, "30")
+    monkeypatch.setenv(RETENTION_BATCH_SIZE_ENV, "1000")  # env valid; explicit overrides
+    initialize_database()
+
+    with _connection() as conn:
+        for _ in range(3):
+            _insert_event(conn, timestamp=_old_timestamp(100))
+        conn.commit()
+
+    with pytest.raises(ValueError, match="batch_size"):
+        prune_events(dry_run=False, batch_size=0)
+
+    # No events were deleted despite execute mode.
+    with _connection() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    assert count == 3
+
+
+def test_cli_rejects_zero_batch_size_argument(tmp_path, monkeypatch, capsys):
+    """Explicit --batch-size 0 is validated by the CLI and reported as a clear
+    error; no deletion occurs."""
+    db_path = tmp_path / "test.db"
+    monkeypatch.setenv("GREYWATCH_DB", str(db_path))
+    monkeypatch.setenv(RETENTION_DAYS_ENV, "30")
+    monkeypatch.setenv(RETENTION_BATCH_SIZE_ENV, "1000")
+    initialize_database()
+
+    with _connection() as conn:
+        for _ in range(3):
+            _insert_event(conn, timestamp=_old_timestamp(100))
+        conn.commit()
+
+    from backend.app.retention import main as retention_main
+
+    rc = retention_main(["--execute", "--batch-size", "0"])
+    assert rc != 0
+
+    captured = capsys.readouterr()
+    assert "batch_size" in captured.err
+    assert "positive integer" in captured.err
+
+    # Nothing was deleted.
+    with _connection() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    assert count == 3
+
+
+def test_cli_rejects_negative_batch_size_argument(tmp_path, monkeypatch, capsys):
+    """Explicit --batch-size=-5 is validated by the CLI (uses = form to avoid
+    argparse negative-number ambiguity) and reported as a clear error."""
+    db_path = tmp_path / "test.db"
+    monkeypatch.setenv("GREYWATCH_DB", str(db_path))
+    monkeypatch.setenv(RETENTION_DAYS_ENV, "30")
+    monkeypatch.setenv(RETENTION_BATCH_SIZE_ENV, "1000")
+    initialize_database()
+
+    from backend.app.retention import main as retention_main
+
+    rc = retention_main(["--execute", "--batch-size=-5"])
+    assert rc != 0
+
+    captured = capsys.readouterr()
+    assert "batch_size" in captured.err
+
+
+def test_wrapper_zero_batch_size_fails_cleanly(tmp_path, monkeypatch):
+    """The shell wrapper must not let an invalid GREYWATCH_RETENTION_BATCH_SIZE
+    trigger unbounded deletion: a zero value forwarded as --batch-size is
+    rejected by the engine and the wrapper exits non-zero with a clear error."""
+    import subprocess
+    import sys
+
+    db_path = tmp_path / "gw.db"
+    monkeypatch.setenv("GREYWATCH_DB", str(db_path))
+    # Retention can be enabled or not -- validation happens before any DB work.
+    monkeypatch.setenv(RETENTION_DAYS_ENV, "30")
+    monkeypatch.setenv(RETENTION_BATCH_SIZE_ENV, "0")
+    initialize_database()
+
+    repo_root = Path(__file__).resolve().parents[2]
+    wrapper = repo_root / "scripts" / "gw_retention.sh"
+
+    env = {
+        **os.environ,
+        "GREYWATCH_DB": str(db_path),
+        "GREYWATCH_EVENT_RETENTION_DAYS": "30",
+        "GREYWATCH_RETENTION_BATCH_SIZE": "0",
+        "GREYWATCH_PYTHON": sys.executable,
+    }
+    result = subprocess.run(
+        ["bash", str(wrapper), "dry-run"],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(repo_root),
+        timeout=60,
+    )
+
+    assert result.returncode != 0
+    assert "batch_size" in (result.stderr + result.stdout)
+    assert "positive integer" in (result.stderr + result.stdout)
