@@ -142,6 +142,19 @@ def _is_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _as_text(value: object) -> str | None:
+    """Decode a possibly-bytes SQLite text value to ``str`` (None passthrough).
+
+    Makes ledger schema inspection robust against connections configured with
+    ``text_factory = bytes`` / custom row factories.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", "replace")
+    return str(value)
+
+
 def _format_versions(versions: Iterable[int]) -> str:
     """Format a version collection for an actionable error message."""
     ordered = sorted(set(versions))
@@ -330,6 +343,9 @@ def _extract_applied_name(row: object, index: int) -> str | None:
 
     if value is None:
         return None
+    # Decode bytes from text_factory=bytes connections.
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8", "replace")
     if not isinstance(value, str):
         raise InvalidAppliedVersionError(
             f"ledger row {index} has invalid name {value!r}; expected a string"
@@ -389,10 +405,15 @@ def _validate_ledger_schema(connection: sqlite3.Connection) -> None:
 
     # PRAGMA table_info rows are (cid, name, type, notnull, dflt_value, pk).
     # Indexing by position is robust to the connection's row_factory.
-    columns: dict[str, tuple[str, bool, bool]] = {
-        row[1]: (row[2].upper() if row[2] else "", bool(row[3]), bool(row[5]))
-        for row in info
-    }
+    # Use _as_text so column names/types are decoded from bytes when
+    # text_factory=bytes is in effect.
+    columns: dict[str, tuple[str, bool, bool]] = {}
+    for row in info:
+        col_name = _as_text(row[1])
+        if col_name is None:
+            continue
+        col_type = _as_text(row[2]) or ""
+        columns[col_name] = (col_type.upper(), bool(row[3]), bool(row[5]))
     required = ("version", "name", "applied_at")
     missing = [column for column in required if column not in columns]
     if missing:
