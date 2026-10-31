@@ -1,8 +1,10 @@
 """Greywatch's first SIEM ingestion and detection engine."""
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
+import logging
 import os
 from pathlib import Path
 import re
@@ -10,6 +12,8 @@ import sqlite3
 
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[2] / "data" / "greywatch.db"
+
+logger = logging.getLogger("greywatch.siem")
 
 
 def is_production_db_path(path: str | Path) -> bool:
@@ -1709,4 +1713,598 @@ def get_alert_detail(alert_id: int) -> dict | None:
         "evidence_window_start": start,
         "evidence_window_end": end,
         "evidence_events": [dict(event) for event in rows],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Event retention
+# --------------------------------------------------------------------------- #
+
+#: Environment variable controlling the event retention period.
+#:
+#: When unset, retention is **disabled** (non-destructive): nothing is ever
+#: deleted. This is the safe default — operators must opt in by setting a
+#: positive integer number of days.
+RETENTION_DAYS_ENV = "GREYWATCH_EVENT_RETENTION_DAYS"
+
+#: Days used when GREYWATCH_EVENT_RETENTION_DAYS is unset or invalid.
+#: ``None`` signals "disabled" (non-destructive).
+DEFAULT_RETENTION_DAYS: int | None = None
+
+#: Maximum number of events deleted in a single transaction. Bounded so a
+#: large backlog does not hold an exclusive write lock for too long and
+#: starve concurrent readers (WAL) or writers (the API / collectors).
+DEFAULT_RETENTION_BATCH_SIZE = 1000
+
+#: Environment variable overriding the per-batch deletion size
+#: (``GREYWATCH_RETENTION_BATCH_SIZE``). When unset or invalid,
+#: :func:`get_retention_batch_size` falls back to
+#: :data:`DEFAULT_RETENTION_BATCH_SIZE` so deletion always proceeds in
+#: bounded batches rather than one unbounded transaction.
+RETENTION_BATCH_SIZE_ENV = "GREYWATCH_RETENTION_BATCH_SIZE"
+
+
+def get_retention_batch_size() -> int:
+    """Read and validate ``GREYWATCH_RETENTION_BATCH_SIZE`` from the environment.
+
+    * **Unset** -> :data:`DEFAULT_RETENTION_BATCH_SIZE` (1000).
+    * **Positive integer** -> ``int(value)``.
+    * **Zero, negative, or non-numeric** -> :data:`DEFAULT_RETENTION_BATCH_SIZE`
+      with a warning logged, so a mis-configured value can never disable
+      batching (which would delete all eligible events in a single
+      unbounded transaction and hold the write lock indefinitely).
+
+    The environment is read on every call so tests stay hermetic via
+    ``monkeypatch.setenv``.
+    """
+    raw = os.environ.get(RETENTION_BATCH_SIZE_ENV, "")
+    if not raw:
+        return DEFAULT_RETENTION_BATCH_SIZE
+
+    raw = raw.strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "retention config: %r is not a valid integer; using default batch "
+            "size %d",
+            raw,
+            DEFAULT_RETENTION_BATCH_SIZE,
+        )
+        return DEFAULT_RETENTION_BATCH_SIZE
+
+    if value <= 0:
+        logger.warning(
+            "retention config: %r must be a positive integer; using default "
+            "batch size %d",
+            raw,
+            DEFAULT_RETENTION_BATCH_SIZE,
+        )
+        return DEFAULT_RETENTION_BATCH_SIZE
+
+    return value
+
+
+@dataclass
+class RetentionConfig:
+    """Configuration for event retention.
+
+    ``retention_days`` is ``None`` when retention is disabled (unset or
+    invalid env var) — in that state :func:`prune_events` is a no-op and the
+    database is never modified.
+    """
+
+    retention_days: int | None = DEFAULT_RETENTION_DAYS
+
+
+@dataclass
+class RetentionSummary:
+    """Result of a retention scan or execution.
+
+    Counts are over the ``events`` table only.  ``deleted_events`` is 0 in
+    dry-run mode; in execute mode it equals the number of rows actually
+    removed (which may be less than ``deletable_events`` if events were
+    inserted between the scan and the deletion).
+    """
+
+    retention_days: int | None
+    """Configured retention period in days (``None`` = disabled / non-destructive)."""
+
+    disabled: bool
+    """True when retention is disabled (no deletion will occur)."""
+
+    eligible_events: int
+    """Events with timestamp older than the retention cutoff."""
+
+    protected_events: int
+    """Eligible events that are protected from deletion (incident-referenced
+    or within an open-alert evidence window)."""
+
+    deletable_events: int
+    """Eligible events that are NOT protected and can be safely deleted."""
+
+    deleted_events: int
+    """Events actually deleted (0 in dry-run mode)."""
+
+    dry_run: bool
+    """True if this was a dry-run (no modifications)."""
+
+    batch_size: int
+    """Configured batch size for deletion."""
+
+    batches_run: int
+    """Number of deletion batches executed (0 in dry-run or disabled)."""
+
+    fk_violations: int = 0
+    """Foreign-key violations found after deletion (0 on success)."""
+
+
+def get_retention_config() -> RetentionConfig:
+    """Read and validate ``GREYWATCH_EVENT_RETENTION_DAYS`` from the environment.
+
+    * **Unset** → ``retention_days = None`` (disabled, non-destructive).
+    * **Positive integer** → ``retention_days = int(value)``.
+    * **Zero, negative, or non-numeric** → ``retention_days = None`` (disabled)
+      and a warning is logged, so a mis-configured retention value can never
+      silently delete everything.
+
+    The environment is read on every call so tests stay hermetic via
+    ``monkeypatch.setenv``.
+    """
+    raw = os.environ.get(RETENTION_DAYS_ENV, "")
+    if not raw:
+        return RetentionConfig(retention_days=None)
+
+    raw = raw.strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "retention config: %r is not a valid integer; retention disabled",
+            raw,
+        )
+        return RetentionConfig(retention_days=None)
+
+    if value <= 0:
+        logger.warning(
+            "retention config: %r must be a positive integer; retention disabled",
+            raw,
+        )
+        return RetentionConfig(retention_days=None)
+
+    return RetentionConfig(retention_days=value)
+
+
+def _get_retention_cutoff(retention_days: int) -> str:
+    """Return the ISO-8601 UTC cutoff timestamp ``retention_days`` ago.
+
+    Events with ``timestamp < cutoff`` are eligible for deletion.
+    ISO-8601 UTC strings are lexicographically sortable, so a string
+    comparison in SQL (``timestamp < ?``) is a correct chronological test.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+    return cutoff.isoformat(timespec="seconds")
+
+
+def _offset_iso(ts: str, minutes: int) -> str:
+    """Return ``ts`` shifted by ``minutes`` (may be negative), as ISO-8601 UTC.
+
+    ``ts`` is an ISO-8601 timestamp stored in the database.  Parsing is
+    lenient: an unparseable value falls back to "now" so the window never
+    silently expands.
+    """
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        dt = datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.astimezone(timezone.utc)
+    return (dt + timedelta(minutes=minutes)).astimezone(timezone.utc).isoformat(
+        timespec="seconds"
+    )
+
+
+def _protected_event_ids(connection: sqlite3.Connection) -> set[int]:
+    """Compute the set of event IDs that must never be deleted by retention.
+
+    An event is protected when:
+
+    1. **It is referenced by an incident** — via the ``incident_events`` join
+       table, for *any* incident (open, acknowledged, or resolved).  Even a
+       resolved incident still links its related events, and ``get_incident``
+       retrieves them, so the FK link must be preserved.
+
+    2. **It falls within the evidence window of an open alert** — the
+       evidence query in :func:`get_alert_detail` is recreated per
+       ``rule_id`` so that the protected set can never drift from what an
+       analyst would actually see:
+
+       * ``SSH_BRUTE_FORCE`` — ``ssh_login_failed`` events from the alert's
+         ``source_ip`` within ``[last_triggered_at - 5 m, last_triggered_at]``
+         (falls back to ``created_at`` when ``last_triggered_at`` is NULL).
+       * ``SURICATA_ALERT`` — ``suricata_alert`` events matching the alert's
+         NULL-safe incident key (signature identity + network 5-tuple)
+         within ``[created_at, last_triggered_at]``.
+       * Any other / unknown rule id — all events within
+         ``[created_at, last_triggered_at]`` (fail-safe: we cannot know the
+         rule-specific evidence criteria, so the entire lifetime window is
+         protected).
+    """
+    protected: set[int] = set()
+
+    # -- 1. Events referenced by incident_events (any incident) --------------
+    rows = connection.execute(
+        "SELECT DISTINCT event_id FROM incident_events WHERE event_id IS NOT NULL"
+    ).fetchall()
+    for row in rows:
+        protected.add(row[0])
+
+    # -- 2. Events within the evidence window of open alerts -----------------
+    open_alerts = connection.execute(
+        "SELECT * FROM alerts WHERE status = 'open'"
+    ).fetchall()
+
+    for alert in open_alerts:
+        rule_id = alert["rule_id"]
+        created_at = alert["created_at"]
+        # last_triggered_at is back-filled from created_at by the migration,
+        # but guard defensively for any row where it is NULL.
+        last_triggered = alert["last_triggered_at"] or created_at
+        window_end = last_triggered
+
+        if rule_id == "SSH_BRUTE_FORCE":
+            window_start = _offset_iso(window_end, -BRUTE_FORCE_WINDOW_MINUTES)
+            ids = connection.execute(
+                """
+                SELECT id FROM events
+                WHERE source_ip = ?
+                  AND event_type = 'ssh_login_failed'
+                  AND timestamp >= ?
+                  AND timestamp <= ?
+                """,
+                (alert["source_ip"], window_start, window_end),
+            ).fetchall()
+        elif rule_id == SURICATA_ALERT_RULE:
+            window_start = created_at
+            key_conditions, key_values = _suricata_incident_conditions(alert)
+            where = " AND ".join(
+                [
+                    "event_type = 'suricata_alert'",
+                    *key_conditions,
+                    "timestamp >= ?",
+                    "timestamp <= ?",
+                ]
+            )
+            ids = connection.execute(
+                f"SELECT id FROM events WHERE {where}",
+                (*key_values, window_start, window_end),
+            ).fetchall()
+        else:
+            # Unknown / future rule: protect the entire lifetime window
+            # (fail-safe — we cannot replicate the evidence query).
+            window_start = created_at
+            ids = connection.execute(
+                """
+                SELECT id FROM events
+                WHERE timestamp >= ?
+                  AND timestamp <= ?
+                """,
+                (window_start, window_end),
+            ).fetchall()
+
+        for row in ids:
+            protected.add(row[0])
+
+    return protected
+
+
+def _safe_retention_connection(db_path: str) -> sqlite3.Connection:
+    """Open a connection configured for retention work.
+
+    Mirrors the pragma settings used by :func:`_connection` (WAL, busy_timeout,
+    synchronous=NORMAL) and additionally enables foreign-key enforcement so
+    that a bug in the protection logic surfaces as a hard error rather than
+    silently leaving an orphaned ``incident_events`` row.
+    """
+    connection = sqlite3.connect(db_path, timeout=30)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA busy_timeout=30000")
+    connection.execute("PRAGMA synchronous=NORMAL")
+    connection.execute("PRAGMA foreign_keys = ON")
+    return connection
+
+
+def compute_retention_summary(retention_days: int | None) -> RetentionSummary:
+    """Compute what a retention run *would* do, without modifying data.
+
+    Returns a :class:`RetentionSummary` with ``dry_run=True``.  When
+    ``retention_days`` is ``None`` the summary reports ``disabled=True`` and
+    all counts zero.
+    """
+    config = RetentionConfig(retention_days=retention_days)
+
+    if config.retention_days is None:
+        return RetentionSummary(
+            retention_days=None,
+            disabled=True,
+            eligible_events=0,
+            protected_events=0,
+            deletable_events=0,
+            deleted_events=0,
+            dry_run=True,
+            batch_size=get_retention_batch_size(),
+            batches_run=0,
+        )
+
+    cutoff = _get_retention_cutoff(config.retention_days)
+
+    with _connection() as connection:
+        protected = _protected_event_ids(connection)
+        eligible = connection.execute(
+            "SELECT COUNT(*) FROM events WHERE timestamp < ?", (cutoff,)
+        ).fetchone()[0]
+
+        # Of the eligible events, how many are protected?
+        if protected:
+            # Use a temp table to avoid hitting SQLite's 999-parameter
+            # limit when the protected set is large.
+            connection.execute(
+                "CREATE TEMP TABLE IF NOT EXISTS _ret_prot (id INTEGER PRIMARY KEY)"
+            )
+            connection.executemany(
+                "INSERT OR IGNORE INTO _ret_prot (id) VALUES (?)",
+                [(pid,) for pid in protected],
+            )
+            connection.commit()
+            protected_count = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM events e
+                WHERE e.timestamp < ?
+                  AND EXISTS (SELECT 1 FROM _ret_prot p WHERE p.id = e.id)
+                """,
+                (cutoff,),
+            ).fetchone()[0]
+            connection.execute("DROP TABLE _ret_prot")
+            connection.commit()
+        else:
+            protected_count = 0
+
+        deletable = eligible - protected_count
+
+    return RetentionSummary(
+        retention_days=config.retention_days,
+        disabled=False,
+        eligible_events=eligible,
+        protected_events=protected_count,
+        deletable_events=deletable,
+        deleted_events=0,
+        dry_run=True,
+        batch_size=get_retention_batch_size(),
+        batches_run=0,
+    )
+
+
+def prune_events(
+    *, dry_run: bool = True, batch_size: int | None = None
+) -> RetentionSummary:
+    """Scan for and optionally delete events older than the retention period.
+
+    Workflow:
+
+    1. Read and validate :data:`RETENTION_DAYS_ENV`.  When unset / invalid the
+       function is a no-op (``disabled=True``) — **nothing is deleted**.
+    2. Compute the *protected* event set (incident references + open-alert
+       evidence windows).  These events are never deleted.
+    3. Count eligible (older than the cutoff), protected (eligible +
+       protected), and deletable events.
+    4. If ``dry_run`` is False, delete deletable events in batches of
+       ``batch_size``, committing after each batch so concurrent readers
+       (WAL) and writers (API / collectors) are not blocked for long.
+    5. After deletion, run ``PRAGMA foreign_key_check`` to verify no
+       orphaned ``incident_events`` references remain.
+
+    All parameters are read from the environment on every call, so tests
+    can flip them via ``monkeypatch.setenv``.
+
+    :param dry_run: When True (the default), no events are deleted; the
+        returned summary reports what *would* happen.
+    :param batch_size: Maximum events deleted per transaction. ``None`` (the
+        default) resolves to the validated ``GREYWATCH_RETENTION_BATCH_SIZE``
+        env var, falling back to :data:`DEFAULT_RETENTION_BATCH_SIZE`.
+    :returns: A :class:`RetentionSummary` describing the operation.
+    """
+    config = get_retention_config()
+
+    if batch_size is None:
+        batch_size = get_retention_batch_size()
+    elif batch_size <= 0:
+        # Reject explicit non-positive batch sizes at the library boundary so a
+        # misconfigured CLI / shell-wrapper value (e.g.
+        # GREYWATCH_RETENTION_BATCH_SIZE=0 forwarded by gw_retention.sh as an
+        # explicit --batch-size) can never reach the DELETE ... LIMIT clause.
+        # Such a value would delete all eligible events in a single unbounded
+        # transaction and hold the write lock indefinitely. The env-var path
+        # above already falls back to DEFAULT_RETENTION_BATCH_SIZE (>= 1), so
+        # this only guards explicitly supplied values (e.g. --batch-size).
+        raise ValueError(
+            f"batch_size must be a positive integer or None (got {batch_size!r}); "
+            "a non-positive batch size would delete all eligible events in a "
+            "single unbounded transaction."
+        )
+
+    if config.retention_days is None:
+        return RetentionSummary(
+            retention_days=None,
+            disabled=True,
+            eligible_events=0,
+            protected_events=0,
+            deletable_events=0,
+            deleted_events=0,
+            dry_run=dry_run,
+            batch_size=batch_size,
+            batches_run=0,
+        )
+
+    cutoff = _get_retention_cutoff(config.retention_days)
+    db_path = Path(os.environ.get("GREYWATCH_DB", str(DEFAULT_DB_PATH)))
+
+    # Ensure the schema exists before we query (initialize_database uses
+    # _connection which is separate; we need the tables to exist first).
+    initialize_database()
+
+    connection = _safe_retention_connection(str(db_path))
+    try:
+        # --- Compute protected set -------------------------------------------
+        protected = _protected_event_ids(connection)
+
+        # --- Stage protected IDs in a temp table -----------------------------
+        connection.execute(
+            "CREATE TEMP TABLE _retention_protected (id INTEGER PRIMARY KEY)"
+        )
+        if protected:
+            connection.executemany(
+                "INSERT OR IGNORE INTO _retention_protected (id) VALUES (?)",
+                [(pid,) for pid in sorted(protected)],
+            )
+        connection.commit()
+
+        # --- Count eligible / protected / deletable --------------------------
+        eligible = connection.execute(
+            "SELECT COUNT(*) FROM events WHERE timestamp < ?", (cutoff,)
+        ).fetchone()[0]
+
+        protected_count = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM events e
+            WHERE e.timestamp < ?
+              AND EXISTS (
+                SELECT 1 FROM _retention_protected p WHERE p.id = e.id
+              )
+            """,
+            (cutoff,),
+        ).fetchone()[0]
+
+        deletable = eligible - protected_count
+
+        # --- Delete (unless dry-run) -----------------------------------------
+        deleted = 0
+        batches = 0
+
+        if not dry_run and deletable > 0:
+            while True:
+                batch_ids = connection.execute(
+                    """
+                    SELECT id FROM events
+                    WHERE timestamp < ?
+                      AND NOT EXISTS (
+                        SELECT 1 FROM _retention_protected p
+                        WHERE p.id = events.id
+                      )
+                    ORDER BY id ASC
+                    LIMIT ?
+                    """,
+                    (cutoff, batch_size),
+                ).fetchall()
+
+                if not batch_ids:
+                    break
+
+                ids = [row[0] for row in batch_ids]
+                placeholders = ",".join("?" for _ in ids)
+                connection.execute(
+                    f"DELETE FROM events WHERE id IN ({placeholders})",
+                    ids,
+                )
+                connection.commit()
+                deleted += len(ids)
+                batches += 1
+
+            # --- Verify foreign-key integrity after deletion ------------------
+            fk_violations = connection.execute(
+                "PRAGMA foreign_key_check"
+            ).fetchall()
+            fk_violation_count = len(fk_violations)
+            if fk_violation_count:
+                # This should never happen: all incident_events references
+                # are computed into the protected set before deletion starts.
+                # If it does, raise so the operator can investigate.
+                logger.error(
+                    "retention: foreign_key_check found %d violation(s) "
+                    "after deleting %d events — investigate immediately",
+                    fk_violation_count,
+                    deleted,
+                )
+        else:
+            fk_violation_count = 0
+
+        # --- Clean up temp table ---------------------------------------------
+        connection.execute("DROP TABLE IF EXISTS _retention_protected")
+        connection.commit()
+
+        return RetentionSummary(
+            retention_days=config.retention_days,
+            disabled=False,
+            eligible_events=eligible,
+            protected_events=protected_count,
+            deletable_events=deletable,
+            deleted_events=deleted,
+            dry_run=dry_run,
+            batch_size=batch_size,
+            batches_run=batches,
+            fk_violations=fk_violation_count,
+        )
+
+    except Exception:
+        connection.rollback()
+        logger.error("retention: operation failed and was rolled back", exc_info=True)
+        raise
+    finally:
+        connection.close()
+
+
+def vacuum_database() -> dict:
+    """Run ``VACUUM`` on the Greywatch database.
+
+    .. warning::
+
+        ``VACUUM`` requires an **exclusive** write lock.  It cannot run while
+        the Greywatch API or any collector holds the database open in WAL
+        mode.  The operator **must** stop all Greywatch processes before
+        invoking this function::
+
+            sudo systemctl stop greywatch-api
+            python -m backend.app.retention --vacuum
+            sudo systemctl start greywatch-api
+
+        This function intentionally does **not** run automatically at startup
+        or during ingestion — it is an explicit maintenance operation.
+
+    :returns: A dict with ``rebuilt_db``, ``size_before``, ``size_after``,
+        and ``freed_bytes``.
+    """
+    db_path = Path(os.environ.get("GREYWATCH_DB", str(DEFAULT_DB_PATH)))
+    if not db_path.exists():
+        raise FileNotFoundError(f"database not found: {db_path}")
+
+    size_before = db_path.stat().st_size
+
+    # VACUUM rewrites the whole database into a new file and replaces the
+    # old one.  It needs an exclusive lock, so any other connection will
+    # raise "database is locked" — the caller must ensure the service is
+    # stopped.
+    connection = sqlite3.connect(str(db_path), timeout=5)
+    try:
+        connection.execute("VACUUM")
+    finally:
+        connection.close()
+
+    size_after = db_path.stat().st_size
+    return {
+        "rebuilt_db": str(db_path),
+        "size_before": size_before,
+        "size_after": size_after,
+        "freed_bytes": size_before - size_after,
     }
