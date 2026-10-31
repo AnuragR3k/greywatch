@@ -56,6 +56,7 @@ from pathlib import Path
 
 from .siem import (
     DEFAULT_RETENTION_BATCH_SIZE,
+    RETENTION_BATCH_SIZE_ENV,
     RETENTION_DAYS_ENV,
     RetentionSummary,
     get_retention_config,
@@ -66,6 +67,7 @@ from .siem import (
 # Re-export for tests / programmatic callers.
 __all__ = [
     "RETENTION_DAYS_ENV",
+    "RETENTION_BATCH_SIZE_ENV",
     "RetentionSummary",
     "get_retention_config",
     "prune_events",
@@ -143,8 +145,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=DEFAULT_RETENTION_BATCH_SIZE,
-        help=f"Maximum events to delete per transaction (default {DEFAULT_RETENTION_BATCH_SIZE}).",
+        default=None,
+        help=(
+            f"Maximum events to delete per transaction. Overrides the "
+            f"{RETENTION_BATCH_SIZE_ENV} env var; defaults to "
+            f"{DEFAULT_RETENTION_BATCH_SIZE} when unset."
+        ),
     )
     parser.add_argument(
         "--vacuum",

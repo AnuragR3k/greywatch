@@ -19,6 +19,7 @@ import pytest
 from backend.app.siem import (
     BRUTE_FORCE_WINDOW_MINUTES,
     DEFAULT_RETENTION_BATCH_SIZE,
+    RETENTION_BATCH_SIZE_ENV,
     RETENTION_DAYS_ENV,
     SURICATA_ALERT_RULE,
     RetentionSummary,
@@ -26,6 +27,7 @@ from backend.app.siem import (
     _offset_iso,
     _protected_event_ids,
     compute_retention_summary,
+    get_retention_batch_size,
     get_retention_config,
     initialize_database,
     ingest_lines,
@@ -1255,3 +1257,173 @@ def test_repeated_execution_is_idempotent(tmp_path, monkeypatch):
     with _connection() as conn:
         ids = {r[0] for r in conn.execute("SELECT id FROM events").fetchall()}
     assert ids == {protected, recent}
+
+
+# --------------------------------------------------------------------------- #
+# GREYWATCH_RETENTION_BATCH_SIZE configuration
+# --------------------------------------------------------------------------- #
+
+
+def _seed_n_old_unprotected_events(tmp_path, monkeypatch, n: int, *, batch_env: str | None = None) -> str:
+    """Create an isolated DB with ``n`` old, unprotected events.
+
+    Sets ``GREYWATCH_DB`` to a temp path, enables retention (30 days), and
+    optionally sets the ``GREYWATCH_RETENTION_BATCH_SIZE`` env var.  Returns
+    the path to the temp database.
+    """
+    db_path = tmp_path / "batch.db"
+    monkeypatch.setenv("GREYWATCH_DB", str(db_path))
+    monkeypatch.setenv(RETENTION_DAYS_ENV, "30")
+    if batch_env is not None:
+        monkeypatch.setenv(RETENTION_BATCH_SIZE_ENV, batch_env)
+    else:
+        monkeypatch.delenv(RETENTION_BATCH_SIZE_ENV, raising=False)
+    initialize_database()
+    with _connection() as conn:
+        for _ in range(n):
+            _insert_event(conn, timestamp=_old_timestamp(100))
+        conn.commit()
+    return str(db_path)
+
+
+def test_batch_size_env_var_overrides_default(monkeypatch):
+    """When GREYWATCH_RETENTION_BATCH_SIZE is set, get_retention_batch_size
+    returns the configured value instead of the 1000 default."""
+    monkeypatch.setenv(RETENTION_BATCH_SIZE_ENV, "50")
+    assert get_retention_batch_size() == 50
+
+
+def test_batch_size_unset_uses_default(monkeypatch):
+    """When the env var is unset, the documented default of 1000 is used."""
+    monkeypatch.delenv(RETENTION_BATCH_SIZE_ENV, raising=False)
+    assert get_retention_batch_size() == DEFAULT_RETENTION_BATCH_SIZE
+    assert get_retention_batch_size() == 1000
+
+
+def test_batch_size_zero_falls_back(monkeypatch):
+    """Zero is invalid (would delete nothing per batch); fall back to 1000."""
+    monkeypatch.setenv(RETENTION_BATCH_SIZE_ENV, "0")
+    assert get_retention_batch_size() == DEFAULT_RETENTION_BATCH_SIZE
+
+
+def test_batch_size_negative_falls_back(monkeypatch):
+    """Negative values are invalid; fall back to 1000."""
+    monkeypatch.setenv(RETENTION_BATCH_SIZE_ENV, "-5")
+    assert get_retention_batch_size() == DEFAULT_RETENTION_BATCH_SIZE
+
+
+def test_batch_size_non_numeric_falls_back(monkeypatch):
+    """Non-numeric values are invalid; fall back to 1000."""
+    monkeypatch.setenv(RETENTION_BATCH_SIZE_ENV, "not-a-number")
+    assert get_retention_batch_size() == DEFAULT_RETENTION_BATCH_SIZE
+
+
+def test_batch_size_zero_is_caught_before_deletion(monkeypatch):
+    """Zero must never reach the DELETE LIMIT clause; it resolves to 1000."""
+    monkeypatch.setenv(RETENTION_BATCH_SIZE_ENV, "0")
+    size = get_retention_batch_size()
+    assert size == DEFAULT_RETENTION_BATCH_SIZE
+    assert size > 0
+
+
+def test_batch_size_explicit_argument_overrides_env(tmp_path, monkeypatch):
+    """An explicit batch_size argument to prune_events must override the
+    GREYWATCH_RETENTION_BATCH_SIZE env var."""
+    monkeypatch.setenv(RETENTION_BATCH_SIZE_ENV, "7")
+    _seed_n_old_unprotected_events(tmp_path, monkeypatch, n=3)
+
+    summary = prune_events(dry_run=False, batch_size=3)
+    assert summary.batch_size == 3
+    # 3 events / 3 per batch => 1 batch
+    assert summary.batches_run == 1
+
+    with _connection() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    assert count == 0
+
+
+def test_batch_size_env_respected_by_prune(tmp_path, monkeypatch):
+    """prune_events resolves batch_size=None to the env-derived value.
+
+    With a batch size of 1 and 3 eligible events, 3 batches are required —
+    proving the env var is honoured by the engine.
+    """
+    _seed_n_old_unprotected_events(tmp_path, monkeypatch, n=3, batch_env="1")
+
+    summary = prune_events(dry_run=False, batch_size=None)
+    assert summary.batch_size == 1
+    assert summary.batches_run == 3
+    assert summary.deleted_events == 3
+
+    with _connection() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    assert count == 0
+
+
+def test_batch_size_default_respected_by_prune(tmp_path, monkeypatch):
+    """prune_events resolves batch_size=None to the default when env unset."""
+    _seed_n_old_unprotected_events(tmp_path, monkeypatch, n=3)
+
+    summary = prune_events(dry_run=False, batch_size=None)
+    assert summary.batch_size == DEFAULT_RETENTION_BATCH_SIZE
+    # 3 events / 1000 per batch => 1 batch
+    assert summary.batches_run == 1
+
+
+def test_compute_retention_summary_reports_batch_size(tmp_path, monkeypatch):
+    """compute_retention_summary reports the env-derived batch size for both
+    the disabled and the active cases."""
+    # Active case — requires a DB to count eligible events.
+    _seed_n_old_unprotected_events(tmp_path, monkeypatch, n=3, batch_env="25")
+    summary = compute_retention_summary(get_retention_config().retention_days)
+    assert summary.batch_size == 25
+
+    # Disabled case — returns early, no DB access needed.
+    monkeypatch.setenv(RETENTION_BATCH_SIZE_ENV, "42")
+    monkeypatch.delenv(RETENTION_DAYS_ENV, raising=False)
+    disabled = compute_retention_summary(None)
+    assert disabled.disabled is True
+    assert disabled.batch_size == 42
+
+
+def test_cli_main_uses_env_batch_size(tmp_path, monkeypatch, capsys):
+    """CLI --execute with --batch-size omitted resolves the env-derived value.
+
+    Env batch-size = 1 and 3 eligible events => the printed summary reports
+    'Deletion batches: 3', proving the env var reached the engine.
+    """
+    from backend.app.retention import main as retention_main
+
+    _seed_n_old_unprotected_events(tmp_path, monkeypatch, n=3, batch_env="1")
+    rc = retention_main(["--execute"])
+    assert rc == 0
+
+    captured = capsys.readouterr()
+    batch_line = next(l for l in captured.out.splitlines() if "Deletion batches" in l)
+    assert batch_line.strip().endswith("3")  # 3 events / batch 1 => 3 batches
+
+
+def test_cli_main_explicit_batch_size_overrides_env(tmp_path, monkeypatch, capsys):
+    """An explicit --batch-size wins over GREYWATCH_RETENTION_BATCH_SIZE."""
+    from backend.app.retention import main as retention_main
+
+    _seed_n_old_unprotected_events(tmp_path, monkeypatch, n=3, batch_env="7")
+    rc = retention_main(["--execute", "--batch-size", "3"])
+    assert rc == 0
+
+    captured = capsys.readouterr()
+    # explicit 3 overrides env 7 => 1 batch for 3 events
+    batch_line = next(l for l in captured.out.splitlines() if "Deletion batches" in l)
+    assert batch_line.strip().endswith("1")
+
+
+def test_cli_parser_batch_size_defaults_to_none(tmp_path, monkeypatch):
+    """The CLI --batch-size defaults to None (sentinel) so prune_events resolves
+    the env-derived value rather than hardcoding 1000 at parse time."""
+    from backend.app.retention import _build_parser
+
+    monkeypatch.setenv(RETENTION_BATCH_SIZE_ENV, "33")
+    opts = _build_parser().parse_args([])
+    assert opts.batch_size is None  # sentinel: prune_events resolves it
+    opts2 = _build_parser().parse_args(["--batch-size", "9"])
+    assert opts2.batch_size == 9

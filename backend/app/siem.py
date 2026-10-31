@@ -2033,7 +2033,7 @@ def compute_retention_summary(retention_days: int | None) -> RetentionSummary:
             deletable_events=0,
             deleted_events=0,
             dry_run=True,
-            batch_size=DEFAULT_RETENTION_BATCH_SIZE,
+            batch_size=get_retention_batch_size(),
             batches_run=0,
         )
 
@@ -2081,7 +2081,7 @@ def compute_retention_summary(retention_days: int | None) -> RetentionSummary:
         deletable_events=deletable,
         deleted_events=0,
         dry_run=True,
-        batch_size=DEFAULT_RETENTION_BATCH_SIZE,
+        batch_size=get_retention_batch_size(),
         batches_run=0,
     )
 
