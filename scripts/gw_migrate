@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""Greywatch database migration CLI tool.
+
+This script provides a command-line interface for managing database migrations.
+It wraps the runner module functions with user-friendly output.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+# Add the project root to the path so we can import from backend
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
+from backend.app.migrations.runner import (
+    MigrationConflictError,
+    MigrationError,
+    MigrationStateError,
+    migrate,
+    plan,
+    status,
+    verify,
+)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="gw_migrate",
+        description="Greywatch database migration tool",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # status command
+    sub_status = sub.add_parser("status", help="show database status")
+    sub_status.add_argument("path", help="path to the database file")
+
+    # plan command
+    sub_plan = sub.add_parser("plan", help="show pending migrations")
+    sub_plan.add_argument("path", help="path to the database file")
+
+    # verify command
+    sub_verify = sub.add_parser("verify", help="verify database is current")
+    sub_verify.add_argument("path", help="path to the database file")
+
+    # migrate command
+    sub_migrate = sub.add_parser("migrate", help="run pending migrations")
+    sub_migrate.add_argument("path", help="path to the database file")
+    sub_migrate.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="show what would be done without modifying the database",
+    )
+    sub_migrate.add_argument(
+        "--yes",
+        action="store_true",
+        help="skip confirmation prompt",
+    )
+
+    return parser
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """Handle the status command."""
+    try:
+        report = status(args.path)
+        print(f"State: {report.state.value}")
+        if report.tables:
+            print(f"Tables: {', '.join(report.tables)}")
+        if report.applied_version is not None:
+            print(f"Applied version: {report.applied_version}")
+        if report.latest_version:
+            print(f"Latest version: {report.latest_version}")
+        if report.detail:
+            print(f"Detail: {report.detail}")
+        if report.ledger_present:
+            print("Ledger present: yes")
+        else:
+            print("Ledger present: no")
+        return 0
+    except MigrationStateError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except MigrationError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
+def cmd_plan(args: argparse.Namespace) -> int:
+    """Handle the plan command."""
+    try:
+        migrations = plan(args.path)
+        if not migrations:
+            print("No pending migrations")
+            return 0
+        print(f"Pending migrations ({len(migrations)}):")
+        for m in migrations:
+            print(f"  v{m.version}: {m.name}")
+        return 0
+    except MigrationStateError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except MigrationError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    """Handle the verify command."""
+    try:
+        if verify(args.path):
+            print(f"OK: database at {args.path} is current")
+            return 0
+        else:
+            print(f"FAILED: database at {args.path} is not current", file=sys.stderr)
+            return 1
+    except MigrationStateError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except MigrationError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
+def cmd_migrate(args: argparse.Namespace) -> int:
+    """Handle the migrate command."""
+    # Dry-run doesn't require confirmation
+    if not args.dry_run and not args.yes:
+        try:
+            response = input("Apply pending migrations? [y/N] ")
+            if response.lower() != "y":
+                print("Aborted", file=sys.stderr)
+                return 1
+        except EOFError:
+            print("Aborted (no confirmation)", file=sys.stderr)
+            return 1
+
+    try:
+        result = migrate(args.path, dry_run=args.dry_run)
+
+        if args.dry_run:
+            if result["applied"] > 0:
+                print(f"Would apply {result['applied']} migration(s)")
+            else:
+                print("No migrations to apply")
+        else:
+            if result["applied"] > 0:
+                print(f"Applied {result['applied']} migration(s)")
+            else:
+                print("No migrations to apply")
+        return 0
+    except MigrationConflictError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except MigrationStateError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except MigrationError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+
+    if args.command == "status":
+        return cmd_status(args)
+    elif args.command == "plan":
+        return cmd_plan(args)
+    elif args.command == "verify":
+        return cmd_verify(args)
+    elif args.command == "migrate":
+        return cmd_migrate(args)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

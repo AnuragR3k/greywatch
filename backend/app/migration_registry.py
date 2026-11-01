@@ -130,11 +130,12 @@ class Migration:
     name: str
 
 
-#: Explicit ordered registry. Keep this empty until real migration modules
-#: exist; append ``Migration(version, name)`` entries in the same change that
-#: adds the corresponding migration file. The future runner must not infer
-#: migrations from filesystem contents.
-MIGRATIONS: tuple[Migration, ...] = ()
+#: The baseline migration establishes the current schema produced by
+#: :func:`backend.app.siem.initialize_database`. Future migrations append
+#: additional ``Migration(version, name)`` entries in the same change that adds
+#: the corresponding migration file. The future runner must not infer migrations
+#: from filesystem contents.
+MIGRATIONS: tuple[Migration, ...] = (Migration(1, "baseline"),)
 
 
 def _is_int(value: object) -> bool:
