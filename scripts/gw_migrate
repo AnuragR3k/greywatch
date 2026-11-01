@@ -139,7 +139,7 @@ def cmd_migrate(args: argparse.Namespace) -> int:
 
     try:
         result = migrate(args.path, dry_run=args.dry_run)
-        
+
         if args.dry_run:
             if result["applied"] > 0:
                 print(f"Would apply {result['applied']} migration(s)")
@@ -164,7 +164,7 @@ def cmd_migrate(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    
+
     if args.command == "status":
         return cmd_status(args)
     elif args.command == "plan":
@@ -173,7 +173,7 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_verify(args)
     elif args.command == "migrate":
         return cmd_migrate(args)
-    
+
     return 0
 
 

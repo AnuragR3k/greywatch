@@ -62,13 +62,13 @@ def fresh_db_path(tmp_path):
 def complete_db_path(tmp_path):
     """Provide a path to a database with complete schema but no ledger (LEDGER_ONLY -> PENDING)."""
     db_path = tmp_path / "complete.db"
-    
+
     # Create the database with complete schema but no ledger
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
-        
+
         # Create all application tables
         conn.execute("""
             CREATE TABLE events (
@@ -92,14 +92,14 @@ def complete_db_path(tmp_path):
                 category TEXT
             )
         """)
-        
+
         conn.execute("""
             CREATE TABLE collector_state (
                 key TEXT PRIMARY KEY,
                 value TEXT
             )
         """)
-        
+
         conn.execute("""
             CREATE TABLE alerts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -122,7 +122,7 @@ def complete_db_path(tmp_path):
                 category TEXT
             )
         """)
-        
+
         conn.execute("""
             CREATE TABLE incidents (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -140,7 +140,7 @@ def complete_db_path(tmp_path):
                 closed_at TEXT
             )
         """)
-        
+
         conn.execute("""
             CREATE TABLE incident_events (
                 incident_id INTEGER NOT NULL,
@@ -151,7 +151,7 @@ def complete_db_path(tmp_path):
                 FOREIGN KEY (event_id) REFERENCES events(id)
             )
         """)
-        
+
         # Create ALL indexes (including addable ones for PENDING state)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_events_ip_time ON events(source_ip, timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status, created_at)")
@@ -159,7 +159,7 @@ def complete_db_path(tmp_path):
         conn.execute("CREATE INDEX IF NOT EXISTS idx_incidents_rule_ip ON incidents(rule_id, source_ip, status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_incident_events_incident ON incident_events(incident_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_incident_events_event ON incident_events(event_id)")
-        
+
         # Addable indexes (required for complete schema / PENDING state)
         conn.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_events_source_record
@@ -171,11 +171,11 @@ def complete_db_path(tmp_path):
             ON events(content_hash)
             WHERE content_hash IS NOT NULL
         """)
-        
+
         conn.commit()
     finally:
         conn.close()
-    
+
     return str(db_path)
 
 
@@ -183,13 +183,13 @@ def complete_db_path(tmp_path):
 def legacy_ready_db_path(tmp_path):
     """Provide a path to a database with all tables but missing addable columns."""
     db_path = tmp_path / "legacy.db"
-    
+
     # Create a database with all tables but missing some addable columns
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
-        
+
         # Create all application tables WITHOUT addable columns
         conn.execute("""
             CREATE TABLE events (
@@ -203,14 +203,14 @@ def legacy_ready_db_path(tmp_path):
                 raw_message TEXT NOT NULL
             )
         """)
-        
+
         conn.execute("""
             CREATE TABLE collector_state (
                 key TEXT PRIMARY KEY,
                 value TEXT
             )
         """)
-        
+
         conn.execute("""
             CREATE TABLE alerts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -226,7 +226,7 @@ def legacy_ready_db_path(tmp_path):
                 last_triggered_at TEXT
             )
         """)
-        
+
         conn.execute("""
             CREATE TABLE incidents (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -244,7 +244,7 @@ def legacy_ready_db_path(tmp_path):
                 closed_at TEXT
             )
         """)
-        
+
         conn.execute("""
             CREATE TABLE incident_events (
                 incident_id INTEGER NOT NULL,
@@ -255,7 +255,7 @@ def legacy_ready_db_path(tmp_path):
                 FOREIGN KEY (event_id) REFERENCES events(id)
             )
         """)
-        
+
         # Create only non-addable indexes
         conn.execute("CREATE INDEX IF NOT EXISTS idx_events_ip_time ON events(source_ip, timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status, created_at)")
@@ -263,11 +263,11 @@ def legacy_ready_db_path(tmp_path):
         conn.execute("CREATE INDEX IF NOT EXISTS idx_incidents_rule_ip ON incidents(rule_id, source_ip, status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_incident_events_incident ON incident_events(incident_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_incident_events_event ON incident_events(event_id)")
-        
+
         conn.commit()
     finally:
         conn.close()
-    
+
     return str(db_path)
 
 
@@ -275,12 +275,12 @@ def legacy_ready_db_path(tmp_path):
 def partial_schema_db_path(tmp_path):
     """Provide a path to a database with a partial schema (subset of tables)."""
     db_path = tmp_path / "partial.db"
-    
+
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
-        
+
         # Only create 2 of 5 app tables
         conn.execute("""
             CREATE TABLE events (
@@ -294,7 +294,7 @@ def partial_schema_db_path(tmp_path):
                 raw_message TEXT NOT NULL
             )
         """)
-        
+
         conn.execute("""
             CREATE TABLE alerts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -310,11 +310,11 @@ def partial_schema_db_path(tmp_path):
                 last_triggered_at TEXT
             )
         """)
-        
+
         conn.commit()
     finally:
         conn.close()
-    
+
     return str(db_path)
 
 
@@ -322,12 +322,12 @@ def partial_schema_db_path(tmp_path):
 def ledger_only_db_path(tmp_path):
     """Provide a path to a database with only the ledger table (no app tables)."""
     db_path = tmp_path / "ledger_only.db"
-    
+
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
-        
+
         # Create only the ledger table
         conn.execute(f"""
             CREATE TABLE {SCHEMA_MIGRATIONS_TABLE} (
@@ -336,11 +336,11 @@ def ledger_only_db_path(tmp_path):
                 applied_at TEXT NOT NULL
             )
         """)
-        
+
         conn.commit()
     finally:
         conn.close()
-    
+
     return str(db_path)
 
 
@@ -348,12 +348,12 @@ def ledger_only_db_path(tmp_path):
 def ledger_with_records_db_path(tmp_path):
     """Provide a path to a database with ledger records but no app tables (invalid state)."""
     db_path = tmp_path / "ledger_with_records.db"
-    
+
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
-        
+
         # Create ledger with a record
         conn.execute(f"""
             CREATE TABLE {SCHEMA_MIGRATIONS_TABLE} (
@@ -362,7 +362,7 @@ def ledger_with_records_db_path(tmp_path):
                 applied_at TEXT NOT NULL
             )
         """)
-        
+
         from datetime import datetime, timezone
         from backend.app.migration_registry import MIGRATIONS
         utc_now = datetime.now(timezone.utc).isoformat()
@@ -370,11 +370,11 @@ def ledger_with_records_db_path(tmp_path):
             f"INSERT INTO {SCHEMA_MIGRATIONS_TABLE} (version, name, applied_at) VALUES (?, ?, ?)",
             (MIGRATIONS[0].version, MIGRATIONS[0].name, utc_now)
         )
-        
+
         conn.commit()
     finally:
         conn.close()
-    
+
     return str(db_path)
 
 
@@ -395,31 +395,31 @@ def empty_db_path(tmp_path):
 def test_missing_path_refused(tmp_path):
     """Missing database path should be refused."""
     db_path = str(tmp_path / "does_not_exist.db")
-    
+
     # Database doesn't exist
     assert not os.path.exists(db_path)
-    
+
     # status() should raise MigrationStateError for missing database
     with pytest.raises(MigrationStateError) as exc_info:
         status(db_path)
-    
+
     assert "does not exist" in str(exc_info.value)
-    
+
     # migrate() should also raise for missing path
     with pytest.raises(MigrationStateError) as exc_info:
         migrate(db_path)
-    
+
     assert "does not exist" in str(exc_info.value)
 
 
 def test_missing_path_file_remains_absent(tmp_path):
     """File should remain absent after migration attempt on missing path."""
     db_path = str(tmp_path / "does_not_exist.db")
-    
+
     # Migration attempt should fail
     with pytest.raises(MigrationStateError):
         migrate(db_path)
-    
+
     # File should still not exist
     assert not os.path.exists(db_path)
 
@@ -433,7 +433,7 @@ def test_empty_file_refused(empty_db_path):
     """Empty (zero-byte) database file should be refused."""
     with pytest.raises(MigrationStateError) as exc_info:
         status(empty_db_path)
-    
+
     assert "empty" in str(exc_info.value).lower()
 
 
@@ -441,7 +441,7 @@ def test_empty_file_migration_refused(empty_db_path):
     """Migration on empty file should be refused and file unchanged."""
     with pytest.raises(MigrationStateError):
         migrate(empty_db_path)
-    
+
     # File should remain empty (zero bytes)
     assert os.path.getsize(empty_db_path) == 0
 
@@ -455,17 +455,17 @@ def test_fresh_database_migration(fresh_db_path):
     """Fresh (non-existent tables) database should be migrated."""
     report = status(fresh_db_path)
     assert report.state == DatabaseState.FRESH
-    
+
     result = migrate(fresh_db_path)
-    
+
     assert result["applied"] == 1
     assert result["skipped"] == 0
-    
+
     # Verify the migration happened
     report = status(fresh_db_path)
     assert report.state == DatabaseState.CURRENT
     assert report.ledger_present
-    
+
     # Check ledger entry
     conn = sqlite3.connect(fresh_db_path)
     try:
@@ -481,12 +481,12 @@ def test_fresh_database_migration(fresh_db_path):
 def test_fresh_database_all_tables_present(fresh_db_path):
     """Verify all expected tables are created in fresh migration."""
     migrate(fresh_db_path)
-    
+
     conn = sqlite3.connect(fresh_db_path)
     try:
         cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
         tables = {row[0] for row in cursor.fetchall()}
-        
+
         assert "schema_migrations" in tables
         assert "events" in tables
         assert "alerts" in tables
@@ -500,9 +500,9 @@ def test_fresh_database_all_tables_present(fresh_db_path):
 def test_fresh_database_dry_run(fresh_db_path):
     """Dry run should not modify the database."""
     result = migrate(fresh_db_path, dry_run=True)
-    
+
     assert result["applied"] == 1
-    
+
     # Database should remain FRESH (not migrated)
     report = status(fresh_db_path)
     assert report.state == DatabaseState.FRESH
@@ -517,11 +517,11 @@ def test_ledger_only_empty_migration(ledger_only_db_path):
     """Database with empty ledger and no app tables should be migrated."""
     report = status(ledger_only_db_path)
     assert report.state == DatabaseState.LEDGER_ONLY
-    
+
     result = migrate(ledger_only_db_path)
-    
+
     assert result["applied"] == 1
-    
+
     # All tables should now exist
     report = status(ledger_only_db_path)
     assert report.state == DatabaseState.CURRENT
@@ -531,7 +531,7 @@ def test_ledger_only_with_records_refused(ledger_with_records_db_path):
     """Database with ledger records but no app tables should be refused."""
     report = status(ledger_with_records_db_path)
     assert report.state == DatabaseState.INCONSISTENT
-    
+
     with pytest.raises((MigrationStateError, MigrationError)):
         migrate(ledger_with_records_db_path)
 
@@ -545,14 +545,14 @@ def test_legacy_ready_with_missing_columns(legacy_ready_db_path):
     """LEGACY_READY with missing addable columns should add them."""
     report = status(legacy_ready_db_path)
     assert report.state == DatabaseState.LEGACY_READY
-    
+
     result = migrate(legacy_ready_db_path)
     assert result["applied"] == 1
-    
+
     # Verify schema is complete
     report = status(legacy_ready_db_path)
     assert report.state == DatabaseState.CURRENT
-    
+
     # Verify addable columns were added
     conn = sqlite3.connect(legacy_ready_db_path)
     try:
@@ -569,13 +569,13 @@ def test_legacy_ready_already_complete(tmp_path):
     """LEGACY_READY with already complete schema should only stamp ledger."""
     # Create a complete database with no ledger
     db_path = tmp_path / "already_complete.db"
-    
+
     # Create with all tables and columns
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
-        
+
         conn.execute("""
             CREATE TABLE events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -598,9 +598,9 @@ def test_legacy_ready_already_complete(tmp_path):
                 category TEXT
             )
         """)
-        
+
         conn.execute("CREATE TABLE collector_state (key TEXT PRIMARY KEY, value TEXT)")
-        
+
         conn.execute("""
             CREATE TABLE alerts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -623,7 +623,7 @@ def test_legacy_ready_already_complete(tmp_path):
                 category TEXT
             )
         """)
-        
+
         conn.execute("""
             CREATE TABLE incidents (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -641,7 +641,7 @@ def test_legacy_ready_already_complete(tmp_path):
                 closed_at TEXT
             )
         """)
-        
+
         conn.execute("""
             CREATE TABLE incident_events (
                 incident_id INTEGER NOT NULL,
@@ -652,7 +652,7 @@ def test_legacy_ready_already_complete(tmp_path):
                 FOREIGN KEY (event_id) REFERENCES events(id)
             )
         """)
-        
+
         conn.execute("CREATE INDEX idx_events_ip_time ON events(source_ip, timestamp)")
         conn.execute("CREATE INDEX idx_alerts_status ON alerts(status, created_at)")
         conn.execute("CREATE INDEX idx_incidents_status ON incidents(status, created_at)")
@@ -661,18 +661,18 @@ def test_legacy_ready_already_complete(tmp_path):
         conn.execute("CREATE INDEX idx_incident_events_event ON incident_events(event_id)")
         conn.execute("CREATE UNIQUE INDEX idx_events_source_record ON events(source, source_record_id) WHERE source_record_id IS NOT NULL")
         conn.execute("CREATE INDEX idx_events_content_hash ON events(content_hash) WHERE content_hash IS NOT NULL")
-        
+
         conn.commit()
     finally:
         conn.close()
-    
+
     # Should be PENDING (complete schema, no ledger)
     report = status(str(db_path))
     assert report.state == DatabaseState.PENDING
-    
+
     result = migrate(str(db_path))
     assert result["applied"] == 1  # Only ledger stamping
-    
+
     # Should now be CURRENT
     report = status(str(db_path))
     assert report.state == DatabaseState.CURRENT
@@ -688,12 +688,12 @@ def test_pending_schema_stamp_only(complete_db_path):
     report = status(complete_db_path)
     assert report.state == DatabaseState.PENDING
     assert not report.ledger_present
-    
+
     result = migrate(complete_db_path)
-    
+
     assert result["applied"] == 1
     assert result["skipped"] == 0
-    
+
     # Verify it's now current
     report = status(complete_db_path)
     assert report.state == DatabaseState.CURRENT
@@ -939,7 +939,7 @@ def test_current_is_no_op(fresh_db_path):
     # First migrate
     result1 = migrate(fresh_db_path)
     assert result1["applied"] == 1
-    
+
     # Second run should be no-op
     result2 = migrate(fresh_db_path)
     assert result2["applied"] == 0
@@ -949,20 +949,20 @@ def test_current_is_no_op(fresh_db_path):
 def test_current_remains_unchanged(fresh_db_path):
     """Running migrate on CURRENT should not modify database."""
     migrate(fresh_db_path)
-    
+
     # Get ledger count before
     conn = sqlite3.connect(fresh_db_path)
     count_before = conn.execute(f"SELECT COUNT(*) FROM {SCHEMA_MIGRATIONS_TABLE}").fetchone()[0]
     conn.close()
-    
+
     # Run migrate again
     migrate(fresh_db_path)
-    
+
     # Should still have same count
     conn = sqlite3.connect(fresh_db_path)
     count_after = conn.execute(f"SELECT COUNT(*) FROM {SCHEMA_MIGRATIONS_TABLE}").fetchone()[0]
     conn.close()
-    
+
     assert count_before == count_after == 1
 
 
@@ -975,7 +975,7 @@ def test_partial_schema_refused(partial_schema_db_path):
     """Partial schema should be refused."""
     report = status(partial_schema_db_path)
     assert report.state in (DatabaseState.LEGACY_PARTIAL, DatabaseState.LEGACY_INCOMPATIBLE)
-    
+
     with pytest.raises((MigrationStateError, MigrationError)):
         migrate(partial_schema_db_path)
 
@@ -988,13 +988,13 @@ def test_partial_schema_refused(partial_schema_db_path):
 def test_inconsistent_ledger_refused(tmp_path):
     """Ledger with gaps should be refused."""
     db_path = tmp_path / "bad_ledger.db"
-    
+
     # Create a database with inconsistent ledger (gap in versions)
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
-        
+
         # Create all tables with COMPLETE schema
         conn.execute("""
             CREATE TABLE events (
@@ -1022,7 +1022,7 @@ def test_inconsistent_ledger_refused(tmp_path):
         conn.execute("CREATE TABLE incidents (id INTEGER PRIMARY KEY, created_at TEXT, updated_at TEXT, rule_id TEXT, title TEXT, severity TEXT, status TEXT DEFAULT 'open', source_ip TEXT, description TEXT, event_count INTEGER, first_seen_at TEXT, last_seen_at TEXT)")
         conn.execute("CREATE TABLE incident_events (incident_id INTEGER NOT NULL, event_id INTEGER NOT NULL, added_at TEXT NOT NULL, PRIMARY KEY (incident_id, event_id), FOREIGN KEY (incident_id) REFERENCES incidents(id), FOREIGN KEY (event_id) REFERENCES events(id))")
         conn.execute("CREATE TABLE collector_state (key TEXT PRIMARY KEY, value TEXT)")
-        
+
         # Create indexes
         conn.execute("CREATE INDEX idx_events_ip_time ON events(source_ip, timestamp)")
         conn.execute("CREATE INDEX idx_alerts_status ON alerts(status, created_at)")
@@ -1032,7 +1032,7 @@ def test_inconsistent_ledger_refused(tmp_path):
         conn.execute("CREATE INDEX idx_incident_events_event ON incident_events(event_id)")
         conn.execute("CREATE UNIQUE INDEX idx_events_source_record ON events(source, source_record_id) WHERE source_record_id IS NOT NULL")
         conn.execute("CREATE INDEX idx_events_content_hash ON events(content_hash) WHERE content_hash IS NOT NULL")
-        
+
         # Create ledger with gap (skip version 1, add version 2)
         conn.execute(f"""
             CREATE TABLE {SCHEMA_MIGRATIONS_TABLE} (
@@ -1041,22 +1041,22 @@ def test_inconsistent_ledger_refused(tmp_path):
                 applied_at TEXT NOT NULL
             )
         """)
-        
+
         from datetime import datetime, timezone
         utc_now = datetime.now(timezone.utc).isoformat()
         conn.execute(
             f"INSERT INTO {SCHEMA_MIGRATIONS_TABLE} (version, name, applied_at) VALUES (2, 'unknown', ?)",
             (utc_now,)
         )
-        
+
         conn.commit()
     finally:
         conn.close()
-    
+
     report = status(str(db_path))
     # Should be NEWER (ledger has version 2, only v1 registered)
     assert report.state == DatabaseState.NEWER
-    
+
     with pytest.raises(MigrationError):
         migrate(str(db_path))
 
@@ -1064,13 +1064,13 @@ def test_inconsistent_ledger_refused(tmp_path):
 def test_future_ledger_version_refused(tmp_path):
     """Future ledger version should be refused."""
     db_path = tmp_path / "future.db"
-    
+
     # Create a database with ledger claiming version 99
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
-        
+
         # Create all tables
         conn.execute("""
             CREATE TABLE events (
@@ -1098,12 +1098,12 @@ def test_future_ledger_version_refused(tmp_path):
         conn.execute("CREATE TABLE incidents (id INTEGER PRIMARY KEY, created_at TEXT, updated_at TEXT, rule_id TEXT, title TEXT, severity TEXT, status TEXT DEFAULT 'open', source_ip TEXT, description TEXT, event_count INTEGER, first_seen_at TEXT, last_seen_at TEXT)")
         conn.execute("CREATE TABLE incident_events (incident_id INTEGER NOT NULL, event_id INTEGER NOT NULL, added_at TEXT NOT NULL, PRIMARY KEY (incident_id, event_id), FOREIGN KEY (incident_id) REFERENCES incidents(id), FOREIGN KEY (event_id) REFERENCES events(id))")
         conn.execute("CREATE TABLE collector_state (key TEXT PRIMARY KEY, value TEXT)")
-        
+
         conn.execute("CREATE INDEX idx_events_ip_time ON events(source_ip, timestamp)")
         conn.execute("CREATE INDEX idx_alerts_status ON alerts(status, created_at)")
         conn.execute("CREATE INDEX idx_incidents_status ON incidents(status, created_at)")
         conn.execute("CREATE INDEX idx_incidents_rule_ip ON incidents(rule_id, source_ip, status)")
-        
+
         # Future version
         conn.execute(f"""
             CREATE TABLE {SCHEMA_MIGRATIONS_TABLE} (
@@ -1112,21 +1112,21 @@ def test_future_ledger_version_refused(tmp_path):
                 applied_at TEXT NOT NULL
             )
         """)
-        
+
         from datetime import datetime, timezone
         utc_now = datetime.now(timezone.utc).isoformat()
         conn.execute(
             f"INSERT INTO {SCHEMA_MIGRATIONS_TABLE} (version, name, applied_at) VALUES (99, 'future', ?)",
             (utc_now,)
         )
-        
+
         conn.commit()
     finally:
         conn.close()
-    
+
     with pytest.raises(MigrationError) as exc_info:
         migrate(str(db_path))
-    
+
     assert "newer" in str(exc_info.value).lower() or "future" in str(exc_info.value).lower()
 
 
@@ -1139,11 +1139,11 @@ def test_valid_symlink_path(fresh_db_path, tmp_path):
     """Valid symlink should be resolved and followed."""
     # First create a database
     migrate(fresh_db_path)
-    
+
     # Create a symlink to it
     symlink_path = tmp_path / "symlink.db"
     os.symlink(fresh_db_path, str(symlink_path))
-    
+
     # Should work through the symlink
     result = migrate(str(symlink_path))
     assert result["applied"] == 0  # Already current
@@ -1153,11 +1153,11 @@ def test_broken_symlink_path(tmp_path):
     """Broken symlink should be refused."""
     symlink_path = tmp_path / "broken.db"
     os.symlink("/nonexistent/path/db.sqlite", str(symlink_path))
-    
+
     # status() should raise MigrationStateError for broken symlink
     with pytest.raises(MigrationStateError):
         status(str(symlink_path))
-    
+
     # migrate() should also fail
     with pytest.raises(MigrationStateError):
         migrate(str(symlink_path))
@@ -1178,10 +1178,10 @@ def test_special_characters_in_path(tmp_path):
     conn.execute("DROP TABLE __placeholder__")
     conn.commit()
     conn.close()
-    
+
     result = migrate(str(special_path))
     assert result["applied"] == 1
-    
+
     # Verify it works
     report = status(str(special_path))
     assert report.state == DatabaseState.CURRENT
@@ -1195,7 +1195,7 @@ def test_special_characters_in_path(tmp_path):
 def test_foreign_key_violation_check(complete_db_path):
     """Verify FK constraints exist after migration."""
     migrate(complete_db_path)
-    
+
     conn = sqlite3.connect(complete_db_path)
     try:
         # Check FK is defined on incident_events
@@ -1216,15 +1216,15 @@ def test_idempotent_migration(fresh_db_path):
     # First run
     result1 = migrate(fresh_db_path)
     assert result1["applied"] == 1
-    
+
     # Second run
     result2 = migrate(fresh_db_path)
     assert result2["applied"] == 0
-    
+
     # Verify database is still valid
     report = status(fresh_db_path)
     assert report.state == DatabaseState.CURRENT
-    
+
     # Verify only one ledger entry
     conn = sqlite3.connect(fresh_db_path)
     count = conn.execute(f"SELECT COUNT(*) FROM {SCHEMA_MIGRATIONS_TABLE}").fetchone()[0]
@@ -1240,7 +1240,7 @@ def test_idempotent_migration(fresh_db_path):
 def test_ledger_single_insert(fresh_db_path):
     """Verify only one ledger entry is created."""
     migrate(fresh_db_path)
-    
+
     conn = sqlite3.connect(fresh_db_path)
     cursor = conn.execute(f"SELECT COUNT(*) FROM {SCHEMA_MIGRATIONS_TABLE}")
     count = cursor.fetchone()[0]
@@ -1326,11 +1326,11 @@ def test_dry_run_never_writes(fresh_db_path):
     import shutil
     backup = fresh_db_path + ".backup"
     shutil.copy(fresh_db_path, backup) if os.path.exists(fresh_db_path) else None
-    
+
     # Dry run
     result = migrate(fresh_db_path, dry_run=True)
     assert result["applied"] == 1  # Would apply
-    
+
     # Database should remain FRESH
     report = status(fresh_db_path)
     assert report.state == DatabaseState.FRESH
@@ -1351,7 +1351,7 @@ def test_dry_run_no_confirmation_required(tmp_path):
     conn.execute("DROP TABLE __placeholder__")
     conn.commit()
     conn.close()
-    
+
     # Should not raise EOFError
     result = migrate(str(db_path), dry_run=True)
     assert result["applied"] == 1
