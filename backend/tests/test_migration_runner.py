@@ -930,6 +930,85 @@ def test_status_and_verify_locked_behavior(fresh_db_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# Test: other refused database states
+# --------------------------------------------------------------------------- #
+
+
+def test_unrelated_database_refused(tmp_path):
+    """A SQLite database with only non-Greywatch tables is refused unchanged."""
+    db_path = tmp_path / "unrelated.db"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("CREATE TABLE widgets (id INTEGER PRIMARY KEY, name TEXT)")
+        conn.execute("INSERT INTO widgets (name) VALUES ('keep me')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert status(str(db_path)).state == DatabaseState.UNRELATED
+
+    with pytest.raises(MigrationError, match="not a Greywatch database"):
+        migrate(str(db_path))
+
+    # Neither the unrelated table nor its data was touched.
+    conn = sqlite3.connect(str(db_path))
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        row = conn.execute("SELECT name FROM widgets WHERE id=1").fetchone()
+    finally:
+        conn.close()
+    assert tables == {"widgets"}
+    assert row == ("keep me",)
+
+
+def test_corrupt_database_refused(tmp_path):
+    """A file that is not a valid SQLite database is refused unchanged."""
+    db_path = tmp_path / "corrupt.db"
+    db_path.write_bytes(b"this is not a SQLite database\n")
+    before = db_path.read_bytes()
+
+    assert status(str(db_path)).state == DatabaseState.CORRUPT
+
+    with pytest.raises(MigrationError, match="cannot access database"):
+        migrate(str(db_path))
+
+    assert db_path.read_bytes() == before
+
+
+def test_permission_denied_database_refused(fresh_db_path, monkeypatch):
+    """A PERMISSION_DENIED inspection is refused without opening a writer.
+
+    Deterministic: the inspector's permission failure is injected instead of
+    relying on ``chmod`` semantics that vary by user (especially root).
+    """
+    from backend.app.migrations import runner as runner_module
+
+    db_path = fresh_db_path
+    original_inspect = runner_module.inspect_path
+    before = Path(db_path).read_bytes()
+
+    cause = PermissionError("permission denied")
+    denied = DatabaseReport(
+        state=DatabaseState.PERMISSION_DENIED,
+        detail=f"permission denied opening database: {cause}",
+        error=cause,
+    )
+    monkeypatch.setattr(runner_module, "inspect_path", lambda path: denied)
+
+    with pytest.raises(MigrationError, match="cannot access database") as excinfo:
+        migrate(db_path)
+
+    assert excinfo.value.__cause__ is cause
+    assert Path(db_path).read_bytes() == before
+    assert original_inspect(db_path).state == DatabaseState.FRESH
+
+
+# --------------------------------------------------------------------------- #
 # Test: CURRENT is a no-op
 # --------------------------------------------------------------------------- #
 
@@ -1288,6 +1367,15 @@ def test_plan_has_migration_for_pending(complete_db_path):
     assert len(migrations) == 1
     assert migrations[0].version == 1
     assert migrations[0].name == "baseline"
+
+
+def test_plan_fresh_returns_baseline(fresh_db_path):
+    """plan() on a FRESH database previews the baseline migration only."""
+    migrations = plan(fresh_db_path)
+
+    assert migrations == [Migration(1, "baseline")]
+    # Planning is read-only: the database is still FRESH afterwards.
+    assert status(fresh_db_path).state == DatabaseState.FRESH
 
 
 def test_plan_empty_for_missing(fresh_db_path):
