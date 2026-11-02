@@ -8,11 +8,13 @@ import os
 import re
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from contextlib import asynccontextmanager
 
 logger = logging.getLogger("greywatch.api")
 
@@ -28,9 +30,12 @@ from .siem import (
     list_alerts,
     list_events,
     resolve_incident,
+    DEFAULT_DB_PATH,
 )
 from . import collector
 from . import suricata
+from .migration_state import ensure_database_file_exists, inspect_path, DatabaseState
+from .migrations.runner import migrate, MigrationError, MigrationStateError, MigrationConflictError
 
 # Maximum HTTP request body size, in bytes. Configurable via the
 # ``GREYWATCH_MAX_REQUEST_BYTES`` environment variable; defaults to 1 MiB.
@@ -465,10 +470,199 @@ class RateLimitMiddleware:
         await self.app(scope, receive, send)
 
 
+def _get_backup_dir(require: bool = False) -> Path:
+    """Get the backup directory from environment.
+
+    Args:
+        require: If True, raise RuntimeError for missing/invalid configuration
+                 instead of returning None. Used when GREYWATCH_REQUIRE_BACKUP=1.
+
+    Returns:
+        Path to the backup directory.
+
+    Raises:
+        RuntimeError: If directory is not configured, empty, nonexistent,
+                      or not a directory (when require=True).
+    """
+    raw = os.environ.get("GREYWATCH_BACKUP_DIR", "")
+    if not raw:
+        if require:
+            raise RuntimeError(
+                "GREYWATCH_REQUIRE_BACKUP=1 is set but GREYWATCH_BACKUP_DIR "
+                "is not configured. Set GREYWATCH_BACKUP_DIR to a valid "
+                "directory path, e.g., '/var/backups/greywatch'."
+            )
+        return None  # type: ignore[return-value]
+
+    path = Path(raw)
+    if not path.exists():
+        if require:
+            raise RuntimeError(
+                f"GREYWATCH_BACKUP_DIR is set to '{path}' but the directory "
+                "does not exist. Create the directory or correct the path."
+            )
+        return None  # type: ignore[return-value]
+
+    if not path.is_dir():
+        if require:
+            raise RuntimeError(
+                f"GREYWATCH_BACKUP_DIR is set to '{path}' but it is not a "
+                "directory. Provide a valid directory path."
+            )
+        return None  # type: ignore[return-value]
+
+    return path
+
+
+def _verify_backup_exists(db_path: Path) -> Path | None:
+    """Find and verify the most recent backup.
+
+    Returns the backup path if a valid backup exists, None otherwise.
+
+    Expected verification failures (corrupt backup, inaccessible file, etc.)
+    are logged and result in None being returned, triggering fail-closed startup.
+    Truly unexpected exceptions are propagated with context.
+    """
+    import time
+    import sqlite3
+
+    from scripts.gw_db_backup import BackupError
+
+    # When backup is required, validate the directory configuration strictly
+    require_backup = os.environ.get("GREYWATCH_REQUIRE_BACKUP", "").lower() in ("1", "true", "yes", "on")
+    backup_dir = _get_backup_dir(require=require_backup)
+    if not backup_dir:
+        return None
+
+    # Find the latest backup file
+    backups = sorted(backup_dir.glob("greywatch.db.*"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not backups:
+        return None
+
+    latest_backup = backups[0]
+
+    # Check backup age against GREYWATCH_MAX_BACKUP_AGE_HOURS (default 24h)
+    max_age_hours = int(os.environ.get("GREYWATCH_MAX_BACKUP_AGE_HOURS", "24"))
+    max_age_seconds = max_age_hours * 3600
+    backup_age = time.time() - latest_backup.stat().st_mtime
+    if backup_age > max_age_seconds:
+        logger.warning(
+            f"Latest backup {latest_backup} is {backup_age / 3600:.1f}h old, "
+            f"exceeds max age of {max_age_hours}h"
+        )
+        return None
+
+    # Verify the backup is a valid SQLite database
+    try:
+        from scripts.gw_db_backup import verify_database
+        verify_database(str(latest_backup), what="backup")
+    except (sqlite3.DatabaseError, OSError, ValueError, BackupError) as exc:
+        # Expected verification failures: corrupt database, permission denied,
+        # invalid format, or BackupError from verify_database (integrity/fk check)
+        logger.warning(f"Backup verification failed for {latest_backup}: {exc}")
+        return None
+
+    return latest_backup
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan handler for database initialization.
+
+    Startup sequence:
+    1. Resolve configured database path
+    2. Ensure parent directory exists
+    3. Safely create database file if necessary (atomic publication)
+    4. Inspect migration state
+    5. If migration required, perform backup preflight (when required)
+    6. Execute migration runner
+    7. Verify final database state
+    8. Mark schema as managed by runner (guard activation)
+    9. Start application
+
+    Fails closed on any error -- application will not start.
+    """
+    # 1. Resolve database path
+    db_path = Path(os.environ.get("GREYWATCH_DB", str(DEFAULT_DB_PATH)))
+
+    # 2. Ensure parent directory exists
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 3. Safely create database file if missing
+    try:
+        ensure_database_file_exists(db_path)
+    except MigrationStateError as exc:
+        logger.error(f"Failed to create database file: {exc}")
+        raise RuntimeError(f"Database initialization failed: {exc}") from exc
+
+    # 4. Inspect migration state
+    report = inspect_path(db_path)
+
+    # 5. Check if migration is required
+    migratable_states = {
+        DatabaseState.FRESH,
+        DatabaseState.LEDGER_ONLY,
+        DatabaseState.LEGACY_READY,
+        DatabaseState.PENDING,
+    }
+
+    # Track if migration was applied
+    migration_applied = 0
+
+    # 6. Backup preflight for migratable states
+    require_backup = os.environ.get("GREYWATCH_REQUIRE_BACKUP", "").lower() in ("1", "true", "yes", "on")
+    if require_backup and report.state in migratable_states:
+        backup_path = _verify_backup_exists(db_path)
+        if backup_path is None:
+            # _verify_backup_exists will have logged the specific reason
+            raise RuntimeError(
+                f"Backup required but no valid backup found. "
+                f"Check logs for details (age, corruption, missing directory)."
+            )
+        logger.info(f"Backup verified: {backup_path}")
+
+    # 7. Execute migration if needed
+    if report.state in migratable_states:
+        try:
+            result = migrate(str(db_path), dry_run=False)
+            logger.info(f"Migration completed: {result}")
+            if result.get("applied", 0) > 0:
+                migration_applied = 1
+        except (MigrationError, MigrationStateError, MigrationConflictError) as exc:
+            logger.error(f"Migration failed: {exc}")
+            raise RuntimeError(f"Database migration failed: {exc}") from exc
+    else:
+        # For CURRENT, UNVERSIONED, etc. - no migration needed
+        logger.info(f"Database state: {report.state.value}; no migration required")
+
+    # Store migration status in app state for health endpoint
+    app.state.migration_applied = migration_applied
+    app.state.schema_ready = True
+
+    # 8. Verify final state
+    final_report = inspect_path(db_path)
+    if final_report.state not in (DatabaseState.CURRENT, DatabaseState.UNVERSIONED):
+        logger.error(f"Database in unexpected state after startup: {final_report.state.value}")
+        raise RuntimeError(
+            f"Database in unexpected state after startup: {final_report.state.value}"
+        )
+
+    # 9. Activate guard so legacy initialize_database() cannot bypass
+    from .siem import _set_schema_managed_by_runner
+    _set_schema_managed_by_runner()
+
+    logger.info("Database startup initialization complete")
+
+    yield
+
+    # Shutdown: nothing to clean up
+
+
 app = FastAPI(
     title="Greywatch API",
     description="Open-source security monitoring and SIEM platform",
     version="0.1.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(RateLimitMiddleware)
@@ -641,11 +835,39 @@ def root():
 
 
 @app.get("/health", tags=["meta"])
-def health():
+def health(request: Request):
+    # Lightweight health check - avoid PRAGMA quick_check on every request
+    # Just verify the database file exists and we can connect
+    import os
+    from pathlib import Path
+    from .siem import DEFAULT_DB_PATH, _connection
+
+    db_path = Path(os.environ.get("GREYWATCH_DB", str(DEFAULT_DB_PATH)))
+    db_exists = db_path.exists()
+
+    # Try a simple connection test without full inspection
+    schema_ready = False
+    database_state = "unknown"
+    if db_exists:
+        try:
+            with _connection() as conn:
+                conn.execute("SELECT 1").fetchone()
+            schema_ready = True
+            database_state = "connected"
+        except Exception:
+            schema_ready = False
+            database_state = "error"
+
+    # Get migration status from app state
+    migration_applied = getattr(request.app.state, "migration_applied", 0)
+
     return {
-        "status": "ok",
+        "status": "ok" if schema_ready else "degraded",
         "service": "greywatch-api",
         "version": "0.1.0",
+        "schema_ready": schema_ready,
+        "migration_applied": migration_applied,
+        "database_state": database_state,
     }
 
 
