@@ -25,7 +25,7 @@ from urllib.parse import quote
 from ..migration_ledger import SCHEMA_MIGRATIONS_TABLE, create_schema_migrations_table
 from ..migration_registry import MIGRATIONS, Migration
 from ..migration_schema import compare_schema
-from ..migration_state import DatabaseReport, DatabaseState, inspect_path
+from ..migration_state import DatabaseReport, DatabaseState, inspect_path, MigrationStateError
 from .v001_baseline import PartialSchemaError, up as up_migration
 
 if TYPE_CHECKING:
@@ -44,10 +44,6 @@ __all__ = [
 
 class MigrationError(RuntimeError):
     """Base class for migration runner errors."""
-
-
-class MigrationStateError(MigrationError):
-    """Migration cannot proceed due to database state."""
 
 
 class MigrationConflictError(MigrationError):
