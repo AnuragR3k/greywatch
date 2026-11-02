@@ -1,27 +1,42 @@
 # Greywatch Migration Runner — Operator Guide
 
-This document describes the transactional migration runner and the
-`scripts/gw_migrate` command-line tool. It covers inspection, planning,
-verification, backups, running migrations, failure handling, recovery, and the
-current limits of automatic migration.
+This document describes the transactional migration runner, the
+`scripts/gw_migrate` command-line tool, and the integrated application startup
+lifecycle. It covers inspection, planning, verification, backups, running
+migrations, failure handling, recovery, and the current limits of automatic
+migration.
 
-The migration runner is **not** invoked by application startup. Schema changes
-are an explicit operator action.
+As of this version, the migration runner **is** invoked by FastAPI application
+startup via the lifespan handler. On startup, the application:
+1. Resolves the configured database path
+2. Atomically creates the database file if missing (no-replace publication)
+3. Inspects the migration state
+4. Performs backup preflight when required by policy
+5. Executes pending migrations transactionally
+6. Verifies the final database state
+7. Starts the service only after successful initialization
+
+Manual migration via `scripts/gw_migrate` remains supported for operator-initiated
+maintenance windows.
 
 ## Contents
 
 1. [Architecture overview](#architecture-overview)
-2. [Database status inspection](#database-status-inspection)
-3. [Migration plan preview](#migration-plan-preview)
-4. [Database verification](#database-verification)
-5. [Backup creation before migration](#backup-creation-before-migration)
-6. [Running a migration interactively](#running-a-migration-interactively)
-7. [Running with `--yes`](#running-with---yes)
-8. [Dry-run behavior](#dry-run-behavior)
-9. [Failure behavior and transactional rollback](#failure-behavior-and-transactional-rollback)
-10. [Recovery by restoring a verified backup](#recovery-by-restoring-a-verified-backup)
-11. [Why automatic downgrade is unsupported](#why-automatic-downgrade-is-unsupported)
-12. [Application startup does not run migrations](#application-startup-does-not-run-migrations)
+2. [Application startup lifecycle](#application-startup-lifecycle)
+3. [Database status inspection](#database-status-inspection)
+4. [Migration plan preview](#migration-plan-preview)
+5. [Database verification](#database-verification)
+6. [Backup creation before migration](#backup-creation-before-migration)
+7. [Running a migration interactively](#running-a-migration-interactively)
+8. [Running with `--yes`](#running-with---yes)
+9. [Dry-run behavior](#dry-run-behavior)
+10. [Failure behavior and transactional rollback](#failure-behavior-and-transactional-rollback)
+11. [Recovery by restoring a verified backup](#recovery-by-restoring-a-verified-backup)
+12. [Why automatic downgrade is unsupported](#why-automatic-downgrade-is-unsupported)
+13. [Concurrent startup behavior](#concurrent-startup-behavior)
+14. [Legacy initialization guard](#legacy-initialization-guard)
+15. [Recovery instructions](#recovery-instructions)
+16. [Operational limitations](#operational-limitations)
 
 ---
 
@@ -82,7 +97,206 @@ its target.
 
 ---
 
-## Database status inspection
+## Application startup lifecycle
+
+FastAPI's lifespan handler (in `backend/app/main.py`) orchestrates database
+initialization on service startup. The sequence is:
+
+1. **Resolve database path** — reads `GREYWATCH_DB` (default:
+   `<repo>/data/greywatch.db` from `backend/app/siem.py`).
+
+2. **Ensure parent directory exists** — creates `db_path.parent` if needed.
+
+3. **Safely create database file if missing** — calls
+   `migration_state.ensure_database_file_exists()`. This uses atomic no-replace
+   publication:
+   - Creates a temporary file in the same directory.
+   - Initializes it as a valid SQLite database (`PRAGMA user_version=0`).
+   - Closes the connection (forces SQLite to write the database header/page).
+   - Verifies the temp file is a valid non-zero SQLite database (`PRAGMA quick_check`).
+   - Attempts `os.link()` to publish atomically without replacing an existing file.
+   - On `EEXIST`: another process won the race; uses their file.
+   - On `EXDEV`/`ENOTSUP`: fails closed (cross-device or filesystem without hard links).
+   - On success: explicitly unlinks the temporary pathname.
+
+   **Guarantees:** Any process inspecting the path sees either nothing or a
+   fully initialized valid SQLite database (state `FRESH`). No zero-byte window
+   is visible. No replacement of an existing destination. The temporary
+   pathname is removed after successful publication. Orphaned temporary files
+   from crashed processes are harmless and not automatically cleaned (manual
+   removal or next deployment).
+
+4. **Inspect migration state** — calls `migration_state.inspect_path()`.
+
+5. **Backup preflight (when required)** — if `GREYWATCH_REQUIRE_BACKUP=1` and
+   the database state is migratable (`FRESH`, `LEDGER_ONLY`, `LEGACY_READY`,
+   `PENDING`):
+   - Finds the latest backup in `GREYWATCH_BACKUP_DIR`.
+   - Verifies it with `scripts.gw_db_backup.verify_database()` (integrity +
+     foreign key check).
+   - Checks backup age against `GREYWATCH_MAX_BACKUP_AGE_HOURS` (default 24h).
+   - Fails startup if no valid backup exists.
+
+   **CURRENT** databases skip the backup check entirely.
+
+6. **Execute migration** — calls `migrations.runner.migrate()` if the state is
+   migratable. The runner:
+   - Opens a write connection with WAL mode and 10s busy timeout.
+   - Acquires write lock with `BEGIN IMMEDIATE`.
+   - Re-inspects under lock (state may have changed).
+   - Validates existing ledger if present.
+   - Applies baseline migration or stamps ledger.
+   - Verifies schema completeness and foreign keys.
+   - Commits transaction.
+
+7. **Verify final state** — re-inspects the database. Must be `CURRENT` or
+   `UNVERSIONED` (no migrations registered). Fails closed otherwise.
+
+8. **Activate legacy guard** — sets process-wide flag
+   `_SCHEMA_MANAGED_BY_RUNNER = True` in `siem.py` so
+   `initialize_database()` cannot bypass the migration runner after startup.
+
+9. **Start application** — only after all steps succeed.
+
+**Failure behavior:** Any error in steps 1–8 causes startup to fail closed.
+The service does not start. Errors are logged with `logger.error`. Exit code
+follows uvicorn's `STARTUP_FAILURE` (exit 3).
+
+**Health endpoint:** `GET /health` returns `schema_ready: true` when the
+database is `CURRENT` or `UNVERSIONED`, and `migration_applied: 1` if a
+migration ran during this startup.
+
+---
+
+## Concurrent startup behavior
+
+Multiple application processes starting simultaneously (e.g., behind a load
+balancer, or multiple `uvicorn` workers, or `TestClient` instances in tests)
+race to create the database file:
+
+- The first process to successfully `os.link()` its temporary file publishes
+  the database.
+- Other processes receive `EEXIST` and use the already-published database.
+- All processes then inspect the same database state and proceed through
+  migration logic.
+- The migration runner's `BEGIN IMMEDIATE` lock ensures only one process
+  actually applies the migration; others re-inspect under the lock, see
+  `CURRENT`, and no-op.
+
+**Competing publisher edge cases:**
+- **Valid destination exists:** Loser uses it (correct).
+- **Missing destination:** Fails closed — does not create a partial
+  destination.
+- **Invalid destination (corrupt/empty):** Fails closed — does not overwrite.
+
+**⚠️ Multi-worker deployment limitation:** The FastAPI lifespan handler runs
+independently in each uvicorn worker process. While the atomic file creation
+and `BEGIN IMMEDIATE` lock provide safety against corruption, there is a
+TOCTOU window between a worker's initial `inspect_path()` (step 4) and its
+`migrate()` call under lock (step 6). If Worker A publishes the database and
+completes migration before Worker B's initial inspection, Worker B may see
+`FRESH` initially, then re-inspect under lock and see `CURRENT` (no-op). This
+is safe but adds latency.
+
+However, if Worker B's initial inspection races with Worker A's WAL checkpoint
+(the `inspect_path()` WAL-copy mechanism copies the database and `-wal`/`-shm`
+separately), Worker B may observe an inconsistent intermediate state and fail
+startup with "database disappeared while acquiring lock" or similar errors.
+This is a known SQLite WAL-mode inspection limitation, not a corruption risk.
+
+**Supported deployment models:**
+- **Single uvicorn worker** (recommended for simplicity): No concurrent
+  startup race.
+- **External coordination:** Use a process manager (systemd, Kubernetes init
+  containers, etc.) to run `gw_migrate migrate` once before starting multiple
+  workers, or use a leader-election sidecar to ensure only one process runs the
+  lifespan at a time.
+- **`GREYWATCH_REQUIRE_BACKUP=1` does NOT provide concurrency coordination.**
+  It only enforces backup existence; it does not serialize startup across
+  workers.
+
+**Test isolation:** The `isolate_schema_guard` fixture in `conftest.py`
+resets the process-wide guard for each test via `monkeypatch`.
+
+---
+
+## Legacy initialization guard
+
+Once the FastAPI lifespan completes successfully, a process-wide guard
+(`_SCHEMA_MANAGED_BY_RUNNER` in `siem.py`) prevents the legacy
+`initialize_database()` from bypassing the migration runner.
+
+- Guard is checked **FIRST**, before any environment variable bypass.
+- `GREYWATCH_ALLOW_LEGACY_INIT=1` cannot bypass the guard after lifespan.
+- No production reset function exists; tests use `monkeypatch` for isolation.
+- Standalone tools/scripts can still use `initialize_database()` by setting
+  `GREYWATCH_ALLOW_LEGACY_INIT=1` (emits deprecation warning unless set).
+
+This ensures the migration runner is the single source of truth for schema
+management in production.
+
+---
+
+## Recovery instructions
+
+**Startup fails with "Database initialization failed" or "Database migration failed":**
+1. Check the logs for the specific error.
+2. If the database file is corrupt/missing, restore from a verified backup:
+   ```bash
+   sudo systemctl stop greywatch-api
+   sudo python3 ./scripts/gw_db_backup.py verify /var/backups/greywatch/greywatch.db.<timestamp>
+   sudo python3 ./scripts/gw_db_backup.py restore /var/backups/greywatch/greywatch.db.<timestamp> ./data/greywatch.db --yes
+   sudo systemctl start greywatch-api
+   ```
+3. If migration failed due to lock/contention, retry startup (the lock is
+   released on failure).
+4. If the database is in an unknown/inconsistent state (`inconsistent`,
+   `newer`, `corrupt`), do not attempt manual `ALTER`/`DROP`. Restore a
+   verified backup.
+
+**Orphaned temporary files:** Files matching `.<dbname>.init.*.tmp` in the
+database directory are from crashed initializations. They are harmless and can
+be removed manually:
+```bash
+rm -f /path/to/data/.greywatch.db.init.*.tmp
+```
+
+---
+
+## Operational limitations
+
+1. **Filesystem must support hard links** — `os.link()` is used for atomic
+   publication. Cross-device (EXDEV), NFS (ENOTSUP), and some network
+   filesystems will fail closed with a clear error. Use a local filesystem.
+
+2. **No automatic downgrade** — The baseline migration has no `down()`
+   implementation. Recovery is backup-based only.
+
+3. **Backup is a point-in-time snapshot, not an atomic restore point** — The
+   online backup API captures a consistent snapshot at backup time. Writes
+   after the backup are not included. For a true pre-migration restore point,
+   stop the service before backing up.
+
+4. **`verify_database()` does not validate backup identity** — It confirms
+   structural validity and foreign key integrity, but not that the backup
+   originated from the current source database. Manually verify backup
+   timestamps and run `gw_migrate status` against the backup if needed.
+
+5. **WAL sidecars are not atomically backed up** — The backup tool uses
+   SQLite's online backup API which converts to DELETE journal mode, so the
+   backup is a single self-contained file. Restore moves stale `-wal`/`-shm`
+   sidecars aside but does not atomically restore them with the main file.
+
+6. **Concurrent startup with external migration runner** — If an operator
+   runs `gw_migrate migrate` while application processes are starting, the
+   runner's `BEGIN IMMEDIATE` lock serializes with the lifespan's migration
+   attempt. One will apply, the other will no-op. This is safe but may cause
+   brief startup delay.
+
+7. **Orphaned temp files are not auto-cleaned** — By design, to avoid
+   deleting a temp file another active worker is initializing. They are
+   small, have distinctive names, and are never published. Clean manually or
+   on next deployment.
 
 `status` inspects the database without modifying it:
 
@@ -502,23 +716,17 @@ Recovery is therefore backup-based:
 
 ---
 
-## Application startup does not run migrations
+## Application startup lifecycle integration
 
-The migration runner is **not** wired into FastAPI startup, `uvicorn`, or
-`initialize_database()`. Starting Greywatch does not inspect the migration
-ledger, apply migrations, or fail because a migration is pending.
+As of this version, the migration runner **is** invoked by FastAPI application
+startup via the lifespan handler. On startup, the application:
+1. Resolves the configured database path
+2. Atomically creates the database file if missing (no-replace publication)
+3. Inspects the migration state
+4. Performs backup preflight when required by policy
+5. Executes pending migrations transactionally
+6. Verifies the final database state
+7. Starts the service only after successful initialization
 
-`initialize_database()` remains the existing application schema path and does
-not write the `schema_migrations` ledger. Migration execution is an explicit
-operator action through `scripts/gw_migrate`.
-
-This separation is intentional:
-
-- a service restart cannot silently alter the database schema;
-- operators choose the maintenance window and take a backup first;
-- the migration CLI can be tested and audited independently of application
-  startup.
-
-Future integration, if desired, must be a separate reviewed change. Until
-then, run `status`, take a backup, run `migrate`, and run `verify` as documented
-above.
+Manual migration via `scripts/gw_migrate` remains supported for operator-initiated
+maintenance windows.
