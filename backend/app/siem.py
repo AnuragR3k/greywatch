@@ -16,6 +16,24 @@ DEFAULT_DB_PATH = Path(__file__).resolve().parents[2] / "data" / "greywatch.db"
 logger = logging.getLogger("greywatch.siem")
 
 
+# Process-wide guard: once the migration runner has initialized the schema,
+# legacy initialize_database() must not bypass it. This guard is checked FIRST
+# before any environment variable bypass. It is set by the FastAPI lifespan
+# after successful migration runner execution. There is NO production reset
+# function; tests must isolate state using monkeypatch.
+_SCHEMA_MANAGED_BY_RUNNER = False
+
+
+def _set_schema_managed_by_runner() -> None:
+    """Mark the schema as managed by the migration runner (process-wide).
+
+    Called by FastAPI lifespan after successful migration. Once set,
+    initialize_database() will raise RuntimeError if called.
+    """
+    global _SCHEMA_MANAGED_BY_RUNNER
+    _SCHEMA_MANAGED_BY_RUNNER = True
+
+
 def is_production_db_path(path: str | Path) -> bool:
     """True if ``path`` resolves to the default production database.
 
@@ -129,6 +147,7 @@ def _connection():
         pass
     connection.execute("PRAGMA busy_timeout=5000")
     connection.execute("PRAGMA synchronous=NORMAL")
+    connection.execute("PRAGMA foreign_keys=ON")
 
     try:
         yield connection
@@ -234,7 +253,33 @@ def _migrate_events_table(connection: sqlite3.Connection) -> None:
 
 
 def initialize_database() -> None:
-    """Create Greywatch's event and alert tables if they do not exist."""
+    """Create Greywatch's event and alert tables if they do not exist.
+
+    Raises RuntimeError if the schema is managed by the migration runner
+    (i.e., FastAPI lifespan has already initialized the database).
+    """
+    # Guard: once the migration runner has initialized the schema, this
+    # legacy function must not bypass it. The guard is checked FIRST,
+    # before any environment variable bypass.
+    if _SCHEMA_MANAGED_BY_RUNNER:
+        raise RuntimeError(
+            "Database schema is managed by the migration runner; "
+            "initialize_database() cannot be called after startup."
+        )
+
+    # Allow standalone usage (e.g., scripts, tests) with explicit opt-in.
+    # This is checked AFTER the guard so production startup cannot be bypassed.
+    allow_legacy = os.environ.get("GREYWATCH_ALLOW_LEGACY_INIT", "").lower() in ("1", "true", "yes", "on")
+
+    import warnings
+    if not allow_legacy:
+        warnings.warn(
+            "initialize_database() is deprecated; use the migration runner instead. "
+            "Set GREYWATCH_ALLOW_LEGACY_INIT=1 to suppress this warning.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
     with _connection() as connection:
         connection.executescript(
             """
@@ -1226,8 +1271,6 @@ def list_incidents(
     IP when provided. The total number of matching incidents is not returned
     here; callers that need it should run :func:`count_incidents`.
     """
-    initialize_database()
-
     if offset < 0:
         offset = 0
 
@@ -1263,7 +1306,6 @@ def count_incidents(status: str = "open", source_ip: str | None = None) -> int:
     Used alongside :func:`list_incidents` so clients can compute the number of
     pages without fetching every row.
     """
-    initialize_database()
 
     with _connection() as connection:
         if source_ip is None:
@@ -1296,7 +1338,6 @@ def count_incidents(status: str = "open", source_ip: str | None = None) -> int:
 
 def get_incident(incident_id: int) -> dict | None:
     """Return an incident with its related events in chronological order."""
-    initialize_database()
 
     with _connection() as connection:
         row = connection.execute(
@@ -1337,7 +1378,6 @@ def _transition_incident(
     (``"not_found"`` or ``"invalid_transition"``). Transitions are idempotent:
     an incident already in ``to_status`` is left unchanged and reported ok.
     """
-    initialize_database()
     now_text = _now_iso()
 
     with _connection() as connection:
@@ -1417,8 +1457,6 @@ def ingest_lines(
     would require comparing stored content and is intentionally out of scope to
     keep ingestion backward-compatible.
     """
-    initialize_database()
-
     if event_ids is not None and len(event_ids) != len(lines):
         raise ValueError("event_ids must be the same length as lines")
 
@@ -1462,8 +1500,6 @@ def ingest_events(events: list[dict]) -> dict:
     directly, so structured journal fields such as exact timestamps and
     provenance survive ingestion without a round-trip through text parsing.
     """
-    initialize_database()
-
     with _connection() as connection:
         inserted_events, new_alerts, new_incidents = _store_events_and_detect(
             events, connection
@@ -1482,7 +1518,7 @@ def ingest_events(events: list[dict]) -> dict:
 
 def get_collector_setting(key: str, default: str | None = None) -> str | None:
     """Read a key/value pair from the collector_state table."""
-    initialize_database()
+
     with _connection() as connection:
         row = connection.execute(
             "SELECT value FROM collector_state WHERE key = ?",
@@ -1493,7 +1529,7 @@ def get_collector_setting(key: str, default: str | None = None) -> str | None:
 
 def set_collector_setting(key: str, value: str | None) -> None:
     """Upsert a key/value pair into the collector_state table."""
-    initialize_database()
+
     with _connection() as connection:
         connection.execute(
             """
@@ -1506,7 +1542,6 @@ def set_collector_setting(key: str, value: str | None) -> None:
 
 
 def list_events(limit: int = 100) -> list[dict]:
-    initialize_database()
 
     with _connection() as connection:
         rows = connection.execute(
@@ -1525,8 +1560,6 @@ def list_alerts(status: str = "open", limit: int = 100, offset: int = 0, source_
     IP when provided. Returns the matching rows (capped by ``limit``); callers
     that need the total should use :func:`count_alerts`.
     """
-    initialize_database()
-
     if offset < 0:
         offset = 0
 
@@ -1562,7 +1595,6 @@ def count_alerts(status: str = "all", source_ip: str | None = None) -> int:
     Used alongside :func:`list_alerts` so clients can compute the number of
     pages without fetching every row.
     """
-    initialize_database()
 
     with _connection() as connection:
         if source_ip is None:
@@ -1594,7 +1626,6 @@ def count_alerts(status: str = "all", source_ip: str | None = None) -> int:
 
 
 def close_alert(alert_id: int) -> bool:
-    initialize_database()
     closed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     with _connection() as connection:
@@ -1628,7 +1659,6 @@ def get_alert_detail(alert_id: int) -> dict | None:
     * Any other/unknown rule id yields an empty evidence set rather than a
       wrong one, so new rules fail safe.
     """
-    initialize_database()
 
     with _connection() as connection:
         row = connection.execute(
@@ -2107,6 +2137,24 @@ def prune_events(
 
     All parameters are read from the environment on every call, so tests
     can flip them via ``monkeypatch.setenv``.
+
+    .. warning::
+       This function calls :func:`initialize_database` to ensure the schema
+       exists. This uses the **legacy initialization path** which is guarded
+       by :data:`_SCHEMA_MANAGED_BY_RUNNER` after FastAPI lifespan startup.
+       Therefore:
+
+       - **Safe for standalone CLI usage** (e.g., ``gw_retention.sh``,
+         cron jobs, scripts) when ``GREYWATCH_ALLOW_LEGACY_INIT=1`` is set.
+       - **Must NOT be invoked from the guarded API process** (i.e., from
+         request handlers, background tasks, or collectors) after the
+         migration runner has initialized the schema. Doing so will raise
+         :exc:`RuntimeError` because the schema guard prevents bypassing
+         the migration runner.
+
+       If you need retention pruning in the API process, implement a
+       separate code path that assumes the schema already exists (managed
+       by the migration runner) and does not call :func:`initialize_database`.
 
     :param dry_run: When True (the default), no events are deleted; the
         returned summary reports what *would* happen.

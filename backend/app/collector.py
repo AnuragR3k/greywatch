@@ -565,7 +565,6 @@ def _persist_health_state(
     before the main checkpoint transaction opens. Wraps the upsert in a
     transaction so the counters are committed atomically.
     """
-    siem.initialize_database()
     with siem._connection() as connection:
         _set_state(
             connection,
@@ -680,7 +679,6 @@ def collect_once(config: CollectorConfig | None = None) -> CollectResult:
     """
     config = config or get_config()
     result = CollectResult()
-    siem.initialize_database()
 
     cursor = _get_cursor()
     last_event_ts = _get_last_event_ts()
@@ -934,7 +932,6 @@ def status() -> dict:
     is the most recent safe error summary; it is never a credential, token, or
     raw log message.
     """
-    siem.initialize_database()
     ingested_value = siem.get_collector_setting(_state_key_events_ingested(), "0")
     try:
         events_ingested = int(ingested_value)

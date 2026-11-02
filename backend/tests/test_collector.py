@@ -19,7 +19,6 @@ import time
 from datetime import datetime, timezone
 
 import pytest
-from fastapi.testclient import TestClient
 
 from backend.app import collector as collector_mod
 from backend.app.collector import (
@@ -29,15 +28,12 @@ from backend.app.collector import (
     parse_journal_record,
     run_journalctl,
 )
-from backend.app.main import app
 from backend.app.siem import (
     _connection,
     get_collector_setting,
     initialize_database,
     list_events,
 )
-
-client = TestClient(app)
 
 
 # --------------------------------------------------------------------------- #
@@ -105,14 +101,6 @@ class FakeJournal:
             return list(self.after or [])
         # bootstrap / fallback (--since) path
         return list(self.initial or [])
-
-
-@pytest.fixture
-def _db(tmp_path, monkeypatch):
-    """Point the collector + API at a fresh temp database for the test."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "test.db"))
-    initialize_database()
-    yield tmp_path
 
 
 @pytest.fixture
@@ -408,7 +396,7 @@ def test_run_journalctl_passes_each_output_flag_once(tmp_path, monkeypatch):
 
 
 
-def test_collect_ingests_journal_events(_db, patch_journal):
+def test_collect_ingests_journal_events(api_client, patch_journal):
     patch_journal.initial = [
         rec("c1", "2026-10-13T10:00:00+00:00",
             "pam_unix(sudo:session): session opened for user root by ry3k(uid=1000)",
@@ -434,7 +422,7 @@ def test_collect_ingests_journal_events(_db, patch_journal):
     assert rows[2]["source_ip"] == "203.0.113.10"
 
 
-def test_collect_preserves_timestamp_hostname_and_raw(_db, patch_journal):
+def test_collect_preserves_timestamp_hostname_and_raw(api_client, patch_journal):
     patch_journal.initial = [
         rec("c1", "2026-10-13T10:00:00+00:00",
             "pam_unix(sudo:session): session opened for user root "
@@ -452,7 +440,7 @@ def test_collect_preserves_timestamp_hostname_and_raw(_db, patch_journal):
     assert rows[0]["source"] == "journal"
 
 
-def test_collect_advances_checkpoint(_db, patch_journal):
+def test_collect_advances_checkpoint(api_client, patch_journal):
     patch_journal.initial = [
         rec("c1", "2026-10-13T10:00:00+00:00",
             "pam_unix(sudo:session): session opened for user root by ry3k(uid=1000)"),
@@ -466,7 +454,7 @@ def test_collect_advances_checkpoint(_db, patch_journal):
     assert get_collector_setting("journal_last_run_at") is not None
 
 
-def test_collect_restart_does_not_duplicate(_db, patch_journal):
+def test_collect_restart_does_not_duplicate(api_client, patch_journal):
     """Checkpoint recovery: a second cycle must not re-ingest already-stored."""
     patch_journal.initial = [
         rec("c1", "2026-10-13T10:00:00+00:00",
@@ -487,7 +475,7 @@ def test_collect_restart_does_not_duplicate(_db, patch_journal):
     assert get_collector_setting("journal_last_cursor") == "c1"
 
 
-def test_collect_within_batch_dedup_by_cursor(_db, patch_journal):
+def test_collect_within_batch_dedup_by_cursor(api_client, patch_journal):
     """Two identical records (same cursor) in one batch must yield one event."""
     dup = rec("cDUP", "2026-10-13T10:00:00+00:00",
               "pam_unix(sudo:session): session opened for user root by ry3k(uid=1000)")
@@ -500,7 +488,7 @@ def test_collect_within_batch_dedup_by_cursor(_db, patch_journal):
     assert len(_event_rows()) == 2
 
 
-def test_collect_cursor_replay_across_cycles_not_duplicated(_db, patch_journal):
+def test_collect_cursor_replay_across_cycles_not_duplicated(api_client, patch_journal):
     """Re-ingesting the same journal cursor on a later cycle must not create a
     duplicate event (source_record_id dedup enforced by the unique index)."""
     same = rec("cREPLAY", "2026-10-13T10:00:00+00:00",
@@ -522,7 +510,7 @@ def test_collect_cursor_replay_across_cycles_not_duplicated(_db, patch_journal):
     assert len(_event_rows()) == 1  # still exactly one logical event
 
 
-def test_collect_fallback_on_invalid_cursor(_db, patch_journal):
+def test_collect_fallback_on_invalid_cursor(api_client, patch_journal):
     """When the cursor is invalid, fall back to --since and still advance."""
     patch_journal.initial = [
         rec("cB1", "2026-10-13T10:00:00+00:00",
@@ -549,7 +537,7 @@ def test_collect_fallback_on_invalid_cursor(_db, patch_journal):
     assert len(_event_rows()) == 3
 
 
-def test_collect_fallback_no_duplicates_on_overlap(_db, patch_journal):
+def test_collect_fallback_no_duplicates_on_overlap(api_client, patch_journal):
     """A --since fallback that re-reads already-ingested records must not
     create duplicates (deduplication against recently-stored events)."""
     patch_journal.initial = [
@@ -578,7 +566,7 @@ def test_collect_fallback_no_duplicates_on_overlap(_db, patch_journal):
     assert len(_event_rows()) == 3
 
 
-def test_idle_cycle_advances_last_run_at(_db, patch_journal):
+def test_idle_cycle_advances_last_run_at(api_client, patch_journal):
     """A steady-state poll that finds no new journal records must still
     refresh the checkpoint's ``last_run_at``.
 
@@ -611,7 +599,7 @@ def test_idle_cycle_advances_last_run_at(_db, patch_journal):
     assert get_collector_setting("journal_last_cursor") == "cursor-prev"
 
 
-def test_journal_sshd_events_trigger_brute_force(_db, patch_journal):
+def test_journal_sshd_events_trigger_brute_force(api_client, patch_journal):
     """Regression: journal-sourced sshd failures still raise SSH_BRUTE_FORCE."""
     ip = "203.0.113.10"
     patch_journal.initial = [
@@ -631,13 +619,13 @@ def test_journal_sshd_events_trigger_brute_force(_db, patch_journal):
     assert result.new_alerts[0]["severity"] == "high"
 
     # Verify end-to-end via the API as well.
-    resp = client.get("/api/v1/alerts")
+    resp = api_client.get("/api/v1/alerts")
     assert resp.status_code == 200
     alerts = resp.json()["alerts"]
     assert any(a["rule_id"] == "SSH_BRUTE_FORCE" for a in alerts)
 
 
-def test_journal_records_produce_brute_force_evidence(_db, patch_journal):
+def test_journal_records_produce_brute_force_evidence(api_client, patch_journal):
     """Full chain: journal record -> parsed event -> SQLite -> alert -> evidence.
 
     Journal-sourced sshd failures are normalized by ``parse_journal_record``
@@ -682,7 +670,7 @@ def test_journal_records_produce_brute_force_evidence(_db, patch_journal):
     assert sum(1 for r in rows if r["event_type"] == "ssh_login_failed") == 5
 
     # SQLite -> alert -> evidence (via the real alert-detail API)
-    detail = client.get(f"/api/v1/alerts/{alert['id']}").json()
+    detail = api_client.get(f"/api/v1/alerts/{alert['id']}").json()
     assert detail["alert"]["rule_id"] == "SSH_BRUTE_FORCE"
     assert detail["alert"]["source_ip"] == attack_ip
     assert detail["alert"]["event_count"] == 5
@@ -696,7 +684,7 @@ def test_journal_records_produce_brute_force_evidence(_db, patch_journal):
     assert not any("session opened" in e["raw_message"] for e in evidence)
 
 
-def test_ingest_events_runs_detection_and_preserves_source(_db):
+def test_ingest_events_runs_detection_and_preserves_source(api_client):
     """The structured-events path stores provenance and runs detection."""
     from backend.app.siem import ingest_events
 
@@ -730,8 +718,8 @@ def test_ingest_events_runs_detection_and_preserves_source(_db):
 # --------------------------------------------------------------------------- #
 
 
-def test_journal_status_endpoint(_db):
-    resp = client.get("/api/v1/journal/status")
+def test_journal_status_endpoint(api_client):
+    resp = api_client.get("/api/v1/journal/status")
     assert resp.status_code == 200
     body = resp.json()
     assert "enabled" in body and "last_cursor" in body
@@ -743,17 +731,16 @@ def test_journal_status_endpoint(_db):
 # --------------------------------------------------------------------------- #
 
 
-def test_journal_status_health_fields_after_successful_run(_db, patch_journal, monkeypatch):
+def test_journal_status_health_fields_after_successful_run(api_client, patch_journal):
     """A successful collection cycle records attempts, successful_runs,
     last_successful_run_at, records_seen and deduplicated."""
-    monkeypatch.setenv("GREYWATCH_DB", str(_db / "health.db"))
     patch_journal.initial = [
         rec("c1", "2026-10-13T10:00:00+00:00",
             "pam_unix(sudo:session): session opened for user root by ry3k(uid=1000)"),
     ]
     collect_once(collector_mod.CollectorConfig())
 
-    body = client.get("/api/v1/journal/status").json()
+    body = api_client.get("/api/v1/journal/status").json()
     assert body["attempts"] == 1
     assert body["successful_runs"] == 1
     assert body["failed_runs"] == 0
@@ -765,10 +752,9 @@ def test_journal_status_health_fields_after_successful_run(_db, patch_journal, m
     assert body["last_attempt_at"] == body["last_successful_run_at"]
 
 
-def test_journal_failed_run_records_error_not_success(_db, patch_journal, monkeypatch):
+def test_journal_failed_run_records_error_not_success(api_client, patch_journal, monkeypatch):
     """A failed cycle (journalctl error) advances attempts/failed_runs and
     last_error, but does NOT advance last_successful_run_at."""
-    monkeypatch.setenv("GREYWATCH_DB", str(_db / "fail.db"))
     # First: a successful run to establish a baseline.
     patch_journal.initial = [
         rec("c1", "2026-10-13T10:00:00+00:00",
@@ -776,7 +762,7 @@ def test_journal_failed_run_records_error_not_success(_db, patch_journal, monkey
     ]
     first = collect_once(collector_mod.CollectorConfig())
     assert first.events_ingested == 1
-    before = client.get("/api/v1/journal/status").json()
+    before = api_client.get("/api/v1/journal/status").json()
     assert before["successful_runs"] == 1
     assert before["failed_runs"] == 0
     successful_run_at = before["last_successful_run_at"]
@@ -788,7 +774,7 @@ def test_journal_failed_run_records_error_not_success(_db, patch_journal, monkey
     second = collect_once(collector_mod.CollectorConfig())
     assert second.errors
 
-    body = client.get("/api/v1/journal/status").json()
+    body = api_client.get("/api/v1/journal/status").json()
     assert body["attempts"] == 2
     assert body["failed_runs"] == 1
     assert body["successful_runs"] == 1  # unchanged by the failed cycle
@@ -798,10 +784,9 @@ def test_journal_failed_run_records_error_not_success(_db, patch_journal, monkey
     assert body["last_successful_run_at"] == successful_run_at
 
 
-def test_journal_idle_run_is_successful(_db, patch_journal, monkeypatch):
+def test_journal_idle_run_is_successful(api_client, patch_journal):
     """A cycle that finds nothing new is still a successful run (idle, not
     failed): last_successful_run_at advances, failed_runs stays 0."""
-    monkeypatch.setenv("GREYWATCH_DB", str(_db / "idle.db"))
     # Seed a cursor so the incremental path is taken and returns nothing.
     collector_mod.siem.set_collector_setting("journal_last_cursor", "cursor-prev")
     patch_journal.after = []
@@ -810,17 +795,16 @@ def test_journal_idle_run_is_successful(_db, patch_journal, monkeypatch):
     assert result.events_ingested == 0
     assert result.errors == []
 
-    body = client.get("/api/v1/journal/status").json()
+    body = api_client.get("/api/v1/journal/status").json()
     assert body["attempts"] == 1
     assert body["successful_runs"] == 1
     assert body["failed_runs"] == 0
     assert body["last_successful_run_at"] == body["last_attempt_at"]
 
 
-def test_journal_dedup_tracked_across_replay(_db, patch_journal, monkeypatch):
+def test_journal_dedup_tracked_across_replay(api_client, patch_journal):
     """records_seen and deduplicated are tracked when the same cursor is
     replayed across cycles."""
-    monkeypatch.setenv("GREYWATCH_DB", str(_db / "dedup.db"))
     same = rec("cREPLAY", "2026-10-13T10:00:00+00:00",
                "Failed password for invalid user admin from 203.0.113.10 "
                "port 54001 ssh2", ident="sshd")
@@ -833,20 +817,19 @@ def test_journal_dedup_tracked_across_replay(_db, patch_journal, monkeypatch):
     second = collect_once(collector_mod.CollectorConfig())
     assert second.events_ingested == 0  # replay skipped
 
-    body = client.get("/api/v1/journal/status").json()
+    body = api_client.get("/api/v1/journal/status").json()
     assert body["records_seen"] == 1  # last cycle saw 1 record
     assert body["deduplicated"] == 1  # that record was a replay
     assert body["attempts"] == 2
     assert body["successful_runs"] == 2
 
 
-def test_journal_disabled_collector_status(_db, monkeypatch):
+def test_journal_disabled_collector_status(api_client, monkeypatch):
     """A disabled collector reports enabled=false without collecting."""
-    monkeypatch.setenv("GREYWATCH_DB", str(_db / "disabled.db"))
     monkeypatch.setenv("GREYWATCH_JOURNAL_ENABLED", "0")
     assert collector_mod.get_config().enabled is False
 
-    body = client.get("/api/v1/journal/status").json()
+    body = api_client.get("/api/v1/journal/status").json()
     assert body["enabled"] is False
 
 
@@ -858,7 +841,7 @@ def body_has_health(body):
     return True
 
 
-def test_journal_collect_endpoint_uses_collector(_db, monkeypatch):
+def test_journal_collect_endpoint_uses_collector(api_client, monkeypatch):
     payload = {
         "__CURSOR": "ep1",
         "__REALTIME_TIMESTAMP": _us("2026-10-13T10:00:00+00:00"),
@@ -871,18 +854,18 @@ def test_journal_collect_endpoint_uses_collector(_db, monkeypatch):
     )
     monkeypatch.setattr(collector_mod, "get_config", lambda: collector_mod.CollectorConfig())
 
-    resp = client.post("/api/v1/journal/collect")
+    resp = api_client.post("/api/v1/journal/collect")
     assert resp.status_code == 200
     body = resp.json()
     assert body["events_ingested"] == 1
 
-    resp = client.get("/api/v1/events?limit=10")
+    resp = api_client.get("/api/v1/events?limit=10")
     assert resp.status_code == 200
     events = resp.json()["events"]
     assert any(e["source"] == "journal" for e in events)
 
 
-def test_journal_collect_falls_back_when_journalctl_missing(_db, monkeypatch):
+def test_journal_collect_falls_back_when_journalctl_missing(api_client, monkeypatch):
     """If journalctl is unavailable the API reports the error, not a 500."""
 
     def _raise_missing(args, **kwargs):
@@ -891,14 +874,14 @@ def test_journal_collect_falls_back_when_journalctl_missing(_db, monkeypatch):
     monkeypatch.setattr(collector_mod, "get_config", lambda: collector_mod.CollectorConfig())
     monkeypatch.setattr(collector_mod, "run_journalctl", _raise_missing)
 
-    resp = client.post("/api/v1/journal/collect")
+    resp = api_client.post("/api/v1/journal/collect")
     assert resp.status_code == 200
     body = resp.json()
     assert body["events_ingested"] == 0
     assert body["errors"]
 
 
-def test_journal_collect_error_sanitizes_command_path(_db, monkeypatch):
+def test_journal_collect_error_sanitizes_command_path(api_client, monkeypatch):
     """Journalctl error must not expose the configured command filesystem path
     in the API response."""
 
@@ -911,7 +894,7 @@ def test_journal_collect_error_sanitizes_command_path(_db, monkeypatch):
     monkeypatch.setattr(collector_mod, "get_config", lambda: collector_mod.CollectorConfig())
     monkeypatch.setattr(collector_mod, "run_journalctl", _raise_missing)
 
-    resp = client.post("/api/v1/journal/collect")
+    resp = api_client.post("/api/v1/journal/collect")
     assert resp.status_code == 200
     body = resp.json()
     assert body["events_ingested"] == 0
@@ -933,17 +916,24 @@ def test_events_source_column_added_to_legacy_db(tmp_path, monkeypatch):
     legacy = _open_legacy_db(tmp_path / "legacy.db")
     legacy.close()
 
+    # Run migration on the legacy database before starting the app
     initialize_database()
 
-    with _connection() as conn:
-        cols = {row["name"] for row in conn.execute("PRAGMA table_info(events)").fetchall()}
-    assert "source" in cols
-    # collector_state table is created too.
-    with _connection() as conn:
-        tables = {row["name"] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()}
-    assert "collector_state" in tables
+    # Create a TestClient with the legacy database to test the migration
+    import os
+    from backend.app.main import app
+    from starlette.testclient import TestClient
+    os.environ["GREYWATCH_DB"] = str(tmp_path / "legacy.db")
+    with TestClient(app) as client:
+        with _connection() as conn:
+            cols = {row["name"] for row in conn.execute("PRAGMA table_info(events)").fetchall()}
+        assert "source" in cols
+        # collector_state table is created too.
+        with _connection() as conn:
+            tables = {row["name"] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+        assert "collector_state" in tables
 
 
 def _open_legacy_db(path):
@@ -972,7 +962,7 @@ def _open_legacy_db(path):
 # --------------------------------------------------------------------------- #
 
 
-def test_run_loop_survives_transcient_collection_error(monkeypatch, tmp_path, caplog):
+def test_run_loop_survives_transcient_collection_error(tmp_path, monkeypatch, caplog):
     """A single failed cycle must not abort the continuous collector loop.
 
     ``collect_once`` already converts ``JournalctlError`` into result.errors,
@@ -1071,7 +1061,7 @@ def _journal_is_writable_and_readable() -> bool:
     return False
 
 
-def test_real_journal_collects_controlled_event(_db):
+def test_real_journal_collects_controlled_event(tmp_path, monkeypatch):
     """End-to-end against the live systemd journal.
 
     Injects a uniquely-marked event with ``logger`` (the canonical journal
@@ -1083,6 +1073,10 @@ def test_real_journal_collects_controlled_event(_db):
     """
     if not _journal_is_writable_and_readable():
         pytest.skip("requires a writable/readable systemd journal")
+
+    # Use a temp database for this test
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "real_journal.db"))
+    initialize_database()
 
     marker = f"grewatch-e2e-{int(time.time())}"
     msg = (

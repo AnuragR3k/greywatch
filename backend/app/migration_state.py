@@ -94,6 +94,7 @@ State semantics
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 import sqlite3
@@ -137,7 +138,14 @@ __all__ = [
     "inspect_path",
     "is_greywatch_database",
     "classify_sqlite_error",
+    "MigrationStateError",
+    "ensure_database_file_exists",
 ]
+
+
+class MigrationStateError(RuntimeError):
+    """Database state prevents migration or initialization."""
+    pass
 
 
 class DatabaseState(str, Enum):
@@ -748,6 +756,130 @@ def inspect_path(
         return report
     finally:
         _maybe_cleanup(connection, tmp_dir)
+
+
+def _is_valid_sqlite_database(path: str) -> bool:
+    """
+    Verify that `path` is a valid SQLite database with a proper header.
+
+    Returns True if:
+    - File exists and is non-zero
+    - SQLite can open it and read PRAGMA user_version
+    - PRAGMA quick_check returns ok
+    """
+    try:
+        if not os.path.exists(path):
+            return False
+        if os.path.getsize(path) == 0:
+            return False
+
+        conn = sqlite3.connect(path)
+        try:
+            # Verify we can read the database header
+            version = conn.execute("PRAGMA user_version").fetchone()
+            if version is None:
+                return False
+            # Optional: quick integrity check
+            integrity = conn.execute("PRAGMA quick_check").fetchone()
+            if integrity != ("ok",):
+                return False
+            return True
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError):
+        return False
+
+
+def ensure_database_file_exists(db_path: Path) -> None:
+    """
+    Atomically ensure a valid empty SQLite database exists at db_path.
+
+    Strategy:
+    1. If destination exists, return immediately (another process published).
+    2. Create temp file in SAME directory.
+    3. Initialize temp file as valid SQLite (PRAGMA user_version=0).
+    4. CLOSE connection -- this forces SQLite to write the database header/page.
+    5. VERIFY the temp file is a valid non-zero SQLite database.
+    6. Attempt atomic no-replace publication via os.link().
+    7. On FileExistsError (EEXIST): another process won -> use their file.
+    8. On other OSError (cross-device, no link support): FAIL CLOSED.
+    9. On successful publication: explicitly unlink the temporary pathname.
+    10. Clean up temp file on any error.
+
+    Guarantees:
+    - Any process inspecting db_path sees either nothing or a fully initialized
+      valid SQLite database (FRESH state).
+    - No zero-byte window visible to other processes.
+    - No replacement of an existing destination.
+    - Temporary pathname is removed after successful publication.
+
+    Orphaned temporary files from crashed processes are NOT automatically cleaned.
+    They are harmless (small, distinctive names, never published) and can be
+    removed manually or on next deployment. Automatic cleanup would risk deleting
+    a temp file another active worker is still initializing.
+    """
+    if db_path.exists():
+        return
+
+    tmp_path = None
+    try:
+        # Create temp file in same directory
+        fd, tmp_path = tempfile.mkstemp(
+            dir=db_path.parent,
+            prefix=f".{db_path.name}.init.",
+            suffix=".tmp"
+        )
+        os.close(fd)
+
+        # Initialize as valid SQLite database
+        conn = sqlite3.connect(tmp_path)
+        try:
+            conn.execute("PRAGMA user_version=0")
+            conn.commit()
+        finally:
+            conn.close()
+
+        # CRITICAL: Verify the temp file is a valid non-zero SQLite database
+        # before attempting publication.
+        if not _is_valid_sqlite_database(tmp_path):
+            raise MigrationStateError(
+                f"Failed to initialize valid SQLite database at {tmp_path}"
+            )
+
+        # Atomic no-replace publication via hard link
+        try:
+            os.link(tmp_path, str(db_path))
+        except OSError as exc:
+            if exc.errno == errno.EEXIST:
+                # Another process published first
+                return
+            elif exc.errno in (errno.EXDEV, errno.EPERM, errno.ENOTSUP):
+                raise MigrationStateError(
+                    f"Cannot atomically publish database: {exc}. "
+                    f"Filesystem must support hard links (no cross-device, no NFS)."
+                ) from exc
+            else:
+                raise MigrationStateError(
+                    f"Failed to publish database: {exc}"
+                ) from exc
+        else:
+            # Publication succeeded -- explicitly unlink the temporary pathname
+            # The destination now has the same inode; our temp name is no longer needed.
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                # If unlink fails, the file is still published correctly.
+                # The temp name is leaked but harmless.
+                pass
+            tmp_path = None  # Ownership transferred; finally block will not unlink
+
+    finally:
+        # Safety net: clean up temp file only if publication failed
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 def is_greywatch_database(connection: sqlite3.Connection) -> bool:

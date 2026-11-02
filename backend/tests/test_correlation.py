@@ -14,7 +14,6 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from fastapi.testclient import TestClient
 
 from backend.app import main
 from backend.app.siem import (
@@ -25,8 +24,6 @@ from backend.app.siem import (
     initialize_database,
     list_incidents,
 )
-
-client = TestClient(main.app)
 
 TOKEN = "test-secret-token-correlation"
 
@@ -104,9 +101,8 @@ def _ingest(events: list[dict], *, db_path) -> dict:
 # --------------------------------------------------------------------------- #
 
 
-def test_valid_correlation_creates_incident(tmp_path, _window_env, monkeypatch):
+def test_valid_correlation_creates_incident(api_client, _window_env):
     """Five failures plus a same-IP success within the window -> one incident."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "valid.db"))
     events = [
         *_failures(5, ATTACK_IP, start_minutes_ago=20),
         _ssh_event("ssh_login_success", ATTACK_IP, -14),
@@ -134,9 +130,8 @@ def test_valid_correlation_creates_incident(tmp_path, _window_env, monkeypatch):
     assert all(e["source_ip"] == ATTACK_IP for e in detail["related_events"])
 
 
-def test_nonmatching_ip_no_incident(tmp_path, _window_env, monkeypatch):
+def test_nonmatching_ip_no_incident(api_client, _window_env):
     """A success from a different source IP must not correlate."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "nomatch.db"))
     events = [
         *_failures(5, ATTACK_IP, start_minutes_ago=20),
         _ssh_event("ssh_login_success", OTHER_IP, -14),
@@ -147,9 +142,8 @@ def test_nonmatching_ip_no_incident(tmp_path, _window_env, monkeypatch):
     assert list_incidents(status="all") == []
 
 
-def test_success_outside_window_no_incident(tmp_path, monkeypatch):
+def test_success_outside_window_no_incident(api_client, monkeypatch):
     """A success outside the correlation window must not correlate."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "oow.db"))
     monkeypatch.setenv("GREYWATCH_CORRELATION_WINDOW_MINUTES", "60")
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(minutes=60)
@@ -172,13 +166,12 @@ def test_success_outside_window_no_incident(tmp_path, monkeypatch):
     assert list_incidents(status="all") == []
 
 
-def test_failures_without_success_no_incident(tmp_path, _window_env, monkeypatch):
+def test_failures_without_success_no_incident(api_client, _window_env):
     """Threshold failures alone produce an alert but no correlation incident.
 
     The successful-login signal is genuinely absent; the framework is in place
     but the complete attack pattern is not claimed.
     """
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "nosuccess.db"))
     # Failures inside the 5-minute brute-force window but with no success.
     result = ingest_events(_failures(5, ATTACK_IP, start_minutes_ago=4))
 
@@ -188,9 +181,8 @@ def test_failures_without_success_no_incident(tmp_path, _window_env, monkeypatch
     assert list_incidents(status="all") == []
 
 
-def test_missing_source_ip_or_timestamp_skipped(tmp_path, _window_env, monkeypatch):
+def test_missing_source_ip_or_timestamp_skipped(api_client, _window_env):
     """Events lacking a usable source IP or timestamp are skipped, not crashed."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "missing.db"))
     events = [
         *_failures(5, ATTACK_IP, start_minutes_ago=20),
         # Success with no source IP.
@@ -204,9 +196,8 @@ def test_missing_source_ip_or_timestamp_skipped(tmp_path, _window_env, monkeypat
     assert list_incidents(status="all") == []
 
 
-def test_duplicate_evaluation_no_duplicate_incident(tmp_path, _window_env, monkeypatch):
+def test_duplicate_evaluation_no_duplicate_incident(api_client, _window_env):
     """Re-ingesting the same pattern creates exactly one incident."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "dup.db"))
     events = [
         *_failures(5, ATTACK_IP, start_minutes_ago=20),
         _ssh_event("ssh_login_success", ATTACK_IP, -14),
@@ -225,14 +216,13 @@ def test_duplicate_evaluation_no_duplicate_incident(tmp_path, _window_env, monke
 
 
 def test_success_alone_without_preceding_failures_no_incident(
-    tmp_path, _window_env, monkeypatch
+    api_client, _window_env
 ):
     """A successful login with no preceding brute-force failures yields nothing.
 
     Negative case: the missing failed-login signal is not fabricated, so a bare
     success is neither an alert nor an incident.
     """
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "successalone.db"))
     result = ingest_events([_ssh_event("ssh_login_success", ATTACK_IP, -14)])
 
     assert result["incidents"] == []
@@ -241,12 +231,11 @@ def test_success_alone_without_preceding_failures_no_incident(
 
 
 def test_correlation_at_exact_window_boundary_incident(
-    tmp_path, monkeypatch
+    api_client, monkeypatch
 ):
     """Failures exactly one correlation window before the success are counted
     (the failure window's lower bound is inclusive). The success is placed well
     inside the now-relative window to avoid clock-drift flakiness."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "boundary.db"))
     monkeypatch.setenv("GREYWATCH_CORRELATION_WINDOW_MINUTES", "60")
     success = _ssh_event("ssh_login_success", ATTACK_IP, -30)
     success_dt = datetime.fromisoformat(
@@ -266,10 +255,9 @@ def test_correlation_at_exact_window_boundary_incident(
 
 
 def test_correlation_failures_just_outside_window_no_incident(
-    tmp_path, monkeypatch
+    api_client, monkeypatch
 ):
     """Failures just before the window lower bound are not counted."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "boundaryoo.db"))
     monkeypatch.setenv("GREYWATCH_CORRELATION_WINDOW_MINUTES", "60")
     success = _ssh_event("ssh_login_success", ATTACK_IP, -30)
     success_dt = datetime.fromisoformat(
@@ -291,11 +279,10 @@ def test_correlation_failures_just_outside_window_no_incident(
 
 
 def test_correlation_out_of_order_events_incident(
-    tmp_path, _window_env, monkeypatch
+    api_client, _window_env
 ):
     """Event list order does not matter; correlation is driven by stored
     timestamps, so a success listed before earlier failures still correlates."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "ooo.db"))
     events = [
         _ssh_event("ssh_login_success", ATTACK_IP, -14),
         *_failures(5, ATTACK_IP, start_minutes_ago=20),
@@ -313,9 +300,8 @@ def test_correlation_out_of_order_events_incident(
 # --------------------------------------------------------------------------- #
 
 
-def test_incident_status_transitions_via_api(tmp_path, monkeypatch):
+def test_incident_status_transitions_via_api(api_client):
     """Acknowledge and resolve transitions, including validation."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "transitions.db"))
     events = [
         *_failures(5, ATTACK_IP, start_minutes_ago=20),
         _ssh_event("ssh_login_success", ATTACK_IP, -14),
@@ -324,36 +310,35 @@ def test_incident_status_transitions_via_api(tmp_path, monkeypatch):
     incident_id = list_incidents(status="all")[0]["id"]
 
     # open -> acknowledged
-    resp = client.post(f"/api/v1/incidents/{incident_id}/acknowledge")
+    resp = api_client.post(f"/api/v1/incidents/{incident_id}/acknowledge")
     assert resp.status_code == 200
     assert resp.json()["status"] == "acknowledged"
 
     # acknowledged -> resolved
-    resp = client.post(f"/api/v1/incidents/{incident_id}/resolve")
+    resp = api_client.post(f"/api/v1/incidents/{incident_id}/resolve")
     assert resp.status_code == 200
     assert resp.json()["status"] == "resolved"
 
     # resolved -> acknowledge is an invalid transition (409)
-    resp = client.post(f"/api/v1/incidents/{incident_id}/acknowledge")
+    resp = api_client.post(f"/api/v1/incidents/{incident_id}/acknowledge")
     assert resp.status_code == 409
 
     # resolve on an already-resolved incident is idempotent (200)
-    resp = client.post(f"/api/v1/incidents/{incident_id}/resolve")
+    resp = api_client.post(f"/api/v1/incidents/{incident_id}/resolve")
     assert resp.status_code == 200
     assert resp.json()["status"] == "resolved"
 
     # unknown incident -> 404
-    resp = client.post("/api/v1/incidents/999999/resolve")
+    resp = api_client.post("/api/v1/incidents/999999/resolve")
     assert resp.status_code == 404
 
-    detail = client.get(f"/api/v1/incidents/{incident_id}").json()
+    detail = api_client.get(f"/api/v1/incidents/{incident_id}").json()
     assert detail["status"] == "resolved"
     assert detail["closed_at"] is not None
 
 
-def test_open_incident_can_resolve_directly(tmp_path, monkeypatch):
+def test_open_incident_can_resolve_directly(api_client):
     """An open incident may resolve without acknowledging first."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "direct.db"))
     events = [
         *_failures(5, ATTACK_IP, start_minutes_ago=20),
         _ssh_event("ssh_login_success", ATTACK_IP, -14),
@@ -361,26 +346,25 @@ def test_open_incident_can_resolve_directly(tmp_path, monkeypatch):
     ingest_events(events)
     incident_id = list_incidents(status="all")[0]["id"]
 
-    resp = client.post(f"/api/v1/incidents/{incident_id}/resolve")
+    resp = api_client.post(f"/api/v1/incidents/{incident_id}/resolve")
     assert resp.status_code == 200
     assert resp.json()["status"] == "resolved"
 
 
-def test_incident_list_and_detail(tmp_path, _window_env, monkeypatch):
+def test_incident_list_and_detail(api_client, _window_env):
     """Incidents are listable and addressable with related events."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "detail.db"))
     events = [
         *_failures(5, ATTACK_IP, start_minutes_ago=20),
         _ssh_event("ssh_login_success", ATTACK_IP, -14),
     ]
     ingest_events(events)
 
-    listed = client.get("/api/v1/incidents").json()
+    listed = api_client.get("/api/v1/incidents").json()
     assert listed["count"] == 1
     assert listed["incidents"][0]["rule_id"] == SSH_BRUTE_FORCE_THEN_SUCCESS_RULE
 
     incident_id = listed["incidents"][0]["id"]
-    detail = client.get(f"/api/v1/incidents/{incident_id}").json()
+    detail = api_client.get(f"/api/v1/incidents/{incident_id}").json()
     assert detail["id"] == incident_id
     assert detail["status"] == "open"
     assert len(detail["related_events"]) == 6
@@ -389,7 +373,7 @@ def test_incident_list_and_detail(tmp_path, _window_env, monkeypatch):
     assert timestamps == sorted(timestamps)
 
     # Unknown incident -> 404
-    assert client.get("/api/v1/incidents/999999").status_code == 404
+    assert api_client.get("/api/v1/incidents/999999").status_code == 404
 
 
 # --------------------------------------------------------------------------- #
@@ -398,9 +382,8 @@ def test_incident_list_and_detail(tmp_path, _window_env, monkeypatch):
 
 
 def test_incident_endpoints_require_auth_in_token_mode(
-    tmp_path, _token_env, monkeypatch
+    api_client, _token_env
 ):
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "auth.db"))
     events = [
         *_failures(5, ATTACK_IP, start_minutes_ago=20),
         _ssh_event("ssh_login_success", ATTACK_IP, -14),
@@ -414,15 +397,15 @@ def test_incident_endpoints_require_auth_in_token_mode(
         ("post", f"/api/v1/incidents/{incident_id}/acknowledge"),
         ("post", f"/api/v1/incidents/{incident_id}/resolve"),
     ]:
-        assert getattr(client, method)(path).status_code == 401, path
+        assert getattr(api_client, method)(path).status_code == 401, path
         assert (
-            getattr(client, method)(
+            getattr(api_client, method)(
                 path, headers={"Authorization": f"Bearer {TOKEN}"}
             ).status_code
             == 200
         ), path
         assert (
-            getattr(client, method)(
+            getattr(api_client, method)(
                 path, headers={"X-API-Key": TOKEN}
             ).status_code
             == 200
@@ -430,10 +413,9 @@ def test_incident_endpoints_require_auth_in_token_mode(
 
 
 def test_incident_endpoints_remote_peer_rejected_default_mode(
-    tmp_path, monkeypatch
+    api_client, monkeypatch
 ):
     """Without a token, a non-loopback peer is rejected on incident endpoints."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "remote.db"))
     monkeypatch.setattr(main, "_is_loopback_host", lambda host: False)
     events = [
         *_failures(5, ATTACK_IP, start_minutes_ago=20),
@@ -442,9 +424,9 @@ def test_incident_endpoints_remote_peer_rejected_default_mode(
     ingest_events(events)
     incident_id = list_incidents(status="all")[0]["id"]
 
-    assert client.get("/api/v1/incidents").status_code == 403
-    assert client.get(f"/api/v1/incidents/{incident_id}").status_code == 403
-    assert client.post(f"/api/v1/incidents/{incident_id}/resolve").status_code == 403
+    assert api_client.get("/api/v1/incidents").status_code == 403
+    assert api_client.get(f"/api/v1/incidents/{incident_id}").status_code == 403
+    assert api_client.post(f"/api/v1/incidents/{incident_id}/resolve").status_code == 403
 
 
 # --------------------------------------------------------------------------- #
@@ -513,9 +495,8 @@ def test_correlation_rollback_and_retry(tmp_path, monkeypatch):
 
 
 def test_suricata_events_do_not_trigger_ssh_correlation(
-    tmp_path, _window_env, monkeypatch
+    api_client, _window_env
 ):
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "suri.db"))
     suricata_event = {
         "timestamp": _iso(-14),
         "host": "sensor",
@@ -541,9 +522,8 @@ def test_suricata_events_do_not_trigger_ssh_correlation(
     assert list_incidents(status="all") == []
 
 
-def test_ssh_brute_force_alert_regression(tmp_path, _window_env, monkeypatch):
+def test_ssh_brute_force_alert_regression(api_client, _window_env):
     """Existing SSH brute-force detection still produces one alert."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "regression.db"))
     # Failures inside the 5-minute brute-force window.
     result = ingest_events(_failures(5, ATTACK_IP, start_minutes_ago=4))
 
@@ -623,31 +603,35 @@ def test_list_incidents_source_ip_filter(tmp_path, _window_env, monkeypatch):
     assert none == []
 
 
-def test_incidents_api_source_ip_filter(tmp_path, _window_env, monkeypatch):
+def test_incidents_api_source_ip_filter(api_client, _window_env):
     """GET /api/v1/incidents honors the source_ip query parameter."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "api_filter.db"))
-    initialize_database()
+    # Use the database provided by api_client fixture
     ip_a, ip_b = "203.0.113.10", "198.51.100.7"
-    _make_incident(tmp_path / "api_filter.db", ip_a, monkeypatch)
-    _make_incident(tmp_path / "api_filter.db", ip_b, monkeypatch)
+    
+    # Create incidents directly
+    for ip in [ip_a, ip_b]:
+        events = [
+            *_failures(5, ip, start_minutes_ago=20),
+            _ssh_event("ssh_login_success", ip, -14),
+        ]
+        ingest_events(events)
 
-    filtered = client.get(f"/api/v1/incidents?status=all&limit=100&source_ip={ip_a}").json()
+    filtered = api_client.get(f"/api/v1/incidents?status=all&limit=100&source_ip={ip_a}").json()
     assert filtered["count"] == 1
     assert filtered["total"] == 1
     assert filtered["incidents"][0]["source_ip"] == ip_a
 
-    none = client.get("/api/v1/incidents?status=all&limit=100&source_ip=10.0.0.99").json()
+    none = api_client.get("/api/v1/incidents?status=all&limit=100&source_ip=10.0.0.99").json()
     assert none["count"] == 0
     assert none["total"] == 0
     assert none["incidents"] == []
 
 
 def test_incidents_api_pagination_returns_total_and_offset(
-    tmp_path, _window_env, monkeypatch
+    api_client, _window_env
 ):
     """GET /api/v1/incidents supports limit/offset and returns total count."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "api_paginate.db"))
-    initialize_database()
+    # Use the database provided by api_client fixture
 
     ips = [f"203.0.113.{20 + i}" for i in range(5)]
     for ip in ips:
@@ -658,7 +642,7 @@ def test_incidents_api_pagination_returns_total_and_offset(
         ingest_events(events)
 
     # Page 1: limit 2, offset 0.
-    r1 = client.get("/api/v1/incidents?status=all&limit=2&offset=0")
+    r1 = api_client.get("/api/v1/incidents?status=all&limit=2&offset=0")
     assert r1.status_code == 200
     b1 = r1.json()
     assert b1["total"] == 5
@@ -666,7 +650,7 @@ def test_incidents_api_pagination_returns_total_and_offset(
     assert len(b1["incidents"]) == 2
 
     # Page 2: limit 2, offset 2 — no overlap with page 1.
-    r2 = client.get("/api/v1/incidents?status=all&limit=2&offset=2")
+    r2 = api_client.get("/api/v1/incidents?status=all&limit=2&offset=2")
     assert r2.status_code == 200
     b2 = r2.json()
     assert b2["total"] == 5
@@ -677,7 +661,7 @@ def test_incidents_api_pagination_returns_total_and_offset(
     )
 
     # Page 3: offset 4 -> single remaining item.
-    r3 = client.get("/api/v1/incidents?status=all&limit=2&offset=4")
+    r3 = api_client.get("/api/v1/incidents?status=all&limit=2&offset=4")
     assert r3.status_code == 200
     b3 = r3.json()
     assert b3["total"] == 5
@@ -685,7 +669,7 @@ def test_incidents_api_pagination_returns_total_and_offset(
     assert len(b3["incidents"]) == 1
 
     # Beyond range: empty page, total still reported.
-    r4 = client.get("/api/v1/incidents?status=all&limit=2&offset=10")
+    r4 = api_client.get("/api/v1/incidents?status=all&limit=2&offset=10")
     assert r4.status_code == 200
     b4 = r4.json()
     assert b4["total"] == 5
