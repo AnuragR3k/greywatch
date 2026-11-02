@@ -22,13 +22,9 @@ path).
 """
 
 import pytest
-from fastapi.testclient import TestClient
 
 from backend.app import main
 from backend.app.collector import CollectResult
-from backend.app.main import app
-
-client = TestClient(app)
 
 TOKEN = "test-secret-token-123"
 
@@ -51,12 +47,12 @@ SENSITIVE = [
 PUBLIC = ["/", "/health"]
 
 
-def _request(method, path, body=None, headers=None):
+def _request(api_client, method, path, body=None, headers=None):
     """Issue a request with the correct verb (some protected endpoints are GET)."""
     headers = headers or {}
     if method == "GET":
-        return client.get(path, headers=headers)
-    return client.post(path, json=body, headers=headers)
+        return api_client.get(path, headers=headers)
+    return api_client.post(path, json=body, headers=headers)
 
 
 @pytest.fixture
@@ -114,9 +110,9 @@ def _token_env(monkeypatch):
 
 
 @pytest.mark.parametrize("path", PUBLIC)
-def test_public_endpoints_never_gated(_token_env, path):
+def test_public_endpoints_never_gated(api_client, _token_env, path):
     """``/`` and ``/health`` remain reachable without auth (boot checks)."""
-    assert client.get(path).status_code == 200, path
+    assert api_client.get(path).status_code == 200, path
 
 
 # --------------------------------------------------------------------------- #
@@ -126,19 +122,19 @@ def test_public_endpoints_never_gated(_token_env, path):
 
 @pytest.mark.parametrize("label,method,path,body", SENSITIVE)
 def test_local_loopback_peer_allowed(
-    _local_env, _stub_backends, label, method, path, body
+    api_client, _local_env, _stub_backends, label, method, path, body
 ):
     """A local peer is allowed on every protected endpoint (reads + writes).
 
     Starlette's TestClient advertises peer host ``"testclient"``, which
     ``_is_loopback_host`` treats as local; so default local access is allowed.
     """
-    assert _request(method, path, body).status_code == 200, label
+    assert _request(api_client, method, path, body).status_code == 200, label
 
 
 @pytest.mark.parametrize("label,method,path,body", SENSITIVE)
 def test_remote_peer_rejected_default_mode(
-    _local_env, _stub_backends, monkeypatch, label, method, path, body
+    api_client, _local_env, _stub_backends, monkeypatch, label, method, path, body
 ):
     """A non-loopback peer (remote) is denied on EVERY protected endpoint.
 
@@ -146,17 +142,17 @@ def test_remote_peer_rejected_default_mode(
     and alert evidence -- are now protected, not just writes.
     """
     monkeypatch.setattr(main, "_is_loopback_host", lambda host: False)
-    resp = _request(method, path, body)
+    resp = _request(api_client, method, path, body)
     assert resp.status_code == 403, (label, resp.status_code, resp.text)
     assert "local host" in resp.json()["detail"]
 
 
-def test_loopback_only_disabled_bypasses_gate(_local_env, monkeypatch, _stub_backends):
+def test_loopback_only_disabled_bypasses_gate(api_client, _local_env, monkeypatch, _stub_backends):
     """``GREYWATCH_API_LOOPBACK_ONLY=0`` disables the loopback gate for proxied
     deployments; the proxy is then responsible for access control."""
     monkeypatch.setattr(main, "_is_loopback_host", lambda host: False)
     monkeypatch.setenv("GREYWATCH_API_LOOPBACK_ONLY", "0")
-    assert client.post("/api/v1/suricata/collect").status_code == 200
+    assert api_client.post("/api/v1/suricata/collect").status_code == 200
 
 
 # --------------------------------------------------------------------------- #
@@ -166,28 +162,28 @@ def test_loopback_only_disabled_bypasses_gate(_local_env, monkeypatch, _stub_bac
 
 @pytest.mark.parametrize("label,method,path,body", SENSITIVE)
 def test_token_mode_missing_or_invalid_rejected(
-    _token_env, _stub_backends, label, method, path, body
+    api_client, _token_env, _stub_backends, label, method, path, body
 ):
     """With a token configured, missing/invalid credentials -> 401."""
-    assert _request(method, path, body).status_code == 401, label
-    assert _request(method, path, body, headers={"Authorization": "Bearer wrong"}).status_code == 401, label
-    assert _request(method, path, body, headers={"X-API-Key": "wrong"}).status_code == 401, label
+    assert _request(api_client, method, path, body).status_code == 401, label
+    assert _request(api_client, method, path, body, headers={"Authorization": "Bearer wrong"}).status_code == 401, label
+    assert _request(api_client, method, path, body, headers={"X-API-Key": "wrong"}).status_code == 401, label
 
 
 @pytest.mark.parametrize("label,method,path,body", SENSITIVE)
 def test_token_mode_valid_authenticates(
-    _token_env, _stub_backends, label, method, path, body
+    api_client, _token_env, _stub_backends, label, method, path, body
 ):
     """A valid bearer token or API key authenticates the request -> 200."""
     assert _request(
-        method, path, body, headers={"Authorization": f"Bearer {TOKEN}"}
+        api_client, method, path, body, headers={"Authorization": f"Bearer {TOKEN}"}
     ).status_code == 200, label
     assert _request(
-        method, path, body, headers={"X-API-Key": TOKEN}
+        api_client, method, path, body, headers={"X-API-Key": TOKEN}
     ).status_code == 200, label
 
 
-def test_token_mode_backends_not_invoked_on_missing_token(_token_env, monkeypatch):
+def test_token_mode_backends_not_invoked_on_missing_token(api_client, _token_env, monkeypatch):
     """A 401 short-circuits before any collection/ingest/read work runs (no side
     effects on failed auth)."""
 
@@ -203,7 +199,7 @@ def test_token_mode_backends_not_invoked_on_missing_token(_token_env, monkeypatc
     monkeypatch.setattr(main, "get_alert_detail", _explode)
     monkeypatch.setattr(main.collector, "status", _explode)
     monkeypatch.setattr(main.suricata, "status", _explode)
-    resp = client.post("/api/v1/events/ingest", json={"lines": ["x"]})
+    resp = api_client.post("/api/v1/events/ingest", json={"lines": ["x"]})
     assert resp.status_code == 401
 
 
@@ -214,7 +210,7 @@ def test_token_mode_backends_not_invoked_on_missing_token(_token_env, monkeypatc
 
 @pytest.mark.parametrize("label,method,path,body", SENSITIVE)
 def test_forwarding_headers_cannot_spoof_loopback(
-    _local_env, monkeypatch, label, method, path, body
+    api_client, _local_env, monkeypatch, label, method, path, body
 ):
     """``X-Forwarded-For`` / ``X-Real-IP`` / ``Forwarded`` are never read by the
     gate, so a forged loopback address in those headers cannot bypass a real
@@ -227,7 +223,7 @@ def test_forwarding_headers_cannot_spoof_loopback(
         "X-Real-IP": "127.0.0.1",
         "Forwarded": 'for=127.0.0.1:5312, for="[::1]:5312"',
     }
-    assert _request(method, path, body, headers=forged).status_code == 403, label
+    assert _request(api_client, method, path, body, headers=forged).status_code == 403, label
 
 
 # --------------------------------------------------------------------------- #
@@ -235,29 +231,29 @@ def test_forwarding_headers_cannot_spoof_loopback(
 # --------------------------------------------------------------------------- #
 
 
-def test_empty_token_falls_back_to_loopback(_local_env, monkeypatch, _stub_backends):
+def test_empty_token_falls_back_to_loopback(api_client, _local_env, monkeypatch, _stub_backends):
     """``GREYATCH_API_TOKEN=''`` is falsy -> token mode OFF -> loopback applies.
     A remote peer is still rejected (403); a loopback peer is allowed (200)."""
     monkeypatch.setenv("GREYWATCH_API_TOKEN", "")
     monkeypatch.setattr(main, "_is_loopback_host", lambda host: False)
-    assert client.post("/api/v1/suricata/collect").status_code == 403
+    assert api_client.post("/api/v1/suricata/collect").status_code == 403
     monkeypatch.setattr(main, "_is_loopback_host", lambda host: True)
-    assert client.post("/api/v1/suricata/collect").status_code == 200
+    assert api_client.post("/api/v1/suricata/collect").status_code == 200
 
 
-def test_whitespace_only_token_is_fail_closed(_local_env, _stub_backends, monkeypatch):
+def test_whitespace_only_token_is_fail_closed(api_client, _local_env, _stub_backends, monkeypatch):
     """A whitespace-only token is truthy -> token mode ON -> unauthenticated
     callers (even a loopback peer) are rejected with 401. This is the operator
     pitfall (an accidental whitespace secret locks out local access) and is the
     safe, fail-closed outcome: no credentials can never authenticate."""
     monkeypatch.setenv("GREYWATCH_API_TOKEN", "   ")
     # loopback peer (TestClient "testclient") but NO credentials -> 401:
-    assert client.post("/api/v1/suricata/collect").status_code == 401
-    assert client.post(
+    assert api_client.post("/api/v1/suricata/collect").status_code == 401
+    assert api_client.post(
         "/api/v1/events/ingest", json={"lines": ["x"]}
     ).status_code == 401
     # invalid bearer -> 401:
-    assert client.post(
+    assert api_client.post(
         "/api/v1/suricata/collect",
         headers={"Authorization": "Bearer wrong"},
     ).status_code == 401

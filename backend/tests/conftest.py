@@ -61,3 +61,33 @@ def _isolate_test_database(tmp_path, monkeypatch):
         # Already pointed at a non-production database by the test — leave it.
     else:
         monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "test.db"))
+
+
+@pytest.fixture(autouse=True)
+def isolate_schema_guard(monkeypatch):
+    """Isolate the process-wide schema guard for each test.
+
+    The guard in siem._SCHEMA_MANAGED_BY_RUNNER is process-wide and persists
+    across TestClient instances. This fixture resets it via monkeypatch so
+    each test gets a clean state.
+    """
+    import backend.app.siem as siem_module
+    monkeypatch.setattr(siem_module, "_SCHEMA_MANAGED_BY_RUNNER", False, raising=False)
+
+
+@pytest.fixture
+def api_client(tmp_path):
+    """Create a TestClient with an isolated temporary database.
+
+    This fixture sets GREYWATCH_DB to a unique temp path, creates a TestClient
+    (which runs the FastAPI lifespan to initialize the schema), and yields it.
+    Each test gets a completely isolated database.
+    """
+    import os
+    from backend.app.main import app
+    from starlette.testclient import TestClient
+
+    db_path = str(tmp_path / "test.db")
+    os.environ["GREYWATCH_DB"] = db_path
+    with TestClient(app) as client:
+        yield client

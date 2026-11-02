@@ -3,9 +3,6 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 
-from fastapi.testclient import TestClient
-
-from backend.app.main import app
 from backend.app.siem import (
     _connection,
     ingest_events,
@@ -15,17 +12,15 @@ from backend.app.siem import (
     parse_auth_line,
 )
 
-client = TestClient(app)
 
-
-def create_brute_force_alert(source_ip="203.0.113.10", count=5):
+def create_brute_force_alert(api_client, source_ip="203.0.113.10", count=5):
     """Ingest failed SSH logins and return the created alert dict."""
     lines = [
         f"sshd[410{i}]: Failed password for user{i} "
         f"from {source_ip} port {54000 + i} ssh2"
         for i in range(count)
     ]
-    response = client.post("/api/v1/events/ingest", json={"lines": lines})
+    response = api_client.post("/api/v1/events/ingest", json={"lines": lines})
     assert response.status_code == 200
     payload = response.json()
     assert len(payload["alerts"]) == 1
@@ -68,9 +63,7 @@ def test_unrecognized_line_is_ignored():
     assert parse_auth_line("kernel: device initialized") is None
 
 
-def test_repeated_failures_create_alert(tmp_path, monkeypatch):
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "test.db"))
-
+def test_repeated_failures_create_alert(api_client, tmp_path, monkeypatch):
     lines = [
         (
             f"sshd[410{i}]: Failed password for user{i} "
@@ -79,7 +72,7 @@ def test_repeated_failures_create_alert(tmp_path, monkeypatch):
         for i in range(5)
     ]
 
-    response = client.post(
+    response = api_client.post(
         "/api/v1/events/ingest",
         json={"lines": lines},
     )
@@ -94,18 +87,16 @@ def test_repeated_failures_create_alert(tmp_path, monkeypatch):
     assert payload["alerts"][0]["rule_id"] == "SSH_BRUTE_FORCE"
     assert payload["alerts"][0]["severity"] == "high"
 
-    event_response = client.get("/api/v1/events")
+    event_response = api_client.get("/api/v1/events")
     assert event_response.status_code == 200
     assert event_response.json()["count"] == 5
 
-    alert_response = client.get("/api/v1/alerts")
+    alert_response = api_client.get("/api/v1/alerts")
     assert alert_response.status_code == 200
     assert alert_response.json()["count"] == 1
 
-def test_timestamped_failed_ssh_events_create_alert(tmp_path, monkeypatch):
+def test_timestamped_failed_ssh_events_create_alert(api_client, tmp_path, monkeypatch):
     """Five timestamped failures within five minutes trigger an alert."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "timestamped.db"))
-
     # Traditional syslog timestamps are interpreted in the system's local timezone.
     now = datetime.now().astimezone().replace(microsecond=0)
     lines = [
@@ -117,7 +108,7 @@ def test_timestamped_failed_ssh_events_create_alert(tmp_path, monkeypatch):
         for i in range(5)
     ]
 
-    response = client.post("/api/v1/events/ingest", json={"lines": lines})
+    response = api_client.post("/api/v1/events/ingest", json={"lines": lines})
 
     assert response.status_code == 200
     payload = response.json()
@@ -127,12 +118,11 @@ def test_timestamped_failed_ssh_events_create_alert(tmp_path, monkeypatch):
     assert payload["alerts"][0]["event_count"] == 5
 
 
-def test_alert_detail_returns_details_and_evidence(tmp_path, monkeypatch):
+def test_alert_detail_returns_details_and_evidence(api_client, tmp_path, monkeypatch):
     """An existing brute-force alert returns its details and evidence events."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "test.db"))
-    alert = create_brute_force_alert()
+    alert = create_brute_force_alert(api_client)
 
-    response = client.get(f"/api/v1/alerts/{alert['id']}")
+    response = api_client.get(f"/api/v1/alerts/{alert['id']}")
     assert response.status_code == 200
 
     payload = response.json()
@@ -157,12 +147,11 @@ def test_alert_detail_returns_details_and_evidence(tmp_path, monkeypatch):
     assert payload["evidence_events"][0]["event_type"] == "ssh_login_failed"
 
 
-def test_evidence_events_include_raw_messages(tmp_path, monkeypatch):
+def test_evidence_events_include_raw_messages(api_client, tmp_path, monkeypatch):
     """Evidence events include their original raw log messages and all fields."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "test.db"))
-    alert = create_brute_force_alert()
+    alert = create_brute_force_alert(api_client)
 
-    response = client.get(f"/api/v1/alerts/{alert['id']}")
+    response = api_client.get(f"/api/v1/alerts/{alert['id']}")
     assert response.status_code == 200
 
     events = response.json()["evidence_events"]
@@ -180,26 +169,23 @@ def test_evidence_events_include_raw_messages(tmp_path, monkeypatch):
         assert event["event_type"] == "ssh_login_failed"
 
 
-def test_unknown_alert_returns_404(tmp_path, monkeypatch):
+def test_unknown_alert_returns_404(api_client, tmp_path, monkeypatch):
     """An unknown alert ID returns HTTP 404."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "test.db"))
 
-    response = client.get("/api/v1/alerts/9999")
+    response = api_client.get("/api/v1/alerts/9999")
     assert response.status_code == 404
     assert "detail" in response.json()
 
 
-def test_alert_no_matching_evidence(tmp_path, monkeypatch):
+def test_alert_no_matching_evidence(api_client, tmp_path, monkeypatch):
     """An alert with no matching evidence events is handled without crashing."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "test.db"))
-    alert = create_brute_force_alert()
+    alert = create_brute_force_alert(api_client)
 
     # Remove all events to simulate purged evidence while the alert persists.
-    initialize_database()
     with _connection() as conn:
         conn.execute("DELETE FROM events")
 
-    response = client.get(f"/api/v1/alerts/{alert['id']}")
+    response = api_client.get(f"/api/v1/alerts/{alert['id']}")
     assert response.status_code == 200
 
     payload = response.json()
@@ -209,13 +195,12 @@ def test_alert_no_matching_evidence(tmp_path, monkeypatch):
     assert "evidence_window_end" in payload
 
 
-def test_events_outside_evidence_window_excluded(tmp_path, monkeypatch):
+def test_events_outside_evidence_window_excluded(api_client, tmp_path, monkeypatch):
     """Events outside the defined evidence time window are excluded."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "test.db"))
-    alert = create_brute_force_alert()
+    alert = create_brute_force_alert(api_client)
 
     # Fetch the alert to obtain the evidence window boundaries.
-    detail = client.get(f"/api/v1/alerts/{alert['id']}").json()
+    detail = api_client.get(f"/api/v1/alerts/{alert['id']}").json()
     created_at = datetime.fromisoformat(detail["alert"]["created_at"])
     window_start = datetime.fromisoformat(detail["evidence_window_start"])
     window_end = datetime.fromisoformat(detail["evidence_window_end"])
@@ -235,7 +220,6 @@ def test_events_outside_evidence_window_excluded(tmp_path, monkeypatch):
     ).astimezone(timezone.utc).isoformat(timespec="seconds")
     after_msg = f"AFTER_WINDOW_{after_time}"
 
-    initialize_database()
     with _connection() as conn:
         conn.execute(
             """
@@ -270,7 +254,7 @@ def test_events_outside_evidence_window_excluded(tmp_path, monkeypatch):
             ),
         )
 
-    response = client.get(f"/api/v1/alerts/{alert['id']}")
+    response = api_client.get(f"/api/v1/alerts/{alert['id']}")
     assert response.status_code == 200
 
     events = response.json()["evidence_events"]
@@ -289,15 +273,14 @@ def test_events_outside_evidence_window_excluded(tmp_path, monkeypatch):
     assert after_msg not in raw_messages
 
 
-def test_evidence_matches_updated_event_count(tmp_path, monkeypatch):
+def test_evidence_matches_updated_event_count(api_client, tmp_path, monkeypatch):
     """After more failures arrive, event_count and evidence must agree.
 
     Regression test: the evidence window used to end at created_at, so
     failures ingested after the alert was created were counted on the alert
     but never returned as evidence.
     """
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "test.db"))
-    alert = create_brute_force_alert()
+    alert = create_brute_force_alert(api_client)
     assert alert["event_count"] == 5
 
     # Cross a second boundary so created_at and last_triggered_at differ;
@@ -311,7 +294,7 @@ def test_evidence_matches_updated_event_count(tmp_path, monkeypatch):
         f"from 203.0.113.10 port {56000 + i} ssh2"
         for i in range(2)
     ]
-    response = client.post("/api/v1/events/ingest", json={"lines": extra})
+    response = api_client.post("/api/v1/events/ingest", json={"lines": extra})
     assert response.status_code == 200
     payload = response.json()
 
@@ -319,7 +302,7 @@ def test_evidence_matches_updated_event_count(tmp_path, monkeypatch):
     assert payload["alerts"] == []
     assert payload["parsed"] == 2
 
-    detail = client.get(f"/api/v1/alerts/{alert['id']}")
+    detail = api_client.get(f"/api/v1/alerts/{alert['id']}")
     assert detail.status_code == 200
     body = detail.json()
 
@@ -403,22 +386,29 @@ def test_migration_backfills_last_triggered_at(tmp_path, monkeypatch):
     legacy.commit()
     legacy.close()
 
+    # Run migration on the legacy database before starting the app
     initialize_database()
 
-    with _connection() as conn:
-        row = conn.execute(
-            "SELECT created_at, last_triggered_at FROM alerts WHERE id = 1"
-        ).fetchone()
+    # Create a TestClient with the legacy database to test the migration
+    import os
+    from backend.app.main import app
+    from starlette.testclient import TestClient
+    os.environ["GREYWATCH_DB"] = str(db_path)
+    with TestClient(app) as client:
+        with _connection() as conn:
+            row = conn.execute(
+                "SELECT created_at, last_triggered_at FROM alerts WHERE id = 1"
+            ).fetchone()
 
-    # Backfilled from created_at so the window behaves as before the change.
-    assert row["last_triggered_at"] == row["created_at"]
+        # Backfilled from created_at so the window behaves as before the change.
+        assert row["last_triggered_at"] == row["created_at"]
 
-    # And the migrated alert serves evidence without errors.
-    response = client.get("/api/v1/alerts/1")
-    assert response.status_code == 200
-    body = response.json()
-    assert body["evidence_window_end"] == "2026-10-12T10:00:00+00:00"
-    assert body["evidence_events"] == []
+        # And the migrated alert serves evidence without errors.
+        response = client.get("/api/v1/alerts/1")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["evidence_window_end"] == "2026-10-12T10:00:00+00:00"
+        assert body["evidence_events"] == []
 
 
 # --------------------------------------------------------------------------- #
@@ -439,7 +429,7 @@ def _failed_login_line(idx: int, source_ip: str, port: int = 54000) -> str:
     )
 
 
-def test_end_to_end_http_detection_flow(tmp_path, monkeypatch):
+def test_end_to_end_http_detection_flow(api_client, tmp_path, monkeypatch):
     """Deterministic full-stack flow: HTTP ingest -> alert -> evidence.
 
     Exercises the real FastAPI ingestion endpoint, the shared detection engine,
@@ -458,12 +448,11 @@ def test_end_to_end_http_detection_flow(tmp_path, monkeypatch):
       8. unrelated events + out-of-window events excluded from evidence
       9. repeated ingestion does not duplicate the alert
     """
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "e2e.db"))
     attack_ip = "203.0.113.10"
 
     # 1, 2, 3, 4: Ingest exactly the threshold (5) of failed logins.
     failed_lines = [_failed_login_line(i, attack_ip) for i in range(5)]
-    ingest = client.post("/api/v1/events/ingest", json={"lines": failed_lines})
+    ingest = api_client.post("/api/v1/events/ingest", json={"lines": failed_lines})
     assert ingest.status_code == 200
     body = ingest.json()
 
@@ -480,7 +469,7 @@ def test_end_to_end_http_detection_flow(tmp_path, monkeypatch):
     assert alert["event_count"] == 5
 
     # 3 (cont.): events persisted and retrievable from the event API.
-    stored = client.get("/api/v1/events").json()
+    stored = api_client.get("/api/v1/events").json()
     assert stored["count"] == 5
     stored_raws = {e["raw_message"] for e in stored["events"]}
     for line in failed_lines:
@@ -489,7 +478,7 @@ def test_end_to_end_http_detection_flow(tmp_path, monkeypatch):
     assert all(e["event_type"] == "ssh_login_failed" for e in stored["events"])
 
     # 5: the alert is retrievable through the real alert-listing API.
-    alerts = client.get("/api/v1/alerts?status=all&limit=100").json()
+    alerts = api_client.get("/api/v1/alerts?status=all&limit=100").json()
     assert alerts["count"] == 1
     assert alerts["alerts"][0]["id"] == alert["id"]
 
@@ -501,19 +490,19 @@ def test_end_to_end_http_detection_flow(tmp_path, monkeypatch):
         f"sshd[6100]: Accepted password for bystander from {attack_ip} port 56001 ssh2",
         f"sshd[6101]: Invalid user bystander from {attack_ip}",
     ]
-    extra = client.post("/api/v1/events/ingest", json={"lines": unrelated})
+    extra = api_client.post("/api/v1/events/ingest", json={"lines": unrelated})
     assert extra.status_code == 200
     extra_body = extra.json()
     assert extra_body["parsed"] == 3
     # No new alert: wrong-IP line is below threshold; target-IP failed count
     # is unchanged (the success/invalid_user lines are not counted).
     assert extra_body["alerts"] == []
-    assert client.get("/api/v1/alerts?status=all&limit=100").json()["count"] == 1
+    assert api_client.get("/api/v1/alerts?status=all&limit=100").json()["count"] == 1
 
     # 8 (out-of-window event): a failed login from the target IP whose
     # timestamp predates the evidence window must not be returned as evidence.
     # Inserted directly so it cannot influence the detection count.
-    detail_before = client.get(f"/api/v1/alerts/{alert['id']}").json()
+    detail_before = api_client.get(f"/api/v1/alerts/{alert['id']}").json()
     window_start = datetime.fromisoformat(detail_before["evidence_window_start"])
     oow_ts = (window_start - timedelta(minutes=10)).astimezone(timezone.utc).isoformat(
         timespec="seconds"
@@ -537,16 +526,16 @@ def test_end_to_end_http_detection_flow(tmp_path, monkeypatch):
     # 9, 6, 7: Re-ingesting two more failures from the target IP updates the
     # existing alert (no duplicate) and the evidence grows to match.
     more_lines = [_failed_login_line(i, attack_ip, port=54100) for i in range(5, 7)]
-    again = client.post("/api/v1/events/ingest", json={"lines": more_lines})
+    again = api_client.post("/api/v1/events/ingest", json={"lines": more_lines})
     assert again.status_code == 200
     again_body = again.json()
     assert again_body["parsed"] == 2
     assert again_body["alerts"] == []  # 9: no duplicate alert created
 
-    assert client.get("/api/v1/alerts?status=open&limit=100").json()["count"] == 1
-    assert client.get("/api/v1/alerts?status=all&limit=100").json()["count"] == 1
+    assert api_client.get("/api/v1/alerts?status=open&limit=100").json()["count"] == 1
+    assert api_client.get("/api/v1/alerts?status=all&limit=100").json()["count"] == 1
 
-    detail = client.get(f"/api/v1/alerts/{alert['id']}").json()
+    detail = api_client.get(f"/api/v1/alerts/{alert['id']}").json()
     evidence = detail["evidence_events"]
 
     # 7: evidence is consistent with the stored in-window failed logins.
@@ -576,85 +565,81 @@ def test_end_to_end_http_detection_flow(tmp_path, monkeypatch):
         assert ws <= ts <= we
 
 
-def test_below_threshold_does_not_create_alert(tmp_path, monkeypatch):
+def test_below_threshold_does_not_create_alert(api_client, tmp_path, monkeypatch):
     """Below-threshold scenario: 4 failures (< 5) store events but raise no alert."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "below.db"))
     attack_ip = "203.0.113.10"
     lines = [_failed_login_line(i, attack_ip) for i in range(4)]
 
-    res = client.post("/api/v1/events/ingest", json={"lines": lines})
+    res = api_client.post("/api/v1/events/ingest", json={"lines": lines})
     body = res.json()
 
     assert body["received"] == 4
     assert body["parsed"] == 4
     assert body["alerts"] == []
 
-    events = client.get("/api/v1/events").json()
+    events = api_client.get("/api/v1/events").json()
     assert events["count"] == 4
-    assert client.get("/api/v1/alerts?status=all&limit=100").json()["count"] == 0
+    assert api_client.get("/api/v1/alerts?status=all&limit=100").json()["count"] == 0
 
 
-def test_brute_force_threshold_is_per_source_ip(tmp_path, monkeypatch):
+def test_brute_force_threshold_is_per_source_ip(api_client, tmp_path, monkeypatch):
     """At-threshold scenario: two IPs each at 5 failures yield two alerts."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "perip.db"))
     ip_a, ip_b = "203.0.113.10", "198.51.100.7"
     lines = [_failed_login_line(i, ip_a) for i in range(5)] + [
         _failed_login_line(i, ip_b, port=55000) for i in range(5)
     ]
 
-    res = client.post("/api/v1/events/ingest", json={"lines": lines})
+    res = api_client.post("/api/v1/events/ingest", json={"lines": lines})
     body = res.json()
 
     assert body["parsed"] == 10
     assert len(body["alerts"]) == 2
     assert {a["source_ip"] for a in body["alerts"]} == {ip_a, ip_b}
-    assert client.get("/api/v1/alerts?status=all&limit=100").json()["count"] == 2
+    assert api_client.get("/api/v1/alerts?status=all&limit=100").json()["count"] == 2
 
 
-def test_alerts_listing_pagination_offset_and_total(tmp_path, monkeypatch):
+def test_alerts_listing_pagination_offset_and_total(api_client, tmp_path, monkeypatch):
     """The alerts listing returns a true total and honors limit/offset."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "page.db"))
     ip_a, ip_b, ip_c = "203.0.113.10", "198.51.100.7", "198.51.100.8"
     lines = (
         [_failed_login_line(i, ip_a) for i in range(5)]
         + [_failed_login_line(i, ip_b, port=55000) for i in range(5)]
         + [_failed_login_line(i, ip_c, port=56000) for i in range(5)]
     )
-    client.post("/api/v1/events/ingest", json={"lines": lines})
+    api_client.post("/api/v1/events/ingest", json={"lines": lines})
 
-    first = client.get("/api/v1/alerts?status=all&limit=2&offset=0").json()
+    first = api_client.get("/api/v1/alerts?status=all&limit=2&offset=0").json()
     assert first["count"] == 2
     assert first["total"] == 3
     assert len(first["alerts"]) == 2
 
-    second = client.get("/api/v1/alerts?status=all&limit=2&offset=2").json()
+    second = api_client.get("/api/v1/alerts?status=all&limit=2&offset=2").json()
     assert second["count"] == 1
     assert second["total"] == 3
     assert {a["id"] for a in second["alerts"]}.isdisjoint({a["id"] for a in first["alerts"]})
 
-    third = client.get("/api/v1/alerts?status=all&limit=2&offset=4").json()
+    third = api_client.get("/api/v1/alerts?status=all&limit=2&offset=4").json()
     assert third["count"] == 0
     assert third["total"] == 3
     assert third["alerts"] == []
 
 
-def test_alerts_listing_source_ip_filter(tmp_path, monkeypatch):
+def test_alerts_listing_source_ip_filter(api_client, tmp_path, monkeypatch):
     """The alerts listing can be narrowed to a single source IP."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "filter.db"))
     ip_a, ip_b = "203.0.113.10", "198.51.100.7"
     lines = (
         [_failed_login_line(i, ip_a) for i in range(5)]
         + [_failed_login_line(i, ip_b, port=55000) for i in range(5)]
     )
-    client.post("/api/v1/events/ingest", json={"lines": lines})
+    api_client.post("/api/v1/events/ingest", json={"lines": lines})
 
-    filtered = client.get(f"/api/v1/alerts?status=all&limit=100&source_ip={ip_a}").json()
+    filtered = api_client.get(f"/api/v1/alerts?status=all&limit=100&source_ip={ip_a}").json()
     assert filtered["count"] == 1
     assert filtered["total"] == 1
     assert filtered["alerts"][0]["source_ip"] == ip_a
 
     # A source IP with no alerts returns an empty page with total 0.
-    none = client.get("/api/v1/alerts?status=all&limit=100&source_ip=10.0.0.99").json()
+    none = api_client.get("/api/v1/alerts?status=all&limit=100&source_ip=10.0.0.99").json()
     assert none["count"] == 0
     assert none["total"] == 0
     assert none["alerts"] == []
@@ -690,11 +675,10 @@ def _ssh_failed_event(
 
 
 def test_dedup_replayed_identifiable_record_not_duplicated(
-    tmp_path, monkeypatch
+    api_client, tmp_path, monkeypatch
 ):
     """Re-ingesting the same identifiable record (journal __CURSOR) creates no
     second event and does not inflate the brute-force count."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "dedup.db"))
     ip = "203.0.113.10"
     ts = "2026-10-13T10:00:00+00:00"
     event = _ssh_failed_event(
@@ -711,7 +695,7 @@ def test_dedup_replayed_identifiable_record_not_duplicated(
     # One unique failure is below threshold -> no alert, count not inflated.
     assert first["alerts"] == []
     assert second["alerts"] == []
-    assert client.get("/api/v1/alerts?status=all&limit=100").json()["count"] == 0
+    assert api_client.get("/api/v1/alerts?status=all&limit=100").json()["count"] == 0
 
 
 def test_dedup_distinct_source_record_ids_remain_distinct(
@@ -720,6 +704,7 @@ def test_dedup_distinct_source_record_ids_remain_distinct(
     """Five failures with distinct native ids stay distinct and still trigger
     the threshold (replay safety never collapses legitimate events)."""
     monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "distinct.db"))
+    initialize_database()
     ip = "203.0.113.10"
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     events = [
@@ -742,7 +727,7 @@ def test_dedup_distinct_source_record_ids_remain_distinct(
 
 
 def test_dedup_null_source_record_id_not_deduped(
-    tmp_path, monkeypatch
+    api_client, tmp_path, monkeypatch
 ):
     """Records without a stable native id (HTTP lines) are not deduplicated by
     source_record_id; replaying identical HTTP lines inflates the count.
@@ -752,22 +737,21 @@ def test_dedup_null_source_record_id_not_deduped(
     used as a dedup key because identical messages can be separate genuine
     authentication failures.
     """
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "http.db"))
     ip = "203.0.113.10"
     lines = [
         f"sshd[600{i}]: Failed password for attacker{i} from {ip} port {54000+i} ssh2"
         for i in range(5)
     ]
 
-    first = client.post("/api/v1/events/ingest", json={"lines": lines}).json()
-    second = client.post("/api/v1/events/ingest", json={"lines": lines}).json()
+    first = api_client.post("/api/v1/events/ingest", json={"lines": lines}).json()
+    second = api_client.post("/api/v1/events/ingest", json={"lines": lines}).json()
 
     assert first["parsed"] == 5
     assert second["parsed"] == 5  # replayed, not deduped (no native id)
     assert len(list_events()) == 10
     assert second["alerts"] == []  # aggregated into existing open alert
     # The alert count reflects all 10 stored rows (inflation is the limitation).
-    detail = client.get(f"/api/v1/alerts/{first['alerts'][0]['id']}").json()
+    detail = api_client.get(f"/api/v1/alerts/{first['alerts'][0]['id']}").json()
     assert detail["alert"]["event_count"] == 10
 
 
@@ -818,17 +802,16 @@ def _http_failed_lines(source_ip: str, count: int, port_base: int = 54000):
     ]
 
 
-def test_http_event_with_stable_id_inserted_once(tmp_path, monkeypatch):
+def test_http_event_with_stable_id_inserted_once(api_client, tmp_path, monkeypatch):
     """Replaying the same event id inserts the event once and counts it once."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "idempotent.db"))
     ip = "203.0.113.10"
     lines = _http_failed_lines(ip, 5)
     ids = [f"evt-{i}" for i in range(5)]
 
-    first = client.post(
+    first = api_client.post(
         "/api/v1/events/ingest", json={"lines": lines, "event_ids": ids}
     ).json()
-    second = client.post(
+    second = api_client.post(
         "/api/v1/events/ingest", json={"lines": lines, "event_ids": ids}
     ).json()
 
@@ -845,22 +828,21 @@ def test_http_event_with_stable_id_inserted_once(tmp_path, monkeypatch):
 
     # Exactly 5 unique events stored; brute-force count stayed at 5.
     assert len(list_events()) == 5
-    alert = client.get("/api/v1/alerts?status=all&limit=100").json()["alerts"][0]
+    alert = api_client.get("/api/v1/alerts?status=all&limit=100").json()["alerts"][0]
     assert alert["event_count"] == 5
 
 
 def test_http_distinct_ids_with_identical_messages_remain_distinct(
-    tmp_path, monkeypatch
+    api_client, tmp_path, monkeypatch
 ):
     """Distinct ids preserve legitimate repeated events even when content and
     timestamps are identical."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "distinctids.db"))
     ip = "203.0.113.10"
     line = f"sshd[700]: Failed password for root from {ip} port 54000 ssh2"
     lines = [line] * 5
     ids = [f"evt-distinct-{i}" for i in range(5)]
 
-    result = client.post(
+    result = api_client.post(
         "/api/v1/events/ingest", json={"lines": lines, "event_ids": ids}
     ).json()
 
@@ -872,10 +854,9 @@ def test_http_distinct_ids_with_identical_messages_remain_distinct(
     assert len(list_events()) == 5
 
 
-def test_http_mixed_batch_reports_accurate_counts(tmp_path, monkeypatch):
+def test_http_mixed_batch_reports_accurate_counts(api_client, tmp_path, monkeypatch):
     """A batch with new events, a duplicate, and an invalid line reports
     accepted vs duplicate vs ignored counts accurately."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "mixed.db"))
     ip = "203.0.113.10"
     lines = [
         f"sshd[701]: Failed password for a from {ip} port 54101 ssh2",  # new
@@ -885,7 +866,7 @@ def test_http_mixed_batch_reports_accurate_counts(tmp_path, monkeypatch):
     ]
     ids = ["evt-mix-1", "evt-mix-2", "evt-mix-1", None]
 
-    result = client.post(
+    result = api_client.post(
         "/api/v1/events/ingest", json={"lines": lines, "event_ids": ids}
     ).json()
 
@@ -897,7 +878,7 @@ def test_http_mixed_batch_reports_accurate_counts(tmp_path, monkeypatch):
 
 
 def test_http_reused_id_with_different_content_treated_as_replay(
-    tmp_path, monkeypatch
+    api_client, tmp_path, monkeypatch
 ):
     """Reusing an id for different content is treated as a replay (documented).
 
@@ -906,9 +887,8 @@ def test_http_reused_id_with_different_content_treated_as_replay(
     ``duplicates`` -- callers must use a stable id per distinct event. This
     pins the documented behavior so it cannot change silently.
     """
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "reuse.db"))
 
-    first = client.post(
+    first = api_client.post(
         "/api/v1/events/ingest",
         json={
             "lines": [
@@ -920,7 +900,7 @@ def test_http_reused_id_with_different_content_treated_as_replay(
     assert first["duplicates"] == 0
     assert len(first["events"]) == 1
 
-    second = client.post(
+    second = api_client.post(
         "/api/v1/events/ingest",
         json={
             "lines": [
@@ -935,10 +915,9 @@ def test_http_reused_id_with_different_content_treated_as_replay(
     assert all(e["source_ip"] != "198.51.100.7" for e in list_events())
 
 
-def test_http_event_ids_scoped_by_source(tmp_path, monkeypatch):
+def test_http_event_ids_scoped_by_source(api_client, tmp_path, monkeypatch):
     """The same id string from journal and http sources do not collide; each
     source keeps its own identifier namespace."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "scoping.db"))
     ip = "203.0.113.10"
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -959,7 +938,7 @@ def test_http_event_ids_scoped_by_source(tmp_path, monkeypatch):
     # HTTP event with the same id "shared-id" must still be inserted (different
     # source namespace).
     lines = [f"sshd[703]: Failed password for u from {ip} port 54103 ssh2"]
-    result = client.post(
+    result = api_client.post(
         "/api/v1/events/ingest", json={"lines": lines, "event_ids": ["shared-id"]}
     ).json()
 
@@ -969,22 +948,19 @@ def test_http_event_ids_scoped_by_source(tmp_path, monkeypatch):
     assert len(list_events()) == 2
 
 
-def test_http_length_mismatch_returns_400(tmp_path, monkeypatch):
+def test_http_length_mismatch_returns_400(api_client, tmp_path, monkeypatch):
     """event_ids that do not match lines length is rejected with HTTP 400."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "mismatch.db"))
     lines = ["sshd[704]: Failed password for x from 203.0.113.10 port 54104 ssh2"]
 
-    resp = client.post(
+    resp = api_client.post(
         "/api/v1/events/ingest", json={"lines": lines, "event_ids": ["a", "b"]}
     )
     assert resp.status_code == 400
 
 
-def test_http_concurrent_same_id_cannot_insert_twice(tmp_path, monkeypatch):
+def test_http_concurrent_same_id_cannot_insert_twice(api_client, tmp_path, monkeypatch):
     """Concurrent retries of the same id: exactly one insert wins the unique
     index; the rest are skipped as duplicates."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "httpconc.db"))
-    initialize_database()
     ip = "203.0.113.10"
     lines = [f"sshd[705]: Failed password for x from {ip} port 54105 ssh2"]
     ids = ["evt-http-conc"]
@@ -996,7 +972,7 @@ def test_http_concurrent_same_id_cannot_insert_twice(tmp_path, monkeypatch):
     def worker(_tag: int) -> None:
         try:
             results.append(
-                client.post(
+                api_client.post(
                     "/api/v1/events/ingest",
                     json={"lines": lines, "event_ids": ids},
                 ).json()
@@ -1020,15 +996,14 @@ def test_http_concurrent_same_id_cannot_insert_twice(tmp_path, monkeypatch):
     assert len(list_events()) == 1
 
 
-def test_http_no_ids_retains_compatibility_behavior(tmp_path, monkeypatch):
+def test_http_no_ids_retains_compatibility_behavior(api_client, tmp_path, monkeypatch):
     """Requests without event_ids keep source=None and are not deduplicated:
     replaying identical HTTP lines inflates the count (documented limitation)."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "nocompat.db"))
     ip = "203.0.113.10"
     lines = _http_failed_lines(ip, 5)
 
-    first = client.post("/api/v1/events/ingest", json={"lines": lines}).json()
-    second = client.post("/api/v1/events/ingest", json={"lines": lines}).json()
+    first = api_client.post("/api/v1/events/ingest", json={"lines": lines}).json()
+    second = api_client.post("/api/v1/events/ingest", json={"lines": lines}).json()
 
     assert first["parsed"] == 5
     assert first["duplicates"] == 0
@@ -1105,23 +1080,22 @@ def test_concurrent_ingest_lines_succeeds(tmp_path, monkeypatch):
     assert count == total_events == 24, (count, total_events)
 
 
-def test_six_failures_sets_event_count_to_six(tmp_path, monkeypatch):
+def test_six_failures_sets_event_count_to_six(api_client, tmp_path, monkeypatch):
     """Above-threshold scenario: 6 failures (>= 5) raise an alert with count 6."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "above.db"))
     attack_ip = "203.0.113.10"
     lines = [_failed_login_line(i, attack_ip) for i in range(6)]
 
-    res = client.post("/api/v1/events/ingest", json={"lines": lines})
+    res = api_client.post("/api/v1/events/ingest", json={"lines": lines})
     body = res.json()
 
     assert body["parsed"] == 6
     assert len(body["alerts"]) == 1
     assert body["alerts"][0]["event_count"] == 6
-    assert client.get("/api/v1/alerts?status=all&limit=100").json()["count"] == 1
+    assert api_client.get("/api/v1/alerts?status=all&limit=100").json()["count"] == 1
 
 
 def test_duplicate_ingestion_updates_count_without_new_alert(
-    tmp_path, monkeypatch
+    api_client, tmp_path, monkeypatch
 ):
     """Re-ingesting the same failures updates the alert count; no duplicate alert.
 
@@ -1130,29 +1104,27 @@ def test_duplicate_ingestion_updates_count_without_new_alert(
     present in the window. This documents current behavior: duplicate ingestion
     inflates event_count rather than creating a second alert.
     """
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "dup.db"))
     attack_ip = "203.0.113.10"
     lines = [_failed_login_line(i, attack_ip) for i in range(5)]
 
-    first = client.post("/api/v1/events/ingest", json={"lines": lines}).json()
+    first = api_client.post("/api/v1/events/ingest", json={"lines": lines}).json()
     assert len(first["alerts"]) == 1
     assert first["alerts"][0]["event_count"] == 5
     alert_id = first["alerts"][0]["id"]
 
-    second = client.post("/api/v1/events/ingest", json={"lines": lines}).json()
+    second = api_client.post("/api/v1/events/ingest", json={"lines": lines}).json()
     assert second["alerts"] == []  # no new alert created
-    assert client.get("/api/v1/alerts?status=all&limit=100").json()["count"] == 1
+    assert api_client.get("/api/v1/alerts?status=all&limit=100").json()["count"] == 1
 
-    detail = client.get(f"/api/v1/alerts/{alert_id}").json()
+    detail = api_client.get(f"/api/v1/alerts/{alert_id}").json()
     assert detail["alert"]["id"] == alert_id
     assert detail["alert"]["event_count"] == 10  # 5 + 5 re-ingested rows
 
 
 def test_ingested_events_outside_detection_window_not_counted(
-    tmp_path, monkeypatch
+    api_client, tmp_path, monkeypatch
 ):
     """Failed logins with timestamps outside the 5-minute window are not counted."""
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "oow.db"))
     attack_ip = "203.0.113.10"
     # Five failures stamped ten minutes ago -> outside [now-5min, now].
     old = (
@@ -1164,12 +1136,12 @@ def test_ingested_events_outside_detection_window_not_counted(
         for i in range(5)
     ]
 
-    res = client.post("/api/v1/events/ingest", json={"lines": lines})
+    res = api_client.post("/api/v1/events/ingest", json={"lines": lines})
     body = res.json()
 
     assert body["parsed"] == 5
     assert body["alerts"] == []  # not counted -> no alert
-    assert client.get("/api/v1/alerts?status=all&limit=100").json()["count"] == 0
+    assert api_client.get("/api/v1/alerts?status=all&limit=100").json()["count"] == 0
 
 
 def test_rollback_on_failed_transaction_leaves_no_partial_data(

@@ -13,14 +13,11 @@ the *provenance distinction* that the dashboard relies on to tell synthetic
 HTTP-ingested events apart from genuine journal / Suricata telemetry.
 """
 
+import pytest
 from datetime import datetime, timezone
-
-from fastapi.testclient import TestClient
 
 from backend.app.main import app
 from backend.app.siem import ingest_events, ingest_lines
-
-client = TestClient(app)
 
 # Reserved documentation IPs — never routable, never target external systems.
 ATTACK_IP = "203.0.113.10"
@@ -45,18 +42,16 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def test_ssh_brute_force_live_detection_contract(tmp_path, monkeypatch):
+def test_ssh_brute_force_live_detection_contract(api_client, tmp_path):
     """Acceptance contract for the live SSH brute-force workflow.
 
     Mirrors docs/LIVE_THREAT_TEST.md: 5 synthetic failed logins via the real
     HTTP ingestion endpoint on an isolated DB must produce exactly one
     SSH_BRUTE_FORCE alert whose evidence window contains all 5 events.
     """
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "live.db"))
-
     # 1, 2, 3: five failed SSH logins from one reserved source IP.
     lines = [_failed_login_line(i, ATTACK_IP) for i in range(5)]
-    resp = client.post("/api/v1/events/ingest", json={"lines": lines})
+    resp = api_client.post("/api/v1/events/ingest", json={"lines": lines})
     assert resp.status_code == 200
     body = resp.json()
     assert body["received"] == 5
@@ -66,7 +61,7 @@ def test_ssh_brute_force_live_detection_contract(tmp_path, monkeypatch):
     assert len(body["alerts"]) == 1
 
     # 3 (cont.): events are persisted and retrievable through the events API.
-    events = client.get("/api/v1/events?limit=100").json()
+    events = api_client.get("/api/v1/events?limit=100").json()
     assert events["count"] == 5
     assert all(e["event_type"] == "ssh_login_failed" for e in events["events"])
     assert all(e["source_ip"] == ATTACK_IP for e in events["events"])
@@ -80,11 +75,11 @@ def test_ssh_brute_force_live_detection_contract(tmp_path, monkeypatch):
     assert alert["event_count"] == 5
 
     # 5, 6: the alert is retrievable through the alerting API with evidence.
-    alerts = client.get("/api/v1/alerts?status=all&limit=100").json()
+    alerts = api_client.get("/api/v1/alerts?status=all&limit=100").json()
     assert alerts["count"] == 1
     assert alerts["alerts"][0]["id"] == alert["id"]
 
-    detail = client.get(f"/api/v1/alerts/{alert['id']}").json()
+    detail = api_client.get(f"/api/v1/alerts/{alert['id']}").json()
     assert detail["alert"]["event_count"] == 5
     assert len(detail["evidence_events"]) == 5
     assert {e["source_ip"] for e in detail["evidence_events"]} == {ATTACK_IP}
@@ -95,7 +90,7 @@ def test_ssh_brute_force_live_detection_contract(tmp_path, monkeypatch):
 
 
 def test_synthetic_events_are_distinguished_from_journal_and_suricata(
-    tmp_path, monkeypatch
+    api_client, tmp_path
 ):
     """Provenance distinction (dashboard §4).
 
@@ -105,11 +100,10 @@ def test_synthetic_events_are_distinguished_from_journal_and_suricata(
     ``eventSourceLabel``/``eventSourceTone`` derive their badges from this field,
     so the distinction is observable in the data contract consumed by the UI.
     """
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "prov.db"))
 
     # Synthetic SSH failures via the HTTP path -> source is NULL.
     lines = [_failed_login_line(i, ATTACK_IP) for i in range(5)]
-    http = client.post("/api/v1/events/ingest", json={"lines": lines}).json()
+    http = api_client.post("/api/v1/events/ingest", json={"lines": lines}).json()
     assert http["parsed"] == 5
     assert all(e.get("source") is None for e in http["events"])
 
@@ -145,7 +139,7 @@ def test_synthetic_events_are_distinguished_from_journal_and_suricata(
     ingest_events([journal_event, suricata_event])
 
     # 7 events total: 5 HTTP-sourced + 1 journal + 1 suricata.
-    events = client.get("/api/v1/events?limit=100").json()
+    events = api_client.get("/api/v1/events?limit=100").json()
     assert events["count"] == 7
     sources = {e.get("source") for e in events["events"]}
     assert sources == {None, "journal", "suricata"}  # NULL, journal, suricata
@@ -159,7 +153,7 @@ def test_synthetic_events_are_distinguished_from_journal_and_suricata(
     # Suricata ``alert`` raises its own Greywatch alert (SURICATA_ALERT). The
     # two incident sources are still distinguished by the event ``source``
     # column, so the SSH and Suricata alerts never collide.
-    alerts = client.get("/api/v1/alerts?status=all&limit=100").json()
+    alerts = api_client.get("/api/v1/alerts?status=all&limit=100").json()
     assert alerts["count"] == 2
     by_rule = {a["rule_id"] for a in alerts["alerts"]}
     assert by_rule == {"SSH_BRUTE_FORCE", "SURICATA_ALERT"}
@@ -171,14 +165,13 @@ def test_synthetic_events_are_distinguished_from_journal_and_suricata(
     assert suri["severity"] == "high"
 
 
-def test_ingest_lines_api_still_accepts_mixed_lines(tmp_path, monkeypatch):
+def test_ingest_lines_api_still_accepts_mixed_lines(api_client, tmp_path):
     """Regression guard: the HTTP ingestion path remains backward compatible.
 
     A mix of a failed login, a successful login, an invalid user, and an
     unrecognized line must parse the auth-related ones and ignore the rest,
     without changing the detection contract.
     """
-    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "mixed.db"))
     mixed = [
         _failed_login_line(0, ATTACK_IP),
         "sshd[6100]: Accepted publickey for bystander from 203.0.113.10 port 56001 ssh2",

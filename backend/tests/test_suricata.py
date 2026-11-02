@@ -41,8 +41,6 @@ from backend.app.siem import (
     list_events,
 )
 
-client = TestClient(app)
-
 
 # --------------------------------------------------------------------------- #
 # Helpers / fixtures
@@ -234,7 +232,7 @@ def test_parse_eve_uses_host_field_when_present():
 # --------------------------------------------------------------------------- #
 
 
-def test_collect_ingests_alert_records(_db, tmp_path):
+def test_collect_ingests_alert_records(api_client, tmp_path):
     path = _write_eve(tmp_path / "eve.json", [_alert_line(i) for i in range(3)])
     result = collect_once(SuricataConfig(eve_path=str(path)))
 
@@ -279,17 +277,17 @@ def test_collect_ingests_alert_records(_db, tmp_path):
     assert {r["signature_id"] for r in rows} == {2023000, 2023001, 2023002}
 
 
-def test_collected_events_visible_via_events_api(_db, tmp_path, monkeypatch):
+def test_collected_events_visible_via_events_api(api_client, tmp_path, monkeypatch):
     path = _write_eve(tmp_path / "eve.json", [_alert_line(i) for i in range(3)])
     monkeypatch.setenv("GREYWATCH_SURICATA_EVE_PATH", str(path))
 
-    resp = client.post("/api/v1/suricata/collect")
+    resp = api_client.post("/api/v1/suricata/collect")
     assert resp.status_code == 200
     body = resp.json()
     assert body["events_ingested"] == 3
     assert body["errors"] == []
 
-    events = client.get("/api/v1/events").json()["events"]
+    events = api_client.get("/api/v1/events").json()["events"]
     assert len(events) == 3
     assert all(e["source"] == "suricata" for e in events)
     suricata_event = events[0]  # most recent
@@ -301,12 +299,12 @@ def test_collected_events_visible_via_events_api(_db, tmp_path, monkeypatch):
         assert suricata_event[field]
 
 
-def test_collected_events_visible_via_api_raw_json_field(_db, tmp_path, monkeypatch):
+def test_collected_events_visible_via_api_raw_json_field(api_client, tmp_path, monkeypatch):
     """The raw_message stored verbatim lets the dashboard render any field."""
     path = _write_eve(tmp_path / "eve.json", [_alert_line(0)])
     monkeypatch.setenv("GREYWATCH_SURICATA_EVE_PATH", str(path))
-    client.post("/api/v1/suricata/collect")
-    ev = client.get("/api/v1/events").json()["events"][0]
+    api_client.post("/api/v1/suricata/collect")
+    ev = api_client.get("/api/v1/events").json()["events"][0]
     # raw_message is the original EVE JSON line -> recoverable verbatim.
     assert json.loads(ev["raw_message"])["alert"]["signature"] == "ET SCAN test signature 0"
 
@@ -316,7 +314,7 @@ def test_collected_events_visible_via_api_raw_json_field(_db, tmp_path, monkeypa
 # --------------------------------------------------------------------------- #
 
 
-def test_collect_progress_advances_offset_and_idle_resumes(_db, tmp_path):
+def test_collect_progress_advances_offset_and_idle_resumes(api_client, tmp_path):
     path = _write_eve(tmp_path / "eve.json", [_alert_line(i) for i in range(3)])
     cfg = SuricataConfig(eve_path=str(path))
 
@@ -344,7 +342,7 @@ def test_collect_progress_advances_offset_and_idle_resumes(_db, tmp_path):
     assert len(_event_rows()) == 5
 
 
-def test_collect_within_batch_dedup_by_raw_line(_db, tmp_path):
+def test_collect_within_batch_dedup_by_raw_line(api_client, tmp_path):
     """Identical EVE lines within a single read are ingested once."""
     line = _alert_line(0)
     path = _write_eve(tmp_path / "eve.json", [line, line, line])
@@ -359,7 +357,7 @@ def test_collect_within_batch_dedup_by_raw_line(_db, tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-def test_collect_skips_malformed_lines(_db, tmp_path):
+def test_collect_skips_malformed_lines(api_client, tmp_path):
     """A corrupt line never aborts the batch; valid records around it are kept."""
     records = [
         _alert_line(0),
@@ -379,7 +377,7 @@ def test_collect_skips_malformed_lines(_db, tmp_path):
     assert len(_event_rows()) == 2
 
 
-def test_collect_respects_max_records_cap(_db, tmp_path):
+def test_collect_respects_max_records_cap(api_client, tmp_path):
     """A very large EVE file is processed in bounded chunks (no OOM)."""
     path = _write_eve(tmp_path / "eve.json", [_alert_line(i) for i in range(5)])
     cfg = SuricataConfig(eve_path=str(path), max_records=2)
@@ -405,7 +403,7 @@ def test_collect_respects_max_records_cap(_db, tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-def test_collect_rotation_resets_offset_and_dedups(_db, tmp_path):
+def test_collect_rotation_resets_offset_and_dedups(api_client, tmp_path):
     """If the EVE file shrinks below the stored offset, the collector resets
     and re-reads from 0, de-duplicating records already ingested."""
     path = _write_eve(tmp_path / "eve.json", [_alert_line(i) for i in range(4)])
@@ -429,7 +427,7 @@ def test_collect_rotation_resets_offset_and_dedups(_db, tmp_path):
     assert get_collector_setting("suricata_last_offset") == str(path.stat().st_size)
 
 
-def test_collect_handles_missing_file(_db, tmp_path):
+def test_collect_handles_missing_file(api_client, tmp_path):
     """A missing/unreadable EVE file is reported, not raised."""
     cfg = SuricataConfig(eve_path=str(tmp_path / "does-not-exist.json"))
     result = collect_once(cfg)
@@ -445,7 +443,7 @@ def test_collect_handles_missing_file(_db, tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-def test_suricata_alerts_do_not_trigger_ssh_brute_force(_db, tmp_path, monkeypatch):
+def test_suricata_alerts_do_not_trigger_ssh_brute_force(api_client, tmp_path, monkeypatch):
     """Suricata ``alert`` events become ``suricata_alert`` events (not
     ``ssh_login_failed``), so they raise ``SURICATA_ALERT`` alerts and never
     fire ``SSH_BRUTE_FORCE``. The SSH rule still works independently via the
@@ -461,7 +459,7 @@ def test_suricata_alerts_do_not_trigger_ssh_brute_force(_db, tmp_path, monkeypat
     assert all(a["status"] == "open" for a in result.new_alerts)
     assert not any(a["rule_id"] == "SSH_BRUTE_FORCE" for a in result.new_alerts)
 
-    persisted = client.get("/api/v1/alerts?status=all&limit=100").json()
+    persisted = api_client.get("/api/v1/alerts?status=all&limit=100").json()
     assert len(persisted["alerts"]) == 5
     assert all(a["rule_id"] == "SURICATA_ALERT" for a in persisted["alerts"])
     assert not any(
@@ -476,7 +474,7 @@ def test_suricata_alerts_do_not_trigger_ssh_brute_force(_db, tmp_path, monkeypat
         f"from 203.0.113.10 port 5400{i} ssh2"
         for i in range(5)
     ]
-    resp = client.post("/api/v1/events/ingest", json={"lines": lines})
+    resp = api_client.post("/api/v1/events/ingest", json={"lines": lines})
     ssh_alerts = resp.json()["alerts"]
     assert len(ssh_alerts) == 1
     assert ssh_alerts[0]["rule_id"] == "SSH_BRUTE_FORCE"
@@ -488,7 +486,7 @@ def test_suricata_alerts_do_not_trigger_ssh_brute_force(_db, tmp_path, monkeypat
 # --------------------------------------------------------------------------- #
 
 
-def test_status_reports_checkpoint(_db, tmp_path, monkeypatch):
+def test_status_reports_checkpoint(api_client, tmp_path, monkeypatch):
     path = _write_eve(tmp_path / "eve.json", [_alert_line(i) for i in range(2)])
     monkeypatch.setenv("GREYWATCH_SURICATA_EVE_PATH", str(path))
     collect_once(SuricataConfig(eve_path=str(path)))
@@ -502,9 +500,9 @@ def test_status_reports_checkpoint(_db, tmp_path, monkeypatch):
     assert st["last_run_at"] is not None
 
 
-def test_status_endpoint(_db, tmp_path, monkeypatch):
+def test_status_endpoint(api_client, tmp_path, monkeypatch):
     monkeypatch.setenv("GREYWATCH_SURICATA_EVE_PATH", str(tmp_path / "eve.json"))
-    resp = client.get("/api/v1/suricata/status")
+    resp = api_client.get("/api/v1/suricata/status")
     assert resp.status_code == 200
     body = resp.json()
     assert set(body) == {
@@ -533,15 +531,14 @@ def test_status_endpoint(_db, tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- #
 
 
-def test_suricata_status_health_fields_after_successful_run(_db, tmp_path, monkeypatch):
+def test_suricata_status_health_fields_after_successful_run(api_client, tmp_path, monkeypatch):
     """A successful collection cycle records attempts, successful_runs,
     last_successful_run_at, records_seen and deduplicated."""
-    monkeypatch.setenv("GREYWATCH_DB", str(_db / "health.db"))
     path = _write_eve(tmp_path / "eve.json", [_alert_line(0)])
     cfg = SuricataConfig(eve_path=str(path))
     collect_once(cfg)
 
-    body = client.get("/api/v1/suricata/status").json()
+    body = api_client.get("/api/v1/suricata/status").json()
     assert body["attempts"] == 1
     assert body["successful_runs"] == 1
     assert body["failed_runs"] == 0
@@ -553,15 +550,14 @@ def test_suricata_status_health_fields_after_successful_run(_db, tmp_path, monke
     assert body["last_attempt_at"] == body["last_successful_run_at"]
 
 
-def test_suricata_failed_run_records_error_not_success(_db, tmp_path, monkeypatch):
+def test_suricata_failed_run_records_error_not_success(api_client, tmp_path, monkeypatch):
     """A failed cycle (missing EVE file) advances attempts/failed_runs and
     last_error, but does NOT advance last_successful_run_at."""
-    monkeypatch.setenv("GREYWATCH_DB", str(_db / "fail.db"))
     # First: a successful run to establish a baseline.
     path = _write_eve(tmp_path / "eve.json", [_alert_line(0)])
     cfg = SuricataConfig(eve_path=str(path))
     collect_once(cfg)
-    before = client.get("/api/v1/suricata/status").json()
+    before = api_client.get("/api/v1/suricata/status").json()
     assert before["successful_runs"] == 1
     assert before["failed_runs"] == 0
     successful_run_at = before["last_successful_run_at"]
@@ -571,7 +567,7 @@ def test_suricata_failed_run_records_error_not_success(_db, tmp_path, monkeypatc
     second = collect_once(bad_cfg)
     assert second.errors
 
-    body = client.get("/api/v1/suricata/status").json()
+    body = api_client.get("/api/v1/suricata/status").json()
     assert body["attempts"] == 2
     assert body["failed_runs"] == 1
     assert body["successful_runs"] == 1  # unchanged by the failed cycle
@@ -582,10 +578,9 @@ def test_suricata_failed_run_records_error_not_success(_db, tmp_path, monkeypatc
     assert body["last_successful_run_at"] == successful_run_at
 
 
-def test_suricata_idle_run_is_successful(_db, tmp_path, monkeypatch):
+def test_suricata_idle_run_is_successful(api_client, tmp_path, monkeypatch):
     """A cycle that finds nothing new is still a successful run (idle, not
     failed): last_successful_run_at advances, failed_runs stays 0."""
-    monkeypatch.setenv("GREYWATCH_DB", str(_db / "idle.db"))
     path = _write_eve(tmp_path / "eve.json", [_alert_line(0)])
     cfg = SuricataConfig(eve_path=str(path))
     first = collect_once(cfg)
@@ -596,17 +591,16 @@ def test_suricata_idle_run_is_successful(_db, tmp_path, monkeypatch):
     assert second.events_ingested == 0
     assert second.errors == []
 
-    body = client.get("/api/v1/suricata/status").json()
+    body = api_client.get("/api/v1/suricata/status").json()
     assert body["attempts"] == 2
     assert body["successful_runs"] == 2
     assert body["failed_runs"] == 0
     assert body["last_successful_run_at"] == body["last_attempt_at"]
 
 
-def test_suricata_dedup_tracked_on_identical_replay(_db, tmp_path, monkeypatch):
+def test_suricata_dedup_tracked_on_identical_replay(api_client, tmp_path, monkeypatch):
     """records_seen and deduplicated are tracked when the same EVE line is
     replayed at a new byte offset (within-batch raw-line dedup)."""
-    monkeypatch.setenv("GREYWATCH_DB", str(_db / "dedup.db"))
     line = _alert_line(0)
     path = tmp_path / "eve.json"
     path.write_text(line + "\n" + line + "\n", encoding="utf-8")
@@ -617,26 +611,25 @@ def test_suricata_dedup_tracked_on_identical_replay(_db, tmp_path, monkeypatch):
     assert result.records_seen == 2
     assert result.events_ingested == 1
 
-    body = client.get("/api/v1/suricata/status").json()
+    body = api_client.get("/api/v1/suricata/status").json()
     assert body["records_seen"] == 2
     assert body["deduplicated"] == 1
     assert body["attempts"] == 1
     assert body["successful_runs"] == 1
 
 
-def test_suricata_disabled_collector_status(_db, monkeypatch):
+def test_suricata_disabled_collector_status(api_client, monkeypatch):
     """A disabled collector reports enabled=false without collecting."""
-    monkeypatch.setenv("GREYWATCH_DB", str(_db / "disabled.db"))
     monkeypatch.setenv("GREYWATCH_SURICATA_ENABLED", "0")
     assert suricata_mod.get_config().enabled is False
 
-    body = client.get("/api/v1/suricata/status").json()
+    body = api_client.get("/api/v1/suricata/status").json()
     assert body["enabled"] is False
 
 
-def test_collect_endpoint_missing_file_reports_error(_db, tmp_path, monkeypatch):
+def test_collect_endpoint_missing_file_reports_error(api_client, tmp_path, monkeypatch):
     monkeypatch.setenv("GREYWATCH_SURICATA_EVE_PATH", str(tmp_path / "nope.json"))
-    resp = client.post("/api/v1/suricata/collect")
+    resp = api_client.post("/api/v1/suricata/collect")
     assert resp.status_code == 200  # error is reported, not raised
     body = resp.json()
     assert body["events_ingested"] == 0
@@ -644,12 +637,12 @@ def test_collect_endpoint_missing_file_reports_error(_db, tmp_path, monkeypatch)
     assert body["errors"]
 
 
-def test_collect_endpoint_missing_file_sanitizes_path(_db, tmp_path, monkeypatch):
+def test_collect_endpoint_missing_file_sanitizes_path(api_client, tmp_path, monkeypatch):
     """Missing EVE file error must not expose the configured filesystem path
     in the API response. Full details remain in server-side logs."""
     eve_path = str(tmp_path / "deep" / "nested" / "eve.json")
     monkeypatch.setenv("GREYWATCH_SURICATA_EVE_PATH", eve_path)
-    resp = client.post("/api/v1/suricata/collect")
+    resp = api_client.post("/api/v1/suricata/collect")
     assert resp.status_code == 200  # error is reported, not raised
     body = resp.json()
     assert body["events_ingested"] == 0
@@ -660,7 +653,7 @@ def test_collect_endpoint_missing_file_sanitizes_path(_db, tmp_path, monkeypatch
         assert "/deep/" not in err, f"raw path segment not sanitized: {err}"
 
 
-def test_run_loop_no_op_when_disabled(_db, tmp_path, monkeypatch):
+def test_run_loop_no_op_when_disabled(api_client, tmp_path, monkeypatch):
     """An enabled=False config never collects (no EVE file even required)."""
     monkeypatch.setenv("GREYWATCH_SURICATA_EVE_PATH", str(tmp_path / "eve.json"))
     cfg = SuricataConfig(enabled=False, eve_path=str(tmp_path / "nonexistent.json"))
@@ -669,10 +662,12 @@ def test_run_loop_no_op_when_disabled(_db, tmp_path, monkeypatch):
     assert len(_event_rows()) == 0
 
 
-def test_cli_once_reports_missing_file(_db, monkeypatch):
+def test_cli_once_reports_missing_file(tmp_path, monkeypatch):
     """`python -m backend.app.suricata --once` degrades gracefully."""
+    monkeypatch.setenv("GREYWATCH_DB", str(tmp_path / "cli.db"))
+    initialize_database()
     monkeypatch.setenv(
-        "GREYWATCH_SURICATA_EVE_PATH", str(_db / "nope.json")
+        "GREYWATCH_SURICATA_EVE_PATH", str(tmp_path / "nope.json")
     )
     rc = suricata_mod.main(["--once"])
     assert rc == 1  # errors present -> non-zero, but no crash
@@ -1115,7 +1110,7 @@ def test_sample_eve_produces_four_distinct_suricata_alerts(_db, tmp_path):
     assert len(_alert_rows()) == 4
 
 
-def test_suricata_alert_does_not_create_duplicate_api_alerts(_db, tmp_path, monkeypatch):
+def test_suricata_alert_does_not_create_duplicate_api_alerts(api_client, tmp_path, monkeypatch):
     """End-to-end via the HTTP collect endpoint: suricata alerts surface in
     /api/v1/alerts as SURICATA_ALERT, and a second collect cycle (idle) does
     not duplicate them."""
@@ -1128,17 +1123,17 @@ def test_suricata_alert_does_not_create_duplicate_api_alerts(_db, tmp_path, monk
         for i in range(3):
             fh.write(json.dumps(_eve_alert(ts=f"2024-10-12T08:00:0{i}.000000Z")))
             fh.write("\n")
-    resp = client.post("/api/v1/suricata/collect")
+    resp = api_client.post("/api/v1/suricata/collect")
     assert resp.status_code == 200
     body = resp.json()
     assert body["events_ingested"] == 3
     assert len([a for a in body["alerts"] if a["rule_id"] == "SURICATA_ALERT"]) == 1
 
     # Idle cycle: no new alerts, no duplicates.
-    resp2 = client.post("/api/v1/suricata/collect")
+    resp2 = api_client.post("/api/v1/suricata/collect")
     assert resp2.json()["events_ingested"] == 0
     assert resp2.json()["alerts"] == []
-    rows = client.get("/api/v1/alerts?status=all&limit=100").json()["alerts"]
+    rows = api_client.get("/api/v1/alerts?status=all&limit=100").json()["alerts"]
     assert len(rows) == 1
 
 

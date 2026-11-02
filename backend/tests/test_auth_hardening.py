@@ -120,11 +120,10 @@ def test_token_not_in_401_error_response_api_key(_token_env, caplog):
     assert TOKEN not in resp.text
 
 
-def test_token_not_in_status_response(_token_env, caplog):
+def test_token_not_in_status_response(api_client, _token_env, caplog):
     """Collector status responses must not contain the configured token."""
     with caplog.at_level(logging.INFO, logger="greywatch.api"):
-        client = TestClient(base_app)
-        resp = client.get(
+        resp = api_client.get(
             "/api/v1/suricata/status",
             headers={"Authorization": f"Bearer {TOKEN}"},
         )
