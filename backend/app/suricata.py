@@ -373,7 +373,6 @@ def _persist_health_state(
     before the main checkpoint transaction opens. Wraps the upsert in a
     transaction so the counters are committed atomically.
     """
-    siem.initialize_database()
     with siem._connection() as connection:
         _set_state(
             connection,
@@ -630,7 +629,6 @@ def collect_once(config: SuricataConfig | None = None) -> CollectResult:
     """
     config = config or get_config()
     result = CollectResult()
-    siem.initialize_database()
 
     # File stats for identity (inode:device) and rotation/truncation
     # detection (stored offset vs current size).
@@ -827,7 +825,6 @@ def status() -> dict:
     is the most recent safe error summary; it never exposes the EVE filesystem
     path, credentials, or tokens.
     """
-    siem.initialize_database()
     ingested_value = siem.get_collector_setting(_state_key_events_ingested(), "0")
     try:
         events_ingested = int(ingested_value)
