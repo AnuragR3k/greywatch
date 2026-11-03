@@ -42,7 +42,7 @@ from backend.app.migration_state import (
 from backend.app.siem import DEFAULT_DB_PATH, initialize_database
 
 # A registry used across tests that need a non-empty set of migrations.
-REGISTRY = (Migration(1, "init_schema"), Migration(2, "add_indexes"))
+REGISTRY = (Migration(1, "init_schema"), Migration(2, "add_indexes"), Migration(3, "add_col"))
 
 
 # --------------------------------------------------------------------------- #
@@ -540,30 +540,45 @@ def test_unversioned_current_schema(tmp_path, monkeypatch):
 
 
 def test_current_schema_no_ledger_is_pending_with_baseline(tmp_path, monkeypatch):
-    """Complete schema, no ledger, v1 registered -> PENDING (actual behavior).
+    """Complete schema, no ledger, v1+v2+v3 registered -> PENDING (actual behavior).
 
-    Per M4, UNVERSIONED requires an empty registry; with v1 registered,
-    ``applied_version (0) < latest (1)`` yields PENDING.
+    Per M4, UNVERSIONED requires an empty registry; with v1+v2+v3 registered,
+    ``applied_version (0) < latest (3)`` yields PENDING.
     """
     db_path = _current_db(tmp_path, monkeypatch)
-    report = inspect_path(db_path)  # default MIGRATIONS now contains v1
+    report = inspect_path(db_path)  # default MIGRATIONS now contains v1, v2, v3
     assert report.state is DatabaseState.PENDING
     assert report.applied_version == 0
-    assert report.latest_version == 1
+    assert report.latest_version == 3
     assert report.ledger_present is False
 
 
 def test_current_schema_with_baseline_ledger_is_current(tmp_path, monkeypatch):
-    """Complete schema + ledger (1, 'baseline') + v1 registered -> CURRENT."""
+    """Complete schema + ledger (1, 'baseline') + v1+v2+v3 registered -> PENDING (needs v2, v3)."""
     db_path = _current_db(tmp_path, monkeypatch)
     conn = _connect(db_path)
     _insert_ledger(conn, (1, "baseline", "t"))
     conn.close()
 
     report = inspect_path(db_path)  # default MIGRATIONS
-    assert report.state is DatabaseState.CURRENT
+    # Has v1 but not v2, v3, so PENDING
+    assert report.state is DatabaseState.PENDING
     assert report.applied_version == 1
-    assert report.latest_version == 1
+    assert report.latest_version == 3
+    assert report.ledger_present is True
+
+
+def test_current_schema_with_full_ledger_is_current(tmp_path, monkeypatch):
+    """Complete schema + full ledger (1, 2, 3) + v1+v2+v3 registered -> CURRENT."""
+    db_path = _current_db(tmp_path, monkeypatch)
+    conn = _connect(db_path)
+    _insert_ledger(conn, (1, "baseline", "t"), (2, "agents_and_api_keys", "t"), (3, "audit_log_integrity", "t"))
+    conn.close()
+
+    report = inspect_path(db_path)  # default MIGRATIONS
+    assert report.state is DatabaseState.CURRENT
+    assert report.applied_version == 3
+    assert report.latest_version == 3
     assert report.ledger_present is True
 
 
@@ -571,13 +586,13 @@ def test_current_with_registered_and_applied(tmp_path, monkeypatch):
     """A fully-applied ledger (== latest > 0) is CURRENT."""
     db_path = _current_db(tmp_path, monkeypatch)
     conn = _connect(db_path)
-    _insert_ledger(conn, (1, "init_schema", "t"), (2, "add_indexes", "t"))
+    _insert_ledger(conn, (1, "init_schema", "t"), (2, "add_indexes", "t"), (3, "add_col", "t"))
     conn.close()
 
     report = inspect_path(db_path, entries=REGISTRY)
     assert report.state is DatabaseState.CURRENT
-    assert report.applied_version == 2
-    assert report.latest_version == 2
+    assert report.applied_version == 3
+    assert report.latest_version == 3
     assert report.ledger_present is True
 
 
@@ -988,7 +1003,7 @@ def test_m2_generator_registry_consumed_once(tmp_path, monkeypatch):
     """A generator registry is consumed exactly once and still classifies."""
     db_path = _current_db(tmp_path, monkeypatch)
     conn = _connect(db_path)
-    _insert_ledger(conn, (1, "init_schema", "t"), (2, "add_indexes", "t"))
+    _insert_ledger(conn, (1, "init_schema", "t"), (2, "add_indexes", "t"), (3, "add_col", "t"))
     conn.close()
 
     consumed: list[Migration] = []
@@ -1000,15 +1015,15 @@ def test_m2_generator_registry_consumed_once(tmp_path, monkeypatch):
 
     report = inspect_path(db_path, entries=registry_gen())
     assert report.state is DatabaseState.CURRENT
-    # The generator was consumed exactly once (2 items, no second iteration).
-    assert len(consumed) == 2
+    # The generator was consumed exactly once (3 items, no second iteration).
+    assert len(consumed) == 3
 
 
 def test_m2_generator_registry_not_double_consumed(tmp_path, monkeypatch):
     """A generator that raises if iterated twice must work (consumed once)."""
     db_path = _current_db(tmp_path, monkeypatch)
     conn = _connect(db_path)
-    _insert_ledger(conn, (1, "init_schema", "t"), (2, "add_indexes", "t"))
+    _insert_ledger(conn, (1, "init_schema", "t"), (2, "add_indexes", "t"), (3, "add_col", "t"))
     conn.close()
 
     state = {"itters": 0}
@@ -1100,11 +1115,11 @@ def test_m4_states_report_consistent_versions(tmp_path, monkeypatch):
 
     # CURRENT: current schema + ledger applied==latest.
     conn = _connect(db_path)
-    _insert_ledger(conn, (1, "init_schema", "t"), (2, "add_indexes", "t"))
+    _insert_ledger(conn, (1, "init_schema", "t"), (2, "add_indexes", "t"), (3, "add_col", "t"))
     conn.close()
     report = inspect_path(db_path, entries=REGISTRY)
     assert report.state is DatabaseState.CURRENT
-    assert report.applied_version == report.latest_version == 2
+    assert report.applied_version == report.latest_version == 3
 
     # PENDING: applied < latest (clear the ledger first, then insert v1 only).
     conn = _connect(db_path)
@@ -1117,7 +1132,7 @@ def test_m4_states_report_consistent_versions(tmp_path, monkeypatch):
     report = inspect_path(db_path, entries=REGISTRY)
     assert report.state is DatabaseState.PENDING
     assert report.applied_version == 1
-    assert report.latest_version == 2
+    assert report.latest_version == 3
     assert report.applied_version < report.latest_version
 
 
@@ -1785,7 +1800,7 @@ def test_inspect_connection_bytes_factory_with_ledger(tmp_path, monkeypatch):
     db_path = _current_db(tmp_path, monkeypatch)
     conn = sqlite3.connect(db_path)
     conn.text_factory = bytes
-    _insert_ledger(conn, (1, REGISTRY[0].name, "t"), (2, REGISTRY[1].name, "t"))
+    _insert_ledger(conn, (1, REGISTRY[0].name, "t"), (2, REGISTRY[1].name, "t"), (3, REGISTRY[2].name, "t"))
     conn.commit()
     conn.close()
 
@@ -1794,8 +1809,8 @@ def test_inspect_connection_bytes_factory_with_ledger(tmp_path, monkeypatch):
     try:
         report = inspect_connection(conn, entries=REGISTRY)
         assert report.state is DatabaseState.CURRENT
-        assert report.applied_version == 2
-        assert report.latest_version == 2
+        assert report.applied_version == 3
+        assert report.latest_version == 3
         assert report.ledger_present is True
     finally:
         conn.close()
@@ -1938,24 +1953,28 @@ def test_genuine_corrupt_still_classified_as_corrupt(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- #
 
 
-def test_baseline_registry_contains_exactly_v1():
-    """MIGRATIONS contains exactly one entry: version 1 named 'baseline'."""
+def test_baseline_registry_contains_v1_and_v2():
+    """MIGRATIONS contains three entries: version 1 'baseline', version 2 'agents_and_api_keys', version 3 'audit_log_integrity'."""
     from backend.app.migration_registry import MIGRATIONS
 
-    assert len(MIGRATIONS) == 1
+    assert len(MIGRATIONS) == 3
     assert MIGRATIONS[0].version == 1
     assert MIGRATIONS[0].name == "baseline"
+    assert MIGRATIONS[1].version == 2
+    assert MIGRATIONS[1].name == "agents_and_api_keys"
+    assert MIGRATIONS[2].version == 3
+    assert MIGRATIONS[2].name == "audit_log_integrity"
 
 
-def test_baseline_registry_latest_version_is_1():
-    """latest_version() returns 1 with the shipped baseline."""
+def test_baseline_registry_latest_version_is_3():
+    """latest_version() returns 3 with the shipped migrations."""
     from backend.app.migration_registry import latest_version
 
-    assert latest_version() == 1
+    assert latest_version() == 3
 
 
 def test_baseline_registry_validation_accepts_it():
-    """validate_registry accepts the shipped baseline."""
+    """validate_registry accepts the shipped migrations."""
     from backend.app.migration_registry import MIGRATIONS, validate_registry
 
     assert validate_registry(MIGRATIONS) == MIGRATIONS
@@ -1976,7 +1995,7 @@ def test_baseline_ledger_name_mismatch_is_rejected(tmp_path, monkeypatch):
 def test_baseline_ledger_unknown_version_is_rejected(tmp_path, monkeypatch):
     """A ledger entry for an unregistered version is rejected, not silently accepted.
 
-    Applied version 5 > latest (1) is classified as NEWER (not silently accepted
+    Applied version 5 > latest (3) is classified as NEWER (not silently accepted
     as CURRENT). An invalid applied version (0) is INCONSISTENT.
     """
     db_path = _current_db(tmp_path, monkeypatch)
@@ -1987,7 +2006,7 @@ def test_baseline_ledger_unknown_version_is_rejected(tmp_path, monkeypatch):
     report = inspect_path(db_path)  # default MIGRATIONS
     assert report.state is DatabaseState.NEWER  # not silently accepted as current
     assert report.applied_version == 5
-    assert report.latest_version == 1
+    assert report.latest_version == 3
 
 
 def test_initialize_database_fingerprint_matches_expected(tmp_path, monkeypatch):

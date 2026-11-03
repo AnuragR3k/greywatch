@@ -135,7 +135,11 @@ class Migration:
 #: additional ``Migration(version, name)`` entries in the same change that adds
 #: the corresponding migration file. The future runner must not infer migrations
 #: from filesystem contents.
-MIGRATIONS: tuple[Migration, ...] = (Migration(1, "baseline"),)
+MIGRATIONS: tuple[Migration, ...] = (
+    Migration(1, "baseline"),
+    Migration(2, "agents_and_api_keys"),
+    Migration(3, "audit_log_integrity"),
+)
 
 
 def _is_int(value: object) -> bool:

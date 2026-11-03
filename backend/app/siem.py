@@ -711,6 +711,12 @@ def _store_events_and_detect(
     """
     inserted_events = []
 
+    # Check if events table has agent_id column (added in v2 migration)
+    has_agent_id = any(
+        row[1] == "agent_id"
+        for row in connection.execute("PRAGMA table_info(events)").fetchall()
+    )
+
     for event in events:
         # Normalize dedup fields so callers that omit them (e.g. ingest_events
         # with hand-built dicts) still get safe defaults.
@@ -721,36 +727,70 @@ def _store_events_and_detect(
             continue  # replayed record: do not insert, do not count
 
         try:
-            cursor = connection.execute(
-                """
-                INSERT INTO events (
-                    timestamp, host, event_type, username,
-                    source_ip, severity, raw_message, source,
-                    source_record_id, content_hash,
-                    dest_ip, src_port, dest_port, proto,
-                    signature, signature_id, category
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event["timestamp"],
-                    event["host"],
-                    event["event_type"],
-                    event["username"],
-                    event["source_ip"],
-                    event["severity"],
-                    event["raw_message"],
-                    event.get("source"),
-                    event.get("source_record_id"),
-                    event.get("content_hash"),
-                    event.get("dest_ip"),
-                    event.get("src_port"),
-                    event.get("dest_port"),
-                    event.get("proto"),
-                    event.get("signature"),
-                    event.get("signature_id"),
-                    event.get("category"),
-                ),
-            )
+            if has_agent_id:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO events (
+                        timestamp, host, event_type, username,
+                        source_ip, severity, raw_message, source,
+                        source_record_id, content_hash,
+                        dest_ip, src_port, dest_port, proto,
+                        signature, signature_id, category,
+                        agent_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event["timestamp"],
+                        event["host"],
+                        event["event_type"],
+                        event["username"],
+                        event["source_ip"],
+                        event["severity"],
+                        event["raw_message"],
+                        event.get("source"),
+                        event.get("source_record_id"),
+                        event.get("content_hash"),
+                        event.get("dest_ip"),
+                        event.get("src_port"),
+                        event.get("dest_port"),
+                        event.get("proto"),
+                        event.get("signature"),
+                        event.get("signature_id"),
+                        event.get("category"),
+                        event.get("agent_id"),
+                    ),
+                )
+            else:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO events (
+                        timestamp, host, event_type, username,
+                        source_ip, severity, raw_message, source,
+                        source_record_id, content_hash,
+                        dest_ip, src_port, dest_port, proto,
+                        signature, signature_id, category
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event["timestamp"],
+                        event["host"],
+                        event["event_type"],
+                        event["username"],
+                        event["source_ip"],
+                        event["severity"],
+                        event["raw_message"],
+                        event.get("source"),
+                        event.get("source_record_id"),
+                        event.get("content_hash"),
+                        event.get("dest_ip"),
+                        event.get("src_port"),
+                        event.get("dest_port"),
+                        event.get("proto"),
+                        event.get("signature"),
+                        event.get("signature_id"),
+                        event.get("category"),
+                    ),
+                )
         except sqlite3.IntegrityError:
             # Concurrent race on the (source, source_record_id) unique index:
             # another transaction inserted the same identifiable record first.
@@ -1428,7 +1468,9 @@ def resolve_incident(incident_id: int) -> dict:
 
 
 def ingest_lines(
-    lines: list[str], event_ids: list[str | None] | None = None
+    lines: list[str],
+    event_ids: list[str | None] | None = None,
+    agent_id: int | None = None,
 ) -> dict:
     """Parse and persist event lines, then evaluate the SSH brute-force rule.
 
@@ -1456,6 +1498,10 @@ def ingest_lines(
     a stable identifier per distinct event. Detecting key/content conflicts
     would require comparing stored content and is intentionally out of scope to
     keep ingestion backward-compatible.
+
+    Agent attribution: if ``agent_id`` is provided, all ingested events are
+    attributed to that agent. The agent_id must come from authenticated
+    request context, never from the event body.
     """
     if event_ids is not None and len(event_ids) != len(lines):
         raise ValueError("event_ids must be the same length as lines")
@@ -1471,6 +1517,8 @@ def ingest_lines(
             # unique index on (source, source_record_id) enforces replay safety.
             event["source_record_id"] = eid
             event["source"] = "http"
+        if agent_id is not None:
+            event["agent_id"] = agent_id
         parsed_events.append(event)
 
     with _connection() as connection:
@@ -1491,7 +1539,7 @@ def ingest_lines(
     }
 
 
-def ingest_events(events: list[dict]) -> dict:
+def ingest_events(events: list[dict], agent_id: int | None = None) -> dict:
     """Persist already-normalized events and evaluate detection rules.
 
     This is the structured-events entry point used by the journal collector.
@@ -1499,7 +1547,15 @@ def ingest_events(events: list[dict]) -> dict:
     produced by ``parse_auth_line`` or ``collector.parse_journal_record``)
     directly, so structured journal fields such as exact timestamps and
     provenance survive ingestion without a round-trip through text parsing.
+
+    Agent attribution: if ``agent_id`` is provided, all ingested events are
+    attributed to that agent. The agent_id must come from authenticated
+    request context, never from the event body.
     """
+    if agent_id is not None:
+        for event in events:
+            event["agent_id"] = agent_id
+
     with _connection() as connection:
         inserted_events, new_alerts, new_incidents = _store_events_and_detect(
             events, connection

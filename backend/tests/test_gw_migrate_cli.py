@@ -96,7 +96,15 @@ def _ledger_rows(path: Path) -> list[tuple[int, str]]:
 
 def _assert_migrated(path: Path) -> None:
     assert set(APP_TABLES) <= _tables(path)
-    assert _ledger_rows(path) == [(1, "baseline")]
+    # Also verify v2 tables exist
+    assert "agents" in _tables(path)
+    assert "api_keys" in _tables(path)
+    assert "audit_log" in _tables(path)
+    assert _ledger_rows(path) == [
+        (1, "baseline"),
+        (2, "agents_and_api_keys"),
+        (3, "audit_log_integrity"),
+    ]
 
 
 def _assert_unmigrated(path: Path) -> None:
@@ -135,7 +143,7 @@ def test_status_fresh_database(fresh_db: Path):
     assert result.stderr == ""
     assert "State: fresh" in result.stdout
     assert "Applied version: 0" in result.stdout
-    assert "Latest version: 1" in result.stdout
+    assert "Latest version: 3" in result.stdout
     assert "Ledger present: no" in result.stdout
 
 
@@ -145,7 +153,7 @@ def test_status_current_database(current_db: Path):
     assert result.returncode == 0
     assert result.stderr == ""
     assert "State: current" in result.stdout
-    assert "Applied version: 1" in result.stdout
+    assert "Applied version: 3" in result.stdout
     assert "Ledger present: yes" in result.stdout
 
 
@@ -172,8 +180,10 @@ def test_plan_fresh_database_lists_baseline(fresh_db: Path):
 
     assert result.returncode == 0
     assert result.stderr == ""
-    assert "Pending migrations (1):" in result.stdout
+    assert "Pending migrations (3):" in result.stdout
     assert "v1: baseline" in result.stdout
+    assert "v2: agents_and_api_keys" in result.stdout
+    assert "v3: audit_log_integrity" in result.stdout
     # A plan preview is strictly read-only.
     assert fresh_db.read_bytes() == before
     _assert_unmigrated(fresh_db)
@@ -232,7 +242,7 @@ def test_migrate_interactive_confirmation_applies(fresh_db: Path):
     assert result.returncode == 0
     assert result.stderr == ""
     assert "Apply pending migrations? [y/N]" in result.stdout
-    assert "Applied 1 migration(s)" in result.stdout
+    assert "Applied 3 migration(s)" in result.stdout
     _assert_migrated(fresh_db)
 
 
@@ -268,7 +278,7 @@ def test_migrate_yes_bypasses_confirmation_and_applies(fresh_db: Path):
     assert result.returncode == 0
     assert result.stderr == ""
     assert "Apply pending migrations? [y/N]" not in result.stdout
-    assert "Applied 1 migration(s)" in result.stdout
+    assert "Applied 3 migration(s)" in result.stdout
     _assert_migrated(fresh_db)
 
 
@@ -280,7 +290,7 @@ def test_migrate_dry_run_does_not_mutate_or_prompt(fresh_db: Path):
     assert result.returncode == 0
     assert result.stderr == ""
     assert "Apply pending migrations? [y/N]" not in result.stdout
-    assert "Would apply 1 migration(s)" in result.stdout
+    assert "Would apply 3 migration(s)" in result.stdout
     assert fresh_db.read_bytes() == before
     _assert_unmigrated(fresh_db)
 
@@ -291,7 +301,11 @@ def test_migrate_yes_on_current_database_is_noop(current_db: Path):
     assert result.returncode == 0
     assert result.stderr == ""
     assert "No migrations to apply" in result.stdout
-    assert _ledger_rows(current_db) == [(1, "baseline")]
+    assert _ledger_rows(current_db) == [
+        (1, "baseline"),
+        (2, "agents_and_api_keys"),
+        (3, "audit_log_integrity"),
+    ]
 
 
 def test_migrate_corrupt_database_reports_error_and_does_not_write(tmp_path: Path):

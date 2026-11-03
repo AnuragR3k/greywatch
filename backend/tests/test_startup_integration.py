@@ -129,7 +129,7 @@ class TestAtomicPublicationVerification:
         assert report.tables == []
         assert report.ledger_present is False
         assert report.applied_version == 0
-        assert report.latest_version == 1
+        assert report.latest_version == 3
 
     def test_temp_pathname_removed_after_publication(self, tmp_path):
         """Temporary pathname is removed after successful publication."""
