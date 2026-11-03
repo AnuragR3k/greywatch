@@ -36,6 +36,29 @@ from . import collector
 from . import suricata
 from .migration_state import ensure_database_file_exists, inspect_path, DatabaseState
 from .migrations.runner import migrate, MigrationError, MigrationStateError, MigrationConflictError
+from .agents import (
+    Agent,
+    ApiKey,
+    ApiKeyWithSecret,
+    create_agent,
+    get_agent,
+    get_agent_by_name,
+    list_agents,
+    update_agent,
+    deactivate_agent,
+    create_api_key,
+    get_api_key,
+    list_api_keys,
+    revoke_api_key,
+    rotate_api_key,
+    authenticate_api_key,
+    check_agent_rate_limit,
+    require_agent_auth,
+    is_agent_request,
+    get_audit_log,
+    set_event_agent_id,
+    KEY_PREFIX,
+)
 
 # Maximum HTTP request body size, in bytes. Configurable via the
 # ``GREYWATCH_MAX_REQUEST_BYTES`` environment variable; defaults to 1 MiB.
@@ -744,19 +767,48 @@ def _check_trust_boundary(request: Request) -> tuple[int, str] | None:
     """Evaluate Greywatch's trust boundary for a single request.
 
     Returns ``(status_code, detail)`` when the request must be denied, or
-    ``None`` when it is allowed through. See the module-level comment above for
-    the two modes:
+    ``None`` when it is allowed through.
 
-    * Token (network exposure): if ``GREYWATCH_API_TOKEN`` is set, the caller
-      must authenticate with ``Authorization: Bearer <token>`` or
-      ``X-API-Key: <token>``; missing/invalid -> 401. IP is irrelevant in this
-      mode, so the check applies uniformly to reads and writes.
-    * Loopback (local default): with no token set, only loopback peers
-      (127.0.0.1 / ::1, plus the TestClient sentinel "testclient") may use
-      non-public endpoints; a remote or UNKNOWN peer -> 403. The peer is read
-      from the ASGI connection (``request.client.host``); forwarding headers
-      are not consulted, so they cannot spoof loopback.
+    Three authentication modes:
+    1. Agent API Key (gw_*): Valid for ingestion endpoints only (/api/v1/events/ingest).
+       Agent keys are denied for admin/read endpoints.
+    2. Legacy Token (GREYWATCH_API_TOKEN): Valid for all non-public endpoints.
+    3. Loopback (default): Only loopback peers allowed for non-public endpoints.
+
+    The check applies uniformly to reads and writes in modes 2 and 3.
+    In mode 1 (agent key), access is restricted to ingestion endpoints only.
     """
+    path = request.url.path
+
+    # Check for agent API key first (gw_* prefix)
+    auth_header = request.headers.get("Authorization", "")
+    api_key_header = request.headers.get("X-API-Key", "")
+
+    provided_key = None
+    if auth_header.startswith("Bearer "):
+        provided_key = auth_header[len("Bearer "):].strip()
+    elif api_key_header:
+        provided_key = api_key_header.strip()
+
+    if provided_key and provided_key.startswith(KEY_PREFIX):
+        # Agent API key authentication - only allow ingestion endpoints
+        result = authenticate_api_key(provided_key)
+        if not result:
+            return 401, "Invalid or revoked agent API key"
+
+        # Agent keys can ONLY access ingestion endpoints
+        allowed_agent_paths = {
+            "/api/v1/events/ingest",
+        }
+        if path not in allowed_agent_paths:
+            return 403, "Agent API keys are restricted to ingestion endpoints only"
+
+        # Attach agent context to request for downstream use
+        request.state.agent = result.agent
+        request.state.api_key = result.api_key
+        return None
+
+    # Legacy token authentication (GREYWATCH_API_TOKEN)
     token = get_api_token()
     if token:
         provided = request.headers.get("Authorization", "")
@@ -773,6 +825,7 @@ def _check_trust_boundary(request: Request) -> tuple[int, str] | None:
             return 401, "Authentication required"
         return None
 
+    # Loopback mode (default)
     if os.environ.get("GREYWATCH_API_LOOPBACK_ONLY", "1").lower() in (
         "0",
         "false",
@@ -872,7 +925,7 @@ def health(request: Request):
 
 
 @app.post("/api/v1/events/ingest", tags=["ingestion"])
-def ingest(request: IngestRequest):
+def ingest(request: IngestRequest, http_request: Request):
     """Ingest raw log lines and evaluate configured detection rules.
 
     Access is governed by the Greywatch trust boundary (see
@@ -883,9 +936,17 @@ def ingest(request: IngestRequest):
     client-generated stable identifier). Replaying the same identifier does not
     insert a duplicate event or increment detection counts; see
     :func:`backend.app.siem.ingest_lines` for the count contract.
+
+    Agent attribution: if authenticated with an agent API key, events are
+    automatically attributed to that agent. The agent identity comes from the
+    authenticated request context, never from the event body.
     """
+    # Get agent_id from request context (set by trust boundary for agent auth)
+    agent_id = getattr(http_request.state, "agent", None)
+    agent_id = agent_id.id if agent_id else None
+
     try:
-        return ingest_lines(request.lines, request.event_ids)
+        return ingest_lines(request.lines, request.event_ids, agent_id=agent_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -1069,4 +1130,255 @@ def suricata_collect():
         "alerts": result.new_alerts,
         "fallback_used": result.fallback_used,
         "errors": _sanitize_errors(result.errors),
+    }
+
+
+# =============================================================================
+# Agent Management Endpoints (Admin Only)
+# =============================================================================
+
+class AgentCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=128, pattern=r"^[a-zA-Z0-9_-]+$")
+    display_name: str | None = Field(default=None, max_length=256)
+    description: str | None = Field(default=None, max_length=1024)
+
+
+class AgentUpdateRequest(BaseModel):
+    display_name: str | None = Field(default=None, max_length=256)
+    description: str | None = Field(default=None, max_length=1024)
+
+
+class AgentDeactivateRequest(BaseModel):
+    reason: str = Field(..., min_length=1, max_length=512)
+
+
+class ApiKeyCreateRequest(BaseModel):
+    name: str | None = Field(default=None, max_length=128)
+    expires_at: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(Z|[+-]\d{2}:?\d{2})?$")
+
+
+class ApiKeyRevokeRequest(BaseModel):
+    reason: str = Field(..., min_length=1, max_length=512)
+
+
+class ApiKeyRotateRequest(BaseModel):
+    pass  # No body needed
+
+
+@app.get("/api/v1/admin/agents", tags=["admin", "agents"])
+def admin_list_agents(
+    status: str | None = Query(default=None, pattern=r"^(active|inactive|revoked)$"),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    """List all agents (admin only).
+
+    Requires legacy token authentication or loopback access.
+    Agent API keys cannot access this endpoint.
+    """
+    agents = list_agents(status=status, limit=limit, offset=offset)
+    return {
+        "count": len(agents),
+        "agents": [
+            {
+                "id": a.id,
+                "name": a.name,
+                "display_name": a.display_name,
+                "description": a.description,
+                "status": a.status,
+                "created_at": a.created_at,
+                "updated_at": a.updated_at,
+                "last_seen_at": a.last_seen_at,
+                "deactivated_at": a.deactivated_at,
+                "deactivated_reason": a.deactivated_reason,
+            }
+            for a in agents
+        ],
+    }
+
+
+@app.get("/api/v1/admin/agents/{agent_id}", tags=["admin", "agents"])
+def admin_get_agent(agent_id: int):
+    """Get agent details (admin only)."""
+    agent = get_agent(agent_id)
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return {
+        "id": agent.id,
+        "name": agent.name,
+        "display_name": agent.display_name,
+        "description": agent.description,
+        "status": agent.status,
+        "created_at": agent.created_at,
+        "updated_at": agent.updated_at,
+        "last_seen_at": agent.last_seen_at,
+        "deactivated_at": agent.deactivated_at,
+        "deactivated_reason": agent.deactivated_reason,
+    }
+
+
+@app.post("/api/v1/admin/agents", tags=["admin", "agents"])
+def admin_create_agent(request: AgentCreateRequest):
+    """Create a new agent (admin only)."""
+    try:
+        agent = create_agent(
+            name=request.name,
+            display_name=request.display_name,
+            description=request.description,
+            actor="admin_api",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return {
+        "id": agent.id,
+        "name": agent.name,
+        "display_name": agent.display_name,
+        "description": agent.description,
+        "status": agent.status,
+        "created_at": agent.created_at,
+        "updated_at": agent.updated_at,
+    }
+
+
+@app.patch("/api/v1/admin/agents/{agent_id}", tags=["admin", "agents"])
+def admin_update_agent(agent_id: int, request: AgentUpdateRequest):
+    """Update agent metadata (admin only)."""
+    agent = update_agent(
+        agent_id,
+        display_name=request.display_name,
+        description=request.description,
+        actor="admin_api",
+    )
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return {
+        "id": agent.id,
+        "name": agent.name,
+        "display_name": agent.display_name,
+        "description": agent.description,
+        "status": agent.status,
+        "created_at": agent.created_at,
+        "updated_at": agent.updated_at,
+    }
+
+
+@app.post("/api/v1/admin/agents/{agent_id}/deactivate", tags=["admin", "agents"])
+def admin_deactivate_agent(agent_id: int, request: AgentDeactivateRequest):
+    """Deactivate an agent and revoke all its keys (admin only)."""
+    success = deactivate_agent(agent_id, request.reason, actor="admin_api")
+    if not success:
+        agent = get_agent(agent_id)
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        raise HTTPException(status_code=409, detail="Agent is not active")
+    return {"id": agent_id, "status": "inactive"}
+
+
+@app.get("/api/v1/admin/agents/{agent_id}/keys", tags=["admin", "agents"])
+def admin_list_agent_keys(agent_id: int, status: str | None = Query(default=None, pattern=r"^(active|revoked|expired)$")):
+    """List API keys for an agent (admin only)."""
+    agent = get_agent(agent_id)
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    keys = list_api_keys(agent_id, status=status)
+    return {
+        "count": len(keys),
+        "keys": [
+            {
+                "id": k.id,
+                "key_prefix": k.key_prefix,
+                "name": k.name,
+                "status": k.status,
+                "created_at": k.created_at,
+                "expires_at": k.expires_at,
+                "revoked_at": k.revoked_at,
+                "revoked_reason": k.revoked_reason,
+                "last_used_at": k.last_used_at,
+            }
+            for k in keys
+        ],
+    }
+
+
+@app.post("/api/v1/admin/agents/{agent_id}/keys", tags=["admin", "agents"])
+def admin_create_agent_key(agent_id: int, request: ApiKeyCreateRequest):
+    """Create a new API key for an agent (admin only).
+
+    The plaintext key is returned ONLY ONCE in the response.
+    Store it securely - it cannot be retrieved again.
+    """
+    agent = get_agent(agent_id)
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if agent.status != "active":
+        raise HTTPException(status_code=409, detail="Agent is not active")
+
+    try:
+        key = create_api_key(
+            agent_id=agent_id,
+            name=request.name,
+            expires_at=request.expires_at,
+            actor="admin_api",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    return {
+        "id": key.id,
+        "key_prefix": key.key_prefix,
+        "name": key.name,
+        "plaintext_key": key.plaintext_key,  # ONLY returned once!
+        "status": key.status,
+        "created_at": key.created_at,
+        "expires_at": key.expires_at,
+    }
+
+
+@app.post("/api/v1/admin/keys/{key_id}/revoke", tags=["admin", "agents"])
+def admin_revoke_key(key_id: int, request: ApiKeyRevokeRequest):
+    """Revoke an API key (admin only)."""
+    success = revoke_api_key(key_id, request.reason, actor="admin_api")
+    if not success:
+        key = get_api_key(key_id)
+        if not key:
+            raise HTTPException(status_code=404, detail="API key not found")
+        raise HTTPException(status_code=409, detail="Key is not active")
+    return {"id": key_id, "status": "revoked"}
+
+
+@app.post("/api/v1/admin/keys/{key_id}/rotate", tags=["admin", "agents"])
+def admin_rotate_key(key_id: int):
+    """Rotate an API key (admin only).
+
+    Creates a new key and immediately revokes the old one in a single transaction.
+    The new key's plaintext is returned ONLY ONCE in the response.
+    """
+    try:
+        key = rotate_api_key(key_id, actor="admin_api")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    return {
+        "id": key.id,
+        "key_prefix": key.key_prefix,
+        "name": key.name,
+        "plaintext_key": key.plaintext_key,  # ONLY returned once!
+        "status": key.status,
+        "created_at": key.created_at,
+        "expires_at": key.expires_at,
+    }
+
+
+@app.get("/api/v1/admin/audit-log", tags=["admin", "audit"])
+def admin_get_audit_log(
+    agent_id: int | None = Query(default=None),
+    event_type: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    """Get audit log entries (admin only)."""
+    entries = get_audit_log(agent_id=agent_id, event_type=event_type, limit=limit, offset=offset)
+    return {
+        "count": len(entries),
+        "entries": entries,
     }

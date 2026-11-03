@@ -23,10 +23,12 @@ from typing import TYPE_CHECKING
 from urllib.parse import quote
 
 from ..migration_ledger import SCHEMA_MIGRATIONS_TABLE, create_schema_migrations_table
-from ..migration_registry import MIGRATIONS, Migration
+from ..migration_registry import MIGRATIONS, Migration, latest_version, read_applied_versions, validate_ledger
 from ..migration_schema import compare_schema
 from ..migration_state import DatabaseReport, DatabaseState, inspect_path, MigrationStateError
-from .v001_baseline import PartialSchemaError, up as up_migration
+from .v001_baseline import PartialSchemaError, up as up_migration_v1
+from .v002_agents import up as up_migration_v2
+from .v003_audit_log_integrity import up as up_migration_v3
 
 if TYPE_CHECKING:
     pass
@@ -40,6 +42,12 @@ __all__ = [
     "MigrationStateError",
     "MigrationConflictError",
 ]
+
+MIGRATION_UPS = {
+    1: up_migration_v1,
+    2: up_migration_v2,
+    3: up_migration_v3,
+}
 
 
 class MigrationError(RuntimeError):
@@ -306,7 +314,11 @@ def migrate(path: str | os.PathLike[str], *, dry_run: bool = False) -> dict[str,
         return {"applied": 0, "skipped": 0}  # Already current
 
     if dry_run:
-        return {"applied": 1, "skipped": 0}
+        # Calculate how many migrations would be applied
+        highest_registered = latest_version(MIGRATIONS)
+        current_version = report.applied_version or 0
+        pending_count = max(0, highest_registered - current_version)
+        return {"applied": pending_count, "skipped": 0}
 
     # Phase 3: Open write connection and acquire lock
     conn = None
@@ -374,13 +386,40 @@ def migrate(path: str | os.PathLike[str], *, dry_run: bool = False) -> dict[str,
         else:
             applied_versions = ()
 
-        # Phase 8: Determine action based on locked state
-        if locked_report.state == DatabaseState.FRESH:
-            # Fresh database - run full migration
-            create_schema_migrations_table(conn)
+        # Phase 8: Apply all pending migrations
+        applied_count = 0
+        highest_registered = latest_version(MIGRATIONS)
+        current_version = max((v for v, _ in applied_versions), default=0)
+
+        # Determine which migrations need to be applied
+        pending_versions = [v for v in range(current_version + 1, highest_registered + 1)]
+
+        if not pending_versions:
+            # No migrations to apply (e.g., PENDING state just needs ledger stamp)
+            if locked_report.state == DatabaseState.PENDING and applied_versions:
+                # Schema is complete, just need to ensure ledger is stamped
+                utc_now = _utc_now().isoformat()
+                conn.execute(
+                    f"INSERT INTO {SCHEMA_MIGRATIONS_TABLE} (version, name, applied_at) VALUES (?, ?, ?)",
+                    (highest_registered, MIGRATIONS[highest_registered - 1].name, utc_now)
+                )
+                conn.commit()
+                return {"applied": 0, "skipped": 0}
+            conn.rollback()
+            return {"applied": 0, "skipped": 0}
+
+        # Ensure schema_migrations table exists before applying migrations
+        create_schema_migrations_table(conn)
+
+        for version in pending_versions:
+            migration_name = MIGRATIONS[version - 1].name
+            up_fn = MIGRATION_UPS.get(version)
+            if up_fn is None:
+                conn.rollback()
+                raise MigrationError(f"No up() function registered for migration version {version}")
 
             try:
-                up_migration(conn)
+                up_fn(conn)
             except PartialSchemaError as exc:
                 conn.rollback()
                 raise MigrationStateError(str(exc)) from exc
@@ -389,123 +428,26 @@ def migrate(path: str | os.PathLike[str], *, dry_run: bool = False) -> dict[str,
             diffs = compare_schema(conn)
             if not diffs.complete:
                 conn.rollback()
-                raise MigrationStateError(
-                    f"schema incomplete after migration"
-                )
+                raise MigrationStateError(f"schema incomplete after migration v{version}")
 
             # Foreign key check
             fk_violations = conn.execute("PRAGMA foreign_key_check").fetchall()
             if fk_violations:
                 conn.rollback()
                 raise MigrationError(
-                    f"foreign key violations after migration: {len(fk_violations)}"
+                    f"foreign key violations after migration v{version}: {len(fk_violations)}"
                 )
 
-            # Stamp ledger
+            # Stamp ledger for this migration
             utc_now = _utc_now().isoformat()
             conn.execute(
                 f"INSERT INTO {SCHEMA_MIGRATIONS_TABLE} (version, name, applied_at) VALUES (?, ?, ?)",
-                (MIGRATIONS[0].version, MIGRATIONS[0].name, utc_now)
+                (version, migration_name, utc_now)
             )
+            applied_count += 1
 
-            conn.commit()
-            return {"applied": 1, "skipped": 0}
-
-        elif locked_report.state == DatabaseState.LEDGER_ONLY:
-            # Ledger only - run full migration
-            create_schema_migrations_table(conn)
-
-            try:
-                up_migration(conn)
-            except PartialSchemaError as exc:
-                conn.rollback()
-                raise MigrationStateError(str(exc)) from exc
-
-            # Post-migration verification
-            diffs = compare_schema(conn)
-            if not diffs.complete:
-                conn.rollback()
-                raise MigrationStateError(f"schema incomplete after migration")
-
-            # Foreign key check
-            fk_violations = conn.execute("PRAGMA foreign_key_check").fetchall()
-            if fk_violations:
-                conn.rollback()
-                raise MigrationError(f"foreign key violations after migration: {len(fk_violations)}")
-
-            # Stamp ledger
-            utc_now = _utc_now().isoformat()
-            conn.execute(
-                f"INSERT INTO {SCHEMA_MIGRATIONS_TABLE} (version, name, applied_at) VALUES (?, ?, ?)",
-                (MIGRATIONS[0].version, MIGRATIONS[0].name, utc_now)
-            )
-
-            conn.commit()
-            return {"applied": 1, "skipped": 0}
-
-        elif locked_report.state == DatabaseState.LEGACY_READY:
-            # Legacy ready - run migration to add missing columns
-            create_schema_migrations_table(conn)
-
-            try:
-                up_migration(conn)
-            except PartialSchemaError as exc:
-                conn.rollback()
-                raise MigrationStateError(str(exc)) from exc
-
-            # Post-migration verification
-            diffs = compare_schema(conn)
-            if not diffs.complete:
-                conn.rollback()
-                raise MigrationStateError(f"schema incomplete after migration")
-
-            # Foreign key check
-            fk_violations = conn.execute("PRAGMA foreign_key_check").fetchall()
-            if fk_violations:
-                conn.rollback()
-                raise MigrationError(f"foreign key violations after migration: {len(fk_violations)}")
-
-            # Stamp ledger if not already present
-            if len(applied_versions) == 0:
-                utc_now = _utc_now().isoformat()
-                conn.execute(
-                    f"INSERT INTO {SCHEMA_MIGRATIONS_TABLE} (version, name, applied_at) VALUES (?, ?, ?)",
-                    (MIGRATIONS[0].version, MIGRATIONS[0].name, utc_now)
-                )
-
-            conn.commit()
-            return {"applied": 1, "skipped": 0}
-
-        elif locked_report.state == DatabaseState.PENDING:
-            # PENDING - just stamp the ledger, schema is complete
-            diffs = compare_schema(conn)
-            if not diffs.complete:
-                conn.rollback()
-                raise MigrationStateError(f"schema incomplete under lock")
-
-            # Foreign key check
-            fk_violations = conn.execute("PRAGMA foreign_key_check").fetchall()
-            if fk_violations:
-                conn.rollback()
-                raise MigrationError(f"foreign key violations: {len(fk_violations)}")
-
-            # Create ledger table if it doesn't exist
-            if not locked_report.ledger_present:
-                create_schema_migrations_table(conn)
-
-            # Stamp ledger
-            utc_now = _utc_now().isoformat()
-            conn.execute(
-                f"INSERT INTO {SCHEMA_MIGRATIONS_TABLE} (version, name, applied_at) VALUES (?, ?, ?)",
-                (MIGRATIONS[0].version, MIGRATIONS[0].name, utc_now)
-            )
-
-            conn.commit()
-            return {"applied": 1, "skipped": 0}
-
-        else:
-            conn.rollback()
-            return {"applied": 0, "skipped": 0}
+        conn.commit()
+        return {"applied": applied_count, "skipped": 0}
 
     except sqlite3.Error as exc:
         if "locked" in str(exc).lower():

@@ -525,6 +525,30 @@ URL) and record pass/fail.
 - [ ] A 401 (auth failure) does not consume a rate-limit token (verified by
   `test_rate_limit.py::test_auth_failure_does_not_consume_rate_token`).
 
+### Rate limit limitation: Process-local buckets (multi-instance deployments)
+
+**Important:** Agent rate limits in Greywatch are enforced using in-process token
+buckets. This means:
+
+- Each uvicorn worker process maintains its **own independent** rate-limit state.
+- Running multiple workers (e.g., `uvicorn --workers 4`) or multiple replicas
+  **multiplies the effective rate limits** by the number of processes.
+- There is **no distributed coordination** (no Redis, no shared state) in the
+  current implementation.
+
+**Supported deployment configuration today:**
+- Single uvicorn worker (`--workers 1`) behind a reverse proxy (Caddy).
+- This is the only configuration that provides the documented per-agent limits.
+
+**If you need multi-worker or multi-replica deployments:**
+- Do NOT use the built-in agent rate limiting without external coordination.
+- Options: run a single worker (accept throughput limits), or implement Redis-backed
+  rate limiting as a separate infrastructure change (not in scope for this release).
+
+**Workaround for staging:** Use `GREYWATCH_RATE_LIMIT_ENABLED=0` to disable
+agent rate limiting if running multiple workers is required, and enforce rate
+limits at the proxy layer (Caddy rate limiting) instead.
+
 ### E. Request-body limits
 - [ ] POST `/api/v1/events/ingest` with a body > `GREYWATCH_MAX_REQUEST_BYTES` returns `413`.
 - [ ] Body within the limit is accepted.
