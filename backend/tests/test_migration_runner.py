@@ -458,7 +458,7 @@ def test_fresh_database_migration(fresh_db_path):
 
     result = migrate(fresh_db_path)
 
-    assert result["applied"] == 3  # v1 baseline + v2 agents_and_api_keys + v3 audit_log_integrity
+    assert result["applied"] == 4  # v1 baseline + v2 agents_and_api_keys + v3 audit_log_integrity + v4 audit_chain_order
     assert result["skipped"] == 0
 
     # Verify the migration happened
@@ -471,13 +471,15 @@ def test_fresh_database_migration(fresh_db_path):
     try:
         cursor = conn.execute(f"SELECT version, name FROM {SCHEMA_MIGRATIONS_TABLE} ORDER BY version")
         rows = cursor.fetchall()
-        assert len(rows) == 3
+        assert len(rows) == 4
         assert rows[0][0] == 1
         assert rows[0][1] == "baseline"
         assert rows[1][0] == 2
         assert rows[1][1] == "agents_and_api_keys"
         assert rows[2][0] == 3
         assert rows[2][1] == "audit_log_integrity"
+        assert rows[3][0] == 4
+        assert rows[3][1] == "audit_chain_order"
     finally:
         conn.close()
 
@@ -505,7 +507,7 @@ def test_fresh_database_dry_run(fresh_db_path):
     """Dry run should not modify the database."""
     result = migrate(fresh_db_path, dry_run=True)
 
-    assert result["applied"] == 3  # v1 + v2 + v3 would be applied
+    assert result["applied"] == 4  # v1 + v2 + v3 + v4 would be applied
 
     # Database should remain FRESH (not migrated)
     report = status(fresh_db_path)
@@ -524,7 +526,7 @@ def test_ledger_only_empty_migration(ledger_only_db_path):
 
     result = migrate(ledger_only_db_path)
 
-    assert result["applied"] == 3  # v1 baseline + v2 agents_and_api_keys + v3 audit_log_integrity
+    assert result["applied"] == 4  # v1 baseline + v2 agents_and_api_keys + v3 audit_log_integrity + v4 audit_chain_order
 
     # All tables should now exist
     report = status(ledger_only_db_path)
@@ -551,7 +553,7 @@ def test_legacy_ready_with_missing_columns(legacy_ready_db_path):
     assert report.state == DatabaseState.LEGACY_READY
 
     result = migrate(legacy_ready_db_path)
-    assert result["applied"] == 3  # v1 baseline + v2 agents_and_api_keys + v3 audit_log_integrity
+    assert result["applied"] == 4  # v1 baseline + v2 agents_and_api_keys + v3 audit_log_integrity + v4 audit_chain_order
 
     # Verify schema is complete
     report = status(legacy_ready_db_path)
@@ -681,7 +683,7 @@ def test_legacy_ready_already_complete(tmp_path):
     assert report.state == DatabaseState.PENDING
 
     result = migrate(str(db_path))
-    assert result["applied"] == 3  # v1 baseline stamp + v2 agents_and_api_keys + v3 audit_log_integrity
+    assert result["applied"] == 4  # v1 baseline stamp + v2 agents_and_api_keys + v3 audit_log_integrity + v4 audit_chain_order
 
     # Should now be CURRENT
     report = status(str(db_path))
@@ -713,7 +715,7 @@ def test_pending_schema_stamp_only(complete_db_path):
 
     result = migrate(complete_db_path)
 
-    assert result["applied"] == 3  # v1 baseline stamp + v2 agents_and_api_keys + v3 audit_log_integrity
+    assert result["applied"] == 4  # v1 baseline stamp + v2 agents_and_api_keys + v3 audit_log_integrity + v4 audit_chain_order
     assert result["skipped"] == 0
 
     # Verify it's now current
@@ -1050,7 +1052,7 @@ def test_current_is_no_op(fresh_db_path):
     """Running migrate on a CURRENT database should be a no-op."""
     # First migrate
     result1 = migrate(fresh_db_path)
-    assert result1["applied"] == 3  # v1 + v2 + v3
+    assert result1["applied"] == 4  # v1 + v2 + v3 + v4
 
     # Second run should be no-op
     result2 = migrate(fresh_db_path)
@@ -1075,7 +1077,7 @@ def test_current_remains_unchanged(fresh_db_path):
     count_after = conn.execute(f"SELECT COUNT(*) FROM {SCHEMA_MIGRATIONS_TABLE}").fetchone()[0]
     conn.close()
 
-    assert count_before == count_after == 3
+    assert count_before == count_after == 4
 
 
 # --------------------------------------------------------------------------- #
@@ -1292,7 +1294,7 @@ def test_special_characters_in_path(tmp_path):
     conn.close()
 
     result = migrate(str(special_path))
-    assert result["applied"] == 3  # v1 + v2 + v3
+    assert result["applied"] == 4  # v1 + v2 + v3 + v4
 
     # Verify it works
     report = status(str(special_path))
@@ -1327,7 +1329,7 @@ def test_idempotent_migration(fresh_db_path):
     """Running migration multiple times should be safe."""
     # First run
     result1 = migrate(fresh_db_path)
-    assert result1["applied"] == 3  # v1 + v2 + v3
+    assert result1["applied"] == 4  # v1 + v2 + v3 + v4
 
     # Second run
     result2 = migrate(fresh_db_path)
@@ -1337,11 +1339,11 @@ def test_idempotent_migration(fresh_db_path):
     report = status(fresh_db_path)
     assert report.state == DatabaseState.CURRENT
 
-    # Verify ledger entries (three: v1, v2, and v3)
+    # Verify ledger entries (four: v1, v2, v3, and v4)
     conn = sqlite3.connect(fresh_db_path)
     count = conn.execute(f"SELECT COUNT(*) FROM {SCHEMA_MIGRATIONS_TABLE}").fetchone()[0]
     conn.close()
-    assert count == 3
+    assert count == 4
 
 
 # --------------------------------------------------------------------------- #
@@ -1357,7 +1359,7 @@ def test_ledger_single_insert(fresh_db_path):
     cursor = conn.execute(f"SELECT COUNT(*) FROM {SCHEMA_MIGRATIONS_TABLE}")
     count = cursor.fetchone()[0]
     conn.close()
-    assert count == 3  # v1 baseline + v2 agents_and_api_keys + v3 audit_log_integrity
+    assert count == 4  # v1 baseline + v2 agents_and_api_keys + v3 audit_log_integrity + v4 audit_chain_order
 
 
 # --------------------------------------------------------------------------- #
@@ -1397,26 +1399,30 @@ def test_plan_empty_for_current(fresh_db_path):
 def test_plan_has_migration_for_pending(complete_db_path):
     """plan() returns migrations for PENDING database."""
     migrations = plan(complete_db_path)
-    assert len(migrations) == 3
+    assert len(migrations) == 4
     assert migrations[0].version == 1
     assert migrations[0].name == "baseline"
     assert migrations[1].version == 2
     assert migrations[1].name == "agents_and_api_keys"
     assert migrations[2].version == 3
     assert migrations[2].name == "audit_log_integrity"
+    assert migrations[3].version == 4
+    assert migrations[3].name == "audit_chain_order"
 
 
 def test_plan_fresh_returns_baseline(fresh_db_path):
     """plan() on a FRESH database previews all pending migrations."""
     migrations = plan(fresh_db_path)
 
-    assert len(migrations) == 3
+    assert len(migrations) == 4
     assert migrations[0].version == 1
     assert migrations[0].name == "baseline"
     assert migrations[1].version == 2
     assert migrations[1].name == "agents_and_api_keys"
     assert migrations[2].version == 3
     assert migrations[2].name == "audit_log_integrity"
+    assert migrations[3].version == 4
+    assert migrations[3].name == "audit_chain_order"
     # Planning is read-only: the database is still FRESH afterwards.
     assert status(fresh_db_path).state == DatabaseState.FRESH
 
@@ -1460,7 +1466,7 @@ def test_dry_run_never_writes(fresh_db_path):
 
     # Dry run
     result = migrate(fresh_db_path, dry_run=True)
-    assert result["applied"] == 3  # Would apply v1 + v2 + v3
+    assert result["applied"] == 4  # Would apply v1 + v2 + v3 + v4
 
     # Database should remain FRESH
     report = status(fresh_db_path)
@@ -1485,7 +1491,7 @@ def test_dry_run_no_confirmation_required(tmp_path):
 
     # Should not raise EOFError
     result = migrate(str(db_path), dry_run=True)
-    assert result["applied"] == 3  # v1 + v2 + v3 would be applied
+    assert result["applied"] == 4  # v1 + v2 + v3 + v4 would be applied
 
 
 # --------------------------------------------------------------------------- #
@@ -1499,10 +1505,10 @@ def _migration_holder_process(
     begin_probe_event,
     result_dict: dict,
 ) -> None:
-    """Process A: hold ``BEGIN IMMEDIATE`` and apply v1+v2 while B is blocked.
+    """Process A: hold ``BEGIN IMMEDIATE`` and apply v1-v4 while B is blocked.
 
     Acquires the write lock, then waits for Process B's non-blocking probe to
-    confirm the lock is held.  Only then does it perform a valid v1+v2 migration
+    confirm the lock is held.  Only then does it perform a valid v1-v4 migration
     and commit, guaranteeing B's own ``BEGIN IMMEDIATE`` waits for this
     transaction rather than starting after it finished.
     """
@@ -1516,6 +1522,8 @@ def _migration_holder_process(
     from backend.app.migrations.runner import _utc_now
     from backend.app.migrations.v001_baseline import up as _up_v1
     from backend.app.migrations.v002_agents import up as _up_v2
+    from backend.app.migrations.v003_audit_log_integrity import up as _up_v3
+    from backend.app.migrations.v004_audit_chain_order import up as _up_v4
 
     conn = _sqlite3.connect(db_path, timeout=30)
     conn.row_factory = _sqlite3.Row
@@ -1528,10 +1536,12 @@ def _migration_holder_process(
         if not begin_probe_event.wait(timeout=30):
             raise RuntimeError("Process B never probed for the write lock")
 
-        # Complete a real v1+v2 migration while still holding the write lock.
+        # Complete a real v1-v4 migration while still holding the write lock.
         _create_ledger(conn)
         _up_v1(conn)
         _up_v2(conn)
+        _up_v3(conn)
+        _up_v4(conn)
         diffs = _compare_schema(conn)
         if not diffs.complete:
             raise RuntimeError("migration produced an incomplete schema")
@@ -1547,8 +1557,12 @@ def _migration_holder_process(
             f"INSERT INTO {_LEDGER} (version, name, applied_at) VALUES (?, ?, ?)",
             (3, "audit_log_integrity", _utc_now().isoformat()),
         )
+        conn.execute(
+            f"INSERT INTO {_LEDGER} (version, name, applied_at) VALUES (?, ?, ?)",
+            (4, "audit_chain_order", _utc_now().isoformat()),
+        )
         conn.commit()  # releases the write lock
-        result_dict["applied"] = 3
+        result_dict["applied"] = 4
         result_dict["error"] = None
     except Exception as exc:  # noqa: BLE001
         conn.rollback()
@@ -1699,7 +1713,7 @@ def test_concurrent_second_process_waits_for_lock(tmp_path):
         snapshot_b = dict(results_b)
         manager.shutdown()
 
-    assert snapshot_a.get("applied") == 3, snapshot_a.get("error")
+    assert snapshot_a.get("applied") == 4, snapshot_a.get("error")
     assert snapshot_b.get("applied") == 0, snapshot_b.get("error")
 
     # B observed A's lock at the exact point it tried to acquire the writer.
@@ -1713,7 +1727,7 @@ def test_concurrent_second_process_waits_for_lock(tmp_path):
     assert observed[-1] == DatabaseState.CURRENT.value
     assert DatabaseState.CURRENT.value in observed
 
-    # Three ledger rows (v1, v2, and v3), and the database is CURRENT.
+    # Four ledger rows (v1, v2, v3, and v4), and the database is CURRENT.
     report = status(db_path)
     assert report.state == DatabaseState.CURRENT
     conn = sqlite3.connect(db_path)
@@ -1727,6 +1741,7 @@ def test_concurrent_second_process_waits_for_lock(tmp_path):
         (1, "baseline"),
         (2, "agents_and_api_keys"),
         (3, "audit_log_integrity"),
+        (4, "audit_chain_order"),
     ]
 
 

@@ -11,9 +11,10 @@
 #      (mode 0600, root readable only). The backend validates this token on
 #      every non-public API endpoint (token mode).
 #   2. Caddy: via Caddy's own environment (systemd EnvironmentFile or caddy
-#      service env). Caddy injects this token server-side as the
-#      Authorization header when proxying /api/* to the backend. The browser
-#      never sees the token.
+#      service env). Caddy injects this token server-side in the
+#      X-Greywatch-Token header when proxying dashboard /api/* requests to
+#      the backend. The browser never sees the token. Dedicated agent-ingest
+#      routes do not receive it (agents authenticate with their own gw_* key).
 #
 # Usage:
 #   sudo ./scripts/generate_staging_token.sh
@@ -62,7 +63,8 @@ echo ""
 echo "Next steps:"
 echo "  1. Set the same GREYWATCH_API_TOKEN in Caddy's environment (systemd"
 echo "     EnvironmentFile or caddy service env) so Caddy can inject it"
-echo "     server-side when proxying /api/* to the backend."
+echo "     server-side as X-Greywatch-Token when proxying dashboard /api/*"
+echo "     requests. Agent API keys use their own dedicated ingest route."
 echo "  2. Configure Caddy basicauth dashboard user + bcrypt hash"
 echo "     (caddy hash-password)."
 echo "  3. Reload Caddy and the GreyWatch API; see docs/DEPLOYMENT.md."

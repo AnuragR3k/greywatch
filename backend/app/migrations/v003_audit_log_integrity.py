@@ -93,53 +93,35 @@ def up(connection) -> None:
 
 
 def verify_chain(connection) -> tuple[bool, list[str]]:
-    """Verify the audit log hash chain integrity.
+    """Verify the audit log hash chain integrity in canonical id order.
 
-    Returns (is_valid, errors) where errors is a list of violation descriptions.
+    The canonical chain order is insertion order (``id ASC``).  This verifier
+    is read-only and never repairs the chain.  It returns ``(is_valid,
+    errors)`` where ``errors`` is a list of violation descriptions.
+
+    The migration's ``up()`` backfill above is frozen for compatibility with
+    databases that already applied v3.  Migration v004 rebuilds any such
+    timestamp-ordered chain in insertion order; after that point this verifier
+    and the stored chain agree.
     """
-    rows = connection.execute(
-        """
-        SELECT id, timestamp, event_type, agent_id, api_key_id, actor, detail,
-               prev_hash, chain_hash
-        FROM audit_log
-        ORDER BY timestamp ASC, id ASC
-        """
-    ).fetchall()
+    from backend.app.audit_chain import verify_chain as _verify_canonical
 
-    errors = []
-    prev_chain_hash = None
+    return _verify_canonical(connection)
 
-    for row in rows:
-        row_dict = dict(row)
-        stored_prev_hash = row_dict.get("prev_hash")
-        stored_chain_hash = row_dict.get("chain_hash")
 
-        # Check prev_hash linkage
-        if stored_prev_hash != prev_chain_hash:
-            errors.append(
-                f"Record id={row_dict['id']}: prev_hash mismatch "
-                f"(expected {prev_chain_hash}, got {stored_prev_hash})"
-            )
+def verify_chain_timestamp_order(connection) -> tuple[bool, list[str]]:
+    """Verify the historical v003 timestamp ordering (read-only).
 
-        # Verify chain_hash
-        canonical = _canonical_audit_row({
-            "timestamp": row_dict["timestamp"],
-            "event_type": row_dict["event_type"],
-            "agent_id": row_dict["agent_id"],
-            "api_key_id": row_dict["api_key_id"],
-            "actor": row_dict["actor"],
-            "detail": row_dict["detail"],
-        })
-        expected_chain_hash = _compute_chain_hash(stored_prev_hash, canonical)
-        if stored_chain_hash != expected_chain_hash:
-            errors.append(
-                f"Record id={row_dict['id']}: chain_hash mismatch "
-                f"(expected {expected_chain_hash}, got {stored_chain_hash})"
-            )
+    This reproduces the pre-v004 verifier (timestamp order, id-exclusive hash
+    formula).  Because v003's frozen backfill wrote id-inclusive hashes, use
+    ``audit_chain.validate_legacy_rows`` for pre-v004 compatibility checks.
+    Application code must use :func:`verify_chain` (insertion order).
+    """
+    from backend.app.audit_chain import (
+        verify_chain_timestamp_order as _verify_timestamp_order,
+    )
 
-        prev_chain_hash = stored_chain_hash
-
-    return len(errors) == 0, errors
+    return _verify_timestamp_order(connection)
 
 
 def down() -> None:

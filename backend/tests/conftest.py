@@ -47,6 +47,33 @@ def _disable_rate_limit_for_global_app(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _disable_preauth_rate_limit_for_global_app(monkeypatch):
+    """Disable the shared app's pre-auth agent-key limiter for existing tests.
+
+    ``PreAuthAgentRateLimitMiddleware`` is registered once on the global app
+    and keeps process-wide bucket state. Existing tests are not pre-auth
+    limiter tests; disabling here prevents cross-test token depletion and
+    order-dependent 429 flakiness. The dedicated pre-auth tests construct
+    fresh middleware instances (or re-enable the limiter explicitly) and are
+    unaffected because an explicit config or test-local env value wins.
+    """
+    monkeypatch.setenv("GREYWATCH_PREAUTH_RATE_LIMIT_ENABLED", "0")
+
+
+@pytest.fixture(autouse=True)
+def _disable_backup_preflight_for_disposable_databases(monkeypatch):
+    """Opt existing tests out of the production backup gate.
+
+    The suite routinely migrates throwaway databases under ``tmp_path`` that
+    have no backup directory.  The production default requires a verified
+    backup, so tests opt out explicitly here; the M4 backup-preflight tests set
+    ``GREYWATCH_REQUIRE_BACKUP=1`` (or delete it to exercise the default) and
+    provide their own backups.
+    """
+    monkeypatch.setenv("GREYWATCH_REQUIRE_BACKUP", "0")
+
+
+@pytest.fixture(autouse=True)
 def _isolate_test_database(tmp_path, monkeypatch):
     """Redirect unset ``GREYWATCH_DB`` to a temp DB; refuse an explicit prod path."""
     env_db = os.environ.get("GREYWATCH_DB")

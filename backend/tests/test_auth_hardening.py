@@ -17,6 +17,7 @@ import logging
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.datastructures import Headers
 
 from backend.app.main import (
     app as base_app,
@@ -185,7 +186,7 @@ def test_trust_boundary_and_rate_limiter_use_same_token(monkeypatch):
 
         def __init__(self):
             self.client = self._Client()
-            self.headers = {}
+            self.headers = Headers()
             self.url = type("url", (), {"path": "/api/v1/events"})()
 
     req = _FakeRequest()
@@ -216,7 +217,7 @@ def test_empty_token_falls_back_to_loopback(_no_token_env):
 
         def __init__(self):
             self.client = self._Client()
-            self.headers = {}
+            self.headers = Headers()
             self.url = type("url", (), {"path": "/api/v1/events"})()
 
     req = _FakeRequest()
@@ -273,7 +274,7 @@ def test_non_ascii_configured_token_matches_at_boundary(monkeypatch):
 
         def __init__(self, headers):
             self.client = self._Client()
-            self.headers = headers
+            self.headers = Headers(headers)
             self.url = type("url", (), {"path": "/api/v1/events"})()
 
     # No credentials and a wrong non-ASCII credential both fail closed.

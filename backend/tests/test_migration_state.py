@@ -540,46 +540,69 @@ def test_unversioned_current_schema(tmp_path, monkeypatch):
 
 
 def test_current_schema_no_ledger_is_pending_with_baseline(tmp_path, monkeypatch):
-    """Complete schema, no ledger, v1+v2+v3 registered -> PENDING (actual behavior).
+    """Complete schema, no ledger, v1-v4 registered -> PENDING (actual behavior).
 
-    Per M4, UNVERSIONED requires an empty registry; with v1+v2+v3 registered,
-    ``applied_version (0) < latest (3)`` yields PENDING.
+    Per M4, UNVERSIONED requires an empty registry; with v1-v4 registered,
+    ``applied_version (0) < latest (4)`` yields PENDING.
     """
     db_path = _current_db(tmp_path, monkeypatch)
-    report = inspect_path(db_path)  # default MIGRATIONS now contains v1, v2, v3
+    report = inspect_path(db_path)  # default MIGRATIONS now contains v1-v4
     assert report.state is DatabaseState.PENDING
     assert report.applied_version == 0
-    assert report.latest_version == 3
+    assert report.latest_version == 4
     assert report.ledger_present is False
 
 
 def test_current_schema_with_baseline_ledger_is_current(tmp_path, monkeypatch):
-    """Complete schema + ledger (1, 'baseline') + v1+v2+v3 registered -> PENDING (needs v2, v3)."""
+    """Complete schema + ledger (1, 'baseline') + v1-v4 registered -> PENDING."""
     db_path = _current_db(tmp_path, monkeypatch)
     conn = _connect(db_path)
     _insert_ledger(conn, (1, "baseline", "t"))
     conn.close()
 
     report = inspect_path(db_path)  # default MIGRATIONS
-    # Has v1 but not v2, v3, so PENDING
+    # Has v1 but not v2-v4, so PENDING
     assert report.state is DatabaseState.PENDING
     assert report.applied_version == 1
-    assert report.latest_version == 3
+    assert report.latest_version == 4
     assert report.ledger_present is True
 
 
-def test_current_schema_with_full_ledger_is_current(tmp_path, monkeypatch):
-    """Complete schema + full ledger (1, 2, 3) + v1+v2+v3 registered -> CURRENT."""
+def test_core_schema_with_full_ledger_is_inconsistent(tmp_path, monkeypatch):
+    """A v1-only schema must not pass as CURRENT just because the ledger says v4.
+
+    This is the M3 regression: ``initialize_database()`` creates only the five
+    core tables, so a ledger claiming the agent/audit migrations were applied
+    is a ledger/schema disagreement. Verification must report the missing
+    tables, columns, indexes, and foreign keys by name.
+    """
     db_path = _current_db(tmp_path, monkeypatch)
     conn = _connect(db_path)
-    _insert_ledger(conn, (1, "baseline", "t"), (2, "agents_and_api_keys", "t"), (3, "audit_log_integrity", "t"))
+    _insert_ledger(
+        conn,
+        (1, "baseline", "t"),
+        (2, "agents_and_api_keys", "t"),
+        (3, "audit_log_integrity", "t"),
+        (4, "audit_chain_order", "t"),
+    )
     conn.close()
 
     report = inspect_path(db_path)  # default MIGRATIONS
-    assert report.state is DatabaseState.CURRENT
-    assert report.applied_version == 3
-    assert report.latest_version == 3
+    assert report.state is DatabaseState.INCONSISTENT
+    assert report.applied_version == 4
+    assert report.latest_version == 4
     assert report.ledger_present is True
+    assert report.differences is not None
+    assert {"agents", "api_keys", "audit_log"} <= set(
+        report.differences.missing_tables
+    )
+    assert "agent_id" in report.differences.missing_columns.get("events", [])
+    assert "idx_events_agent_id" in report.differences.missing_indexes.get(
+        "events", []
+    )
+    assert "agents" in report.detail
+    assert "api_keys" in report.detail
+    assert "audit_log" in report.detail
 
 
 def test_current_with_registered_and_applied(tmp_path, monkeypatch):
@@ -1954,23 +1977,25 @@ def test_genuine_corrupt_still_classified_as_corrupt(tmp_path, monkeypatch):
 
 
 def test_baseline_registry_contains_v1_and_v2():
-    """MIGRATIONS contains three entries: version 1 'baseline', version 2 'agents_and_api_keys', version 3 'audit_log_integrity'."""
+    """MIGRATIONS contains four entries through version 4 'audit_chain_order'."""
     from backend.app.migration_registry import MIGRATIONS
 
-    assert len(MIGRATIONS) == 3
+    assert len(MIGRATIONS) == 4
     assert MIGRATIONS[0].version == 1
     assert MIGRATIONS[0].name == "baseline"
     assert MIGRATIONS[1].version == 2
     assert MIGRATIONS[1].name == "agents_and_api_keys"
     assert MIGRATIONS[2].version == 3
     assert MIGRATIONS[2].name == "audit_log_integrity"
+    assert MIGRATIONS[3].version == 4
+    assert MIGRATIONS[3].name == "audit_chain_order"
 
 
-def test_baseline_registry_latest_version_is_3():
-    """latest_version() returns 3 with the shipped migrations."""
+def test_baseline_registry_latest_version_is_4():
+    """latest_version() returns 4 with the shipped migrations."""
     from backend.app.migration_registry import latest_version
 
-    assert latest_version() == 3
+    assert latest_version() == 4
 
 
 def test_baseline_registry_validation_accepts_it():
@@ -2006,7 +2031,7 @@ def test_baseline_ledger_unknown_version_is_rejected(tmp_path, monkeypatch):
     report = inspect_path(db_path)  # default MIGRATIONS
     assert report.state is DatabaseState.NEWER  # not silently accepted as current
     assert report.applied_version == 5
-    assert report.latest_version == 3
+    assert report.latest_version == 4
 
 
 def test_initialize_database_fingerprint_matches_expected(tmp_path, monkeypatch):

@@ -22,13 +22,19 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import quote
 
+from ..backup_preflight import run_backup_preflight
 from ..migration_ledger import SCHEMA_MIGRATIONS_TABLE, create_schema_migrations_table
 from ..migration_registry import MIGRATIONS, Migration, latest_version, read_applied_versions, validate_ledger
-from ..migration_schema import compare_schema
+from ..migration_schema import (
+    compare_schema,
+    describe_differences,
+    expected_schema_for_version,
+)
 from ..migration_state import DatabaseReport, DatabaseState, inspect_path, MigrationStateError
 from .v001_baseline import PartialSchemaError, up as up_migration_v1
 from .v002_agents import up as up_migration_v2
 from .v003_audit_log_integrity import up as up_migration_v3
+from .v004_audit_chain_order import up as up_migration_v4
 
 if TYPE_CHECKING:
     pass
@@ -47,6 +53,7 @@ MIGRATION_UPS = {
     1: up_migration_v1,
     2: up_migration_v2,
     3: up_migration_v3,
+    4: up_migration_v4,
 }
 
 
@@ -301,7 +308,10 @@ def migrate(path: str | os.PathLike[str], *, dry_run: bool = False) -> dict[str,
     if error_type == "incompatible":
         if report.state == DatabaseState.NEWER:
             raise MigrationError(f"database is from a newer Greywatch version (ledger: {report.applied_version})")
-        raise MigrationError(f"database in incompatible state: {report.state.value}")
+        detail = f": {report.detail}" if report.detail else ""
+        raise MigrationError(
+            f"database in incompatible state: {report.state.value}{detail}"
+        )
 
     if error_type == "partial":
         raise MigrationStateError(
@@ -319,6 +329,11 @@ def migrate(path: str | os.PathLike[str], *, dry_run: bool = False) -> dict[str,
         current_version = report.applied_version or 0
         pending_count = max(0, highest_registered - current_version)
         return {"applied": pending_count, "skipped": 0}
+
+    # Phase 2.5: Backup preflight.  Runs for both startup and the manual CLI
+    # before any write connection is opened, so a failed preflight leaves the
+    # database untouched.  CURRENT/no-op states returned above and are exempt.
+    run_backup_preflight(resolved)
 
     # Phase 3: Open write connection and acquire lock
     conn = None
@@ -363,7 +378,11 @@ def migrate(path: str | os.PathLike[str], *, dry_run: bool = False) -> dict[str,
             conn.rollback()
             if locked_report.state == DatabaseState.NEWER:
                 raise MigrationError(f"database is from a newer Greywatch version under lock (ledger: {locked_report.applied_version})")
-            raise MigrationError(f"database in incompatible state under lock: {locked_report.state.value}")
+            detail = f": {locked_report.detail}" if locked_report.detail else ""
+            raise MigrationError(
+                f"database in incompatible state under lock: "
+                f"{locked_report.state.value}{detail}"
+            )
 
         if locked_error_type == "partial":
             conn.rollback()
@@ -397,6 +416,20 @@ def migrate(path: str | os.PathLike[str], *, dry_run: bool = False) -> dict[str,
         if not pending_versions:
             # No migrations to apply (e.g., PENDING state just needs ledger stamp)
             if locked_report.state == DatabaseState.PENDING and applied_versions:
+                # Never stamp from the ledger alone: prove the schema required
+                # by the latest registered version before writing anything.
+                try:
+                    expected = expected_schema_for_version(highest_registered)
+                except ValueError as exc:
+                    conn.rollback()
+                    raise MigrationStateError(str(exc)) from exc
+                diffs = compare_schema(conn, expected=expected)
+                if not diffs.complete:
+                    conn.rollback()
+                    raise MigrationStateError(
+                        "schema verification failed before ledger stamp: "
+                        f"{describe_differences(diffs)}"
+                    )
                 # Schema is complete, just need to ensure ledger is stamped
                 utc_now = _utc_now().isoformat()
                 conn.execute(
@@ -424,11 +457,20 @@ def migrate(path: str | os.PathLike[str], *, dry_run: bool = False) -> dict[str,
                 conn.rollback()
                 raise MigrationStateError(str(exc)) from exc
 
-            # Post-migration verification
-            diffs = compare_schema(conn)
+            # Post-migration verification against the schema this version must
+            # produce -- not the ledger row, and not a v1-only descriptor.
+            try:
+                expected = expected_schema_for_version(version)
+            except ValueError as exc:
+                conn.rollback()
+                raise MigrationStateError(str(exc)) from exc
+            diffs = compare_schema(conn, expected=expected)
             if not diffs.complete:
                 conn.rollback()
-                raise MigrationStateError(f"schema incomplete after migration v{version}")
+                raise MigrationStateError(
+                    f"schema incomplete after migration v{version}: "
+                    f"{describe_differences(diffs)}"
+                )
 
             # Foreign key check
             fk_violations = conn.execute("PRAGMA foreign_key_check").fetchall()

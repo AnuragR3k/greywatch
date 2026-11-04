@@ -8,6 +8,7 @@ It wraps the runner module functions with user-friendly output.
 from __future__ import annotations
 
 import argparse
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
+from backend.app.audit_chain import verify_path
 from backend.app.migrations.runner import (
     MigrationConflictError,
     MigrationError,
@@ -58,6 +60,13 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="skip confirmation prompt",
     )
+
+    # audit-verify command (read-only)
+    sub_audit = sub.add_parser(
+        "audit-verify",
+        help="verify the audit-log hash chain (read-only)",
+    )
+    sub_audit.add_argument("path", help="path to the database file")
 
     return parser
 
@@ -162,6 +171,34 @@ def cmd_migrate(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_audit_verify(args: argparse.Namespace) -> int:
+    """Verify the audit chain read-only and report a clear result."""
+    try:
+        valid, errors, count = verify_path(args.path)
+    except (OSError, sqlite3.Error) as exc:
+        print(f"ERROR: cannot verify audit chain: {exc}", file=sys.stderr)
+        return 1
+
+    if valid:
+        print(
+            f"OK: audit chain at {args.path} is valid "
+            f"({count} record{'s' if count != 1 else ''})"
+        )
+        return 0
+
+    print(
+        f"FAILED: audit chain at {args.path} is invalid "
+        f"({count} record{'s' if count != 1 else ''}, "
+        f"{len(errors)} error{'s' if len(errors) != 1 else ''})",
+        file=sys.stderr,
+    )
+    for error in errors[:20]:
+        print(f"  - {error}", file=sys.stderr)
+    if len(errors) > 20:
+        print(f"  ... ({len(errors) - 20} more error(s))", file=sys.stderr)
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
 
@@ -173,6 +210,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_verify(args)
     elif args.command == "migrate":
         return cmd_migrate(args)
+    elif args.command == "audit-verify":
+        return cmd_audit_verify(args)
 
     return 0
 

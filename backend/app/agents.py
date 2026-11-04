@@ -28,34 +28,14 @@ from typing import TYPE_CHECKING, Any, Literal, Optional
 if TYPE_CHECKING:
     from fastapi import Request
 
+from .audit_chain import canonical_audit_row as _canonical_audit_row
+from .audit_chain import compute_chain_hash as _compute_chain_hash
 from .siem import DEFAULT_DB_PATH, _connection
 
 logger = logging.getLogger("greywatch.agents")
 
-# Audit log chain computation (shared with migration v3)
-# These functions must match the canonical serialization in v003_audit_log_integrity.py
-
-def _canonical_audit_row(row: dict[str, Any]) -> str:
-    """Produce a deterministic canonical JSON string for an audit log row.
-
-    Only includes non-NULL fields, with keys sorted for determinism.
-    Must match v003_audit_log_integrity._canonical_audit_row exactly.
-    """
-    # Filter out None values and sort keys
-    canonical = {k: v for k, v in row.items() if v is not None}
-    return json.dumps(canonical, separators=(",", ":"), sort_keys=True)
-
-
-def _compute_chain_hash(prev_hash: str | None, canonical_row: str) -> str:
-    """Compute the chain hash for an audit log entry.
-
-    Chain hash = SHA256(prev_hash + canonical_row)
-    For the first entry, prev_hash is the empty string.
-    Must match v003_audit_log_integrity._compute_chain_hash exactly.
-    """
-    prev = prev_hash or ""
-    combined = (prev + canonical_row).encode("utf-8")
-    return hashlib.sha256(combined).hexdigest()
+# Audit log chain computation is shared with the migration modules.  The
+# canonical chain order is insertion order (``id ASC``).
 
 
 @contextmanager
@@ -81,10 +61,10 @@ def _audit_connection():
     connection.execute("PRAGMA synchronous=NORMAL")
     connection.execute("PRAGMA foreign_keys=ON")
 
-    # Begin IMMEDIATE transaction to serialize audit log writers
-    connection.execute("BEGIN IMMEDIATE")
-
+    # Begin IMMEDIATE transaction to serialize audit log writers. Keep this
+    # inside the try/finally so a lock timeout still closes the connection.
     try:
+        connection.execute("BEGIN IMMEDIATE")
         yield connection
         connection.commit()
     except Exception:
@@ -174,9 +154,47 @@ def get_agent_rate_limit_config() -> RateLimitConfig:
     )
 
 
+def _utc_now_datetime() -> datetime:
+    """Return the current time as a timezone-aware UTC datetime."""
+    return datetime.now(timezone.utc)
+
+
 def _utc_now() -> str:
     """Return current UTC timestamp in ISO format."""
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return _utc_now_datetime().isoformat(timespec="seconds")
+
+
+def _parse_expiration_timestamp(value: str) -> datetime:
+    """Parse an API-key expiration value into a timezone-aware UTC datetime.
+
+    ISO-8601 timestamps ending in ``Z`` and timestamps with explicit UTC
+    offsets are supported. Timestamps without an explicit timezone are
+    interpreted as UTC for backward compatibility.
+
+    Raises:
+        ValueError: If ``value`` is not a valid ISO-8601 timestamp. Callers
+            must reject the key; an invalid expiration must never be treated
+            as a non-expiring key.
+    """
+    if not isinstance(value, str):
+        raise ValueError("expiration timestamp must be a string")
+
+    raw = value.strip()
+    if not raw:
+        raise ValueError("expiration timestamp must not be empty")
+
+    if raw.endswith(("Z", "z")):
+        raw = raw[:-1] + "+00:00"
+
+    try:
+        expires = datetime.fromisoformat(raw)
+        if expires.tzinfo is None:
+            # Legacy keys may contain naive timestamps. Treat them as UTC
+            # rather than allowing a naive/aware comparison to raise.
+            expires = expires.replace(tzinfo=timezone.utc)
+        return expires.astimezone(timezone.utc)
+    except (ValueError, OverflowError) as exc:
+        raise ValueError(f"invalid expiration timestamp: {value!r}") from exc
 
 
 def _hash_key(plaintext_key: str, iterations: Optional[int] = None) -> str:
@@ -242,6 +260,73 @@ def _key_prefix(plaintext_key: str) -> str:
     return plaintext_key[:KEY_PREFIX_LENGTH]
 
 
+def _append_audit_record(
+    conn: sqlite3.Connection,
+    event_type: str,
+    agent_id: Optional[int] = None,
+    api_key_id: Optional[int] = None,
+    actor: str = "system",
+    detail: Optional[dict] = None,
+) -> None:
+    """Append one audit row using the caller's open transaction.
+
+    The caller owns the transaction and must roll it back on any exception.
+    ``_audit_connection()`` takes ``BEGIN IMMEDIATE``, so the chain-head SELECT
+    and the INSERT cannot interleave with another writer.  This function never
+    catches errors: security-sensitive lifecycle mutations must fail together
+    with their audit record rather than commit an unaudited state change.
+
+    Never logs secrets or hashes.
+    """
+    # Get the latest inserted chain_hash within the same transaction.
+    # The canonical chain order is insertion order (``id ASC``), so the
+    # predecessor is the greatest id.  ``id`` is the INTEGER PRIMARY KEY, so
+    # this is an indexed reverse rowid lookup with LIMIT 1 -- no table scan or
+    # temporary sort.
+    row = conn.execute(
+        """
+        SELECT chain_hash FROM audit_log
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+
+    prev_chain_hash = row["chain_hash"] if row else None
+
+    timestamp = _utc_now()
+    detail_json = json.dumps(detail) if detail else None
+
+    # Build the row data for canonical serialization
+    row_data = {
+        "timestamp": timestamp,
+        "event_type": event_type,
+        "agent_id": agent_id,
+        "api_key_id": api_key_id,
+        "actor": actor,
+        "detail": detail_json,
+    }
+
+    canonical = _canonical_audit_row(row_data)
+    chain_hash = _compute_chain_hash(prev_chain_hash, canonical)
+
+    conn.execute(
+        """
+        INSERT INTO audit_log (timestamp, event_type, agent_id, api_key_id, actor, detail, prev_hash, chain_hash)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            timestamp,
+            event_type,
+            agent_id,
+            api_key_id,
+            actor,
+            detail_json,
+            prev_chain_hash,
+            chain_hash,
+        ),
+    )
+
+
 def _audit_log(
     event_type: str,
     agent_id: Optional[int] = None,
@@ -249,58 +334,29 @@ def _audit_log(
     actor: str = "system",
     detail: Optional[dict] = None,
 ) -> None:
-    """Record an audit log entry with hash chain integrity.
+    """Best-effort audit append for non-lifecycle events.
 
-    Computes prev_hash and chain_hash in the same transaction as the INSERT
-    to maintain tamper-evident chain. Never logs secrets or hashes.
+    Authentication failures and other observational events must not turn into
+    a different failure mode when audit storage is unavailable, so this wrapper
+    logs and continues. Security-sensitive lifecycle mutations (agent/key
+    creation, update, deactivation, rotation, revocation) must instead call
+    :func:`_append_audit_record` inside their own ``_audit_connection()``
+    transaction so the state change and its audit row commit or roll back
+    together.
     """
     try:
         with _audit_connection() as conn:
-            # Get the latest chain_hash from the audit log (within the same transaction)
-            row = conn.execute(
-                """
-                SELECT chain_hash FROM audit_log
-                ORDER BY timestamp ASC, id ASC
-                """
-            ).fetchall()
-
-            prev_chain_hash = row[-1]["chain_hash"] if row else None
-
-            timestamp = _utc_now()
-            detail_json = json.dumps(detail) if detail else None
-
-            # Build the row data for canonical serialization
-            row_data = {
-                "timestamp": timestamp,
-                "event_type": event_type,
-                "agent_id": agent_id,
-                "api_key_id": api_key_id,
-                "actor": actor,
-                "detail": detail_json,
-            }
-
-            canonical = _canonical_audit_row(row_data)
-            chain_hash = _compute_chain_hash(prev_chain_hash, canonical)
-
-            conn.execute(
-                """
-                INSERT INTO audit_log (timestamp, event_type, agent_id, api_key_id, actor, detail, prev_hash, chain_hash)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    timestamp,
-                    event_type,
-                    agent_id,
-                    api_key_id,
-                    actor,
-                    detail_json,
-                    prev_chain_hash,
-                    chain_hash,
-                ),
+            _append_audit_record(
+                conn,
+                event_type,
+                agent_id=agent_id,
+                api_key_id=api_key_id,
+                actor=actor,
+                detail=detail,
             )
     except Exception as exc:
-        # Audit logging must never break the main flow
-        logger.error(f"Audit log failed: {exc}")
+        # Observational logging is best-effort; lifecycle writes are not.
+        logger.error("Audit log failed: %s", exc)
 
 
 # =============================================================================
@@ -328,7 +384,10 @@ def create_agent(
         ValueError: If name already exists.
     """
     now = _utc_now()
-    with _connection() as conn:
+    # BEGIN IMMEDIATE serializes the agent insert with the audit-chain append
+    # so both commit together or neither does. An audit failure rolls back the
+    # new agent row instead of leaving an unaudited mutation behind.
+    with _audit_connection() as conn:
         try:
             cursor = conn.execute(
                 """
@@ -341,10 +400,16 @@ def create_agent(
         except sqlite3.IntegrityError:
             raise ValueError(f"Agent with name '{name}' already exists")
 
-    _audit_log("agent_created", agent_id=agent_id, actor=actor, detail={
-        "name": name,
-        "display_name": display_name,
-    })
+        _append_audit_record(
+            conn,
+            "agent_created",
+            agent_id=agent_id,
+            actor=actor,
+            detail={
+                "name": name,
+                "display_name": display_name,
+            },
+        )
 
     return get_agent(agent_id)
 
@@ -394,36 +459,51 @@ def update_agent(
     actor: str = "admin",
 ) -> Optional[Agent]:
     """Update agent metadata."""
-    agent = get_agent(agent_id)
-    if not agent:
-        return None
+    # Read, mutate, and audit under one IMMEDIATE transaction so a failed
+    # audit insert rolls back the metadata change and the audit cannot describe
+    # a state that was not committed.
+    with _audit_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM agents WHERE id = ?", (agent_id,)
+        ).fetchone()
+        if not row:
+            return None
+        agent = _row_to_agent(row)
 
-    updates = []
-    params = []
-    if display_name is not None:
-        updates.append("display_name = ?")
-        params.append(display_name)
-    if description is not None:
-        updates.append("description = ?")
-        params.append(description)
+        updates = []
+        params = []
+        if display_name is not None:
+            updates.append("display_name = ?")
+            params.append(display_name)
+        if description is not None:
+            updates.append("description = ?")
+            params.append(description)
 
-    if not updates:
-        return agent
+        if not updates:
+            return agent
 
-    updates.append("updated_at = ?")
-    params.append(_utc_now())
-    params.append(agent_id)
+        updates.append("updated_at = ?")
+        params.append(_utc_now())
+        params.append(agent_id)
 
-    with _connection() as conn:
         conn.execute(
             f"UPDATE agents SET {', '.join(updates)} WHERE id = ?",
             params,
         )
 
-    _audit_log("agent_updated", agent_id=agent_id, actor=actor, detail={
-        "display_name": display_name,
-        "description": description,
-    })
+        audited_changes = {}
+        if display_name is not None:
+            audited_changes["display_name"] = display_name
+        if description is not None:
+            audited_changes["description"] = description
+
+        _append_audit_record(
+            conn,
+            "agent_updated",
+            agent_id=agent_id,
+            actor=actor,
+            detail=audited_changes,
+        )
 
     return get_agent(agent_id)
 
@@ -439,15 +519,19 @@ def deactivate_agent(agent_id: int, reason: str, actor: str = "admin") -> bool:
     Returns:
         True if agent was deactivated, False if not found.
     """
-    agent = get_agent(agent_id)
-    if not agent:
-        return False
+    # Deactivation revokes every active key; keep that bulk change and its
+    # single audit event in the same transaction.
+    with _audit_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM agents WHERE id = ?", (agent_id,)
+        ).fetchone()
+        if not row:
+            return False
+        agent = _row_to_agent(row)
+        if agent.status != "active":
+            return False
 
-    if agent.status != "active":
-        return False
-
-    now = _utc_now()
-    with _connection() as conn:
+        now = _utc_now()
         # Deactivate agent
         conn.execute(
             """
@@ -467,10 +551,16 @@ def deactivate_agent(agent_id: int, reason: str, actor: str = "admin") -> bool:
             (now, f"Agent deactivated: {reason}", agent_id),
         )
 
-    _audit_log("agent_deactivated", agent_id=agent_id, actor=actor, detail={
-        "reason": reason,
-        "previous_status": agent.status,
-    })
+        _append_audit_record(
+            conn,
+            "agent_deactivated",
+            agent_id=agent_id,
+            actor=actor,
+            detail={
+                "reason": reason,
+                "previous_status": agent.status,
+            },
+        )
 
     return True
 
@@ -516,6 +606,10 @@ def create_api_key(
     Raises:
         ValueError: If agent not found or inactive.
     """
+    # Cheap pre-check avoids paying for PBKDF2 when the agent is obviously
+    # invalid. The authoritative check is repeated inside the transaction
+    # below so a concurrent deactivation cannot create an active key for an
+    # inactive agent.
     agent = get_agent(agent_id)
     if not agent:
         raise ValueError(f"Agent {agent_id} not found")
@@ -527,7 +621,19 @@ def create_api_key(
     prefix = _key_prefix(plaintext_key)
     now = _utc_now()
 
-    with _connection() as conn:
+    # Hash outside the transaction (PBKDF2 is intentionally expensive), then
+    # re-check and write the key + audit row atomically under BEGIN IMMEDIATE.
+    with _audit_connection() as conn:
+        row = conn.execute(
+            "SELECT status FROM agents WHERE id = ?", (agent_id,)
+        ).fetchone()
+        if not row:
+            raise ValueError(f"Agent {agent_id} not found")
+        if row["status"] != "active":
+            raise ValueError(
+                f"Agent {agent_id} is not active (status: {row['status']})"
+            )
+
         cursor = conn.execute(
             """
             INSERT INTO api_keys (agent_id, key_hash, key_prefix, name, status, created_at, expires_at)
@@ -537,11 +643,18 @@ def create_api_key(
         )
         key_id = cursor.lastrowid
 
-    _audit_log("key_generated", agent_id=agent_id, api_key_id=key_id, actor=actor, detail={
-        "key_prefix": prefix,
-        "key_name": name,
-        "expires_at": expires_at,
-    })
+        _append_audit_record(
+            conn,
+            "key_generated",
+            agent_id=agent_id,
+            api_key_id=key_id,
+            actor=actor,
+            detail={
+                "key_prefix": prefix,
+                "key_name": name,
+                "expires_at": expires_at,
+            },
+        )
 
     return ApiKeyWithSecret(
         id=key_id,
@@ -591,15 +704,20 @@ def revoke_api_key(key_id: int, reason: str, actor: str = "admin") -> bool:
     Returns:
         True if key was revoked, False if not found or already revoked.
     """
-    key = get_api_key(key_id)
-    if not key:
-        return False
-    if key.status != "active":
-        return False
+    # Read, mutate, and audit under one IMMEDIATE transaction so the key is
+    # never revoked without its audit record (or vice versa).
+    with _audit_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM api_keys WHERE id = ?", (key_id,)
+        ).fetchone()
+        if not row:
+            return False
+        key = _row_to_api_key(row)
+        if key.status != "active":
+            return False
 
-    agent_id = key.agent_id
-    now = _utc_now()
-    with _connection() as conn:
+        agent_id = key.agent_id
+        now = _utc_now()
         conn.execute(
             """
             UPDATE api_keys
@@ -609,11 +727,18 @@ def revoke_api_key(key_id: int, reason: str, actor: str = "admin") -> bool:
             (now, reason, key_id),
         )
 
-    _audit_log("key_revoked", agent_id=agent_id, api_key_id=key_id, actor=actor, detail={
-        "key_prefix": key.key_prefix,
-        "key_name": key.name,
-        "reason": reason,
-    })
+        _append_audit_record(
+            conn,
+            "key_revoked",
+            agent_id=agent_id,
+            api_key_id=key_id,
+            actor=actor,
+            detail={
+                "key_prefix": key.key_prefix,
+                "key_name": key.name,
+                "reason": reason,
+            },
+        )
 
     # Invalidate rate-limit bucket for this agent to prevent continued use
     # of the revoked key's rate allowance.
@@ -637,6 +762,9 @@ def rotate_api_key(key_id: int, actor: str = "admin") -> ApiKeyWithSecret:
     Raises:
         ValueError: If key not found, not active, or agent inactive.
     """
+    # Cheap pre-check avoids paying for PBKDF2 when the key is obviously
+    # invalid. The authoritative key/agent checks are repeated inside the
+    # transaction so concurrent rotations cannot both create a new key.
     old_key = get_api_key(key_id)
     if not old_key:
         raise ValueError(f"API key {key_id} not found")
@@ -653,7 +781,27 @@ def rotate_api_key(key_id: int, actor: str = "admin") -> ApiKeyWithSecret:
     key_hash = _hash_key(plaintext_key)
     prefix = _key_prefix(plaintext_key)
 
-    with _connection() as conn:
+    # Revoke-old, create-new, and the single rotation audit event commit
+    # together. A failed audit insert leaves the old key active and no new key
+    # behind.
+    with _audit_connection() as conn:
+        old_row = conn.execute(
+            "SELECT * FROM api_keys WHERE id = ?", (key_id,)
+        ).fetchone()
+        if not old_row:
+            raise ValueError(f"API key {key_id} not found")
+        locked_old_key = _row_to_api_key(old_row)
+        if locked_old_key.status != "active":
+            raise ValueError(
+                f"API key {key_id} is not active (status: {locked_old_key.status})"
+            )
+
+        agent_row = conn.execute(
+            "SELECT status FROM agents WHERE id = ?", (agent_id,)
+        ).fetchone()
+        if not agent_row or agent_row["status"] != "active":
+            raise ValueError(f"Agent {agent_id} is not active")
+
         # Revoke old key
         conn.execute(
             """
@@ -669,16 +817,23 @@ def rotate_api_key(key_id: int, actor: str = "admin") -> ApiKeyWithSecret:
             INSERT INTO api_keys (agent_id, key_hash, key_prefix, name, status, created_at)
             VALUES (?, ?, ?, ?, 'active', ?)
             """,
-            (agent_id, key_hash, prefix, old_key.name, now),
+            (agent_id, key_hash, prefix, locked_old_key.name, now),
         )
         new_key_id = cursor.lastrowid
 
-    _audit_log("key_rotated", agent_id=agent_id, api_key_id=new_key_id, actor=actor, detail={
-        "old_key_id": key_id,
-        "old_key_prefix": old_key.key_prefix,
-        "new_key_prefix": prefix,
-        "key_name": old_key.name,
-    })
+        _append_audit_record(
+            conn,
+            "key_rotated",
+            agent_id=agent_id,
+            api_key_id=new_key_id,
+            actor=actor,
+            detail={
+                "old_key_id": key_id,
+                "old_key_prefix": locked_old_key.key_prefix,
+                "new_key_prefix": prefix,
+                "key_name": locked_old_key.name,
+            },
+        )
 
     # Invalidate rate-limit bucket for this agent to prevent continued use
     # of the old key's rate allowance.
@@ -688,7 +843,7 @@ def rotate_api_key(key_id: int, actor: str = "admin") -> ApiKeyWithSecret:
         id=new_key_id,
         agent_id=agent_id,
         key_prefix=prefix,
-        name=old_key.name,
+        name=locked_old_key.name,
         plaintext_key=plaintext_key,
         status="active",
         created_at=now,
@@ -769,18 +924,25 @@ def authenticate_api_key(plaintext_key: str) -> Optional[AuthResult]:
         key_hash = row["key_hash"]
         verified, stored_iterations = _verify_key(plaintext_key, key_hash)
         if verified:
-            # Check expiration
-            if row["expires_at"]:
+            # Check expiration. A missing value (NULL) means the key does not
+            # expire; any present value is parsed strictly. Malformed values
+            # are rejected rather than treated as non-expiring.
+            if row["expires_at"] is not None:
                 try:
-                    expires = datetime.fromisoformat(row["expires_at"].replace("Z", "+00:00"))
-                    if expires < datetime.now(timezone.utc):
-                        _audit_log("auth_failure", agent_id=row["agent_id"], api_key_id=row["key_id"], actor="system", detail={
-                            "reason": "key_expired",
-                            "key_prefix": prefix,
-                        })
-                        return None
+                    expires = _parse_expiration_timestamp(row["expires_at"])
                 except ValueError:
-                    pass  # Invalid expiration format, treat as non-expiring
+                    _audit_log("auth_failure", agent_id=row["agent_id"], api_key_id=row["key_id"], actor="system", detail={
+                        "reason": "invalid_expiration",
+                        "key_prefix": prefix,
+                    })
+                    return None
+
+                if expires <= _utc_now_datetime():
+                    _audit_log("auth_failure", agent_id=row["agent_id"], api_key_id=row["key_id"], actor="system", detail={
+                        "reason": "key_expired",
+                        "key_prefix": prefix,
+                    })
+                    return None
 
             # Rehash-on-auth: if stored hash uses fewer iterations than current default,
             # re-hash the key with current default and update the stored hash.
@@ -788,17 +950,34 @@ def authenticate_api_key(plaintext_key: str) -> Optional[AuthResult]:
             current_iterations = int(os.environ.get("GREYWATCH_KEY_HASH_ITERATIONS", str(DEFAULT_KEY_HASH_ITERATIONS)))
             if stored_iterations is not None and stored_iterations < current_iterations:
                 new_hash = _hash_key(plaintext_key, current_iterations)
-                now = _utc_now()
-                with _connection() as conn:
-                    conn.execute(
-                        "UPDATE api_keys SET key_hash = ? WHERE id = ?",
-                        (new_hash, row["key_id"]),
+                try:
+                    # Keep the optional hash upgrade and its audit row atomic.
+                    # If audit persistence fails, roll back to the previous
+                    # (still valid) hash and continue authentication: a
+                    # background upgrade must not turn a valid login into an
+                    # outage.
+                    with _audit_connection() as conn:
+                        conn.execute(
+                            "UPDATE api_keys SET key_hash = ? WHERE id = ?",
+                            (new_hash, row["key_id"]),
+                        )
+                        _append_audit_record(
+                            conn,
+                            "key_rehashed",
+                            agent_id=row["agent_id"],
+                            api_key_id=row["key_id"],
+                            actor="system",
+                            detail={
+                                "old_iterations": stored_iterations,
+                                "new_iterations": current_iterations,
+                                "key_prefix": prefix,
+                            },
+                        )
+                except Exception as exc:
+                    logger.error(
+                        "Audit-protected key rehash failed; keeping previous hash: %s",
+                        exc,
                     )
-                _audit_log("key_rehashed", agent_id=row["agent_id"], api_key_id=row["key_id"], actor="system", detail={
-                    "old_iterations": stored_iterations,
-                    "new_iterations": current_iterations,
-                    "key_prefix": prefix,
-                })
 
             # Update last_used_at
             now = _utc_now()

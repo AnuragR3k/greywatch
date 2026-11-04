@@ -634,11 +634,13 @@ def test_auth_failure_does_not_consume_rate_token(tmp_path, monkeypatch):
 
 def test_middleware_registration_order():
     """The global app registers middleware so the effective order is
-    TrustBoundary -> MaxBodySize -> RateLimit -> app."""
+    PreAuthAgentRateLimit -> TrustBoundary -> MaxBodySize -> RateLimit -> app.
+
+    The pre-auth limiter must be outermost: it has to reject agent-key floods
+    before authentication and its audit writes.
+    """
     names = [m.cls.__name__ for m in base_app.user_middleware]
-    # Registration order: trust boundary (BaseHTTPMiddleware) first, then
-    # MaxBodySize, then RateLimit last -> reversed build makes RateLimit
-    # innermost, MaxBodySize middle, trust boundary outermost.
-    assert names[0] == "BaseHTTPMiddleware"  # trust boundary
-    assert names[1] == "MaxBodySizeMiddleware"
-    assert names[2] == "RateLimitMiddleware"
+    assert names[0] == "PreAuthAgentRateLimitMiddleware"
+    assert names[1] == "BaseHTTPMiddleware"  # trust boundary
+    assert names[2] == "MaxBodySizeMiddleware"
+    assert names[3] == "RateLimitMiddleware"

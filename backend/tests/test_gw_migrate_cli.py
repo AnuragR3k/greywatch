@@ -104,6 +104,7 @@ def _assert_migrated(path: Path) -> None:
         (1, "baseline"),
         (2, "agents_and_api_keys"),
         (3, "audit_log_integrity"),
+        (4, "audit_chain_order"),
     ]
 
 
@@ -143,7 +144,7 @@ def test_status_fresh_database(fresh_db: Path):
     assert result.stderr == ""
     assert "State: fresh" in result.stdout
     assert "Applied version: 0" in result.stdout
-    assert "Latest version: 3" in result.stdout
+    assert "Latest version: 4" in result.stdout
     assert "Ledger present: no" in result.stdout
 
 
@@ -153,7 +154,7 @@ def test_status_current_database(current_db: Path):
     assert result.returncode == 0
     assert result.stderr == ""
     assert "State: current" in result.stdout
-    assert "Applied version: 3" in result.stdout
+    assert "Applied version: 4" in result.stdout
     assert "Ledger present: yes" in result.stdout
 
 
@@ -180,10 +181,11 @@ def test_plan_fresh_database_lists_baseline(fresh_db: Path):
 
     assert result.returncode == 0
     assert result.stderr == ""
-    assert "Pending migrations (3):" in result.stdout
+    assert "Pending migrations (4):" in result.stdout
     assert "v1: baseline" in result.stdout
     assert "v2: agents_and_api_keys" in result.stdout
     assert "v3: audit_log_integrity" in result.stdout
+    assert "v4: audit_chain_order" in result.stdout
     # A plan preview is strictly read-only.
     assert fresh_db.read_bytes() == before
     _assert_unmigrated(fresh_db)
@@ -242,7 +244,7 @@ def test_migrate_interactive_confirmation_applies(fresh_db: Path):
     assert result.returncode == 0
     assert result.stderr == ""
     assert "Apply pending migrations? [y/N]" in result.stdout
-    assert "Applied 3 migration(s)" in result.stdout
+    assert "Applied 4 migration(s)" in result.stdout
     _assert_migrated(fresh_db)
 
 
@@ -278,7 +280,7 @@ def test_migrate_yes_bypasses_confirmation_and_applies(fresh_db: Path):
     assert result.returncode == 0
     assert result.stderr == ""
     assert "Apply pending migrations? [y/N]" not in result.stdout
-    assert "Applied 3 migration(s)" in result.stdout
+    assert "Applied 4 migration(s)" in result.stdout
     _assert_migrated(fresh_db)
 
 
@@ -290,7 +292,7 @@ def test_migrate_dry_run_does_not_mutate_or_prompt(fresh_db: Path):
     assert result.returncode == 0
     assert result.stderr == ""
     assert "Apply pending migrations? [y/N]" not in result.stdout
-    assert "Would apply 3 migration(s)" in result.stdout
+    assert "Would apply 4 migration(s)" in result.stdout
     assert fresh_db.read_bytes() == before
     _assert_unmigrated(fresh_db)
 
@@ -305,6 +307,7 @@ def test_migrate_yes_on_current_database_is_noop(current_db: Path):
         (1, "baseline"),
         (2, "agents_and_api_keys"),
         (3, "audit_log_integrity"),
+        (4, "audit_chain_order"),
     ]
 
 
@@ -354,5 +357,68 @@ def test_help_exits_zero():
     assert result.returncode == 0
     assert result.stderr == ""
     assert "usage: gw_migrate" in result.stdout
-    for command in ("status", "plan", "verify", "migrate"):
+    for command in ("status", "plan", "verify", "migrate", "audit-verify"):
         assert command in result.stdout
+
+
+# --------------------------------------------------------------------------- #
+# audit-verify (read-only chain verification)
+# --------------------------------------------------------------------------- #
+
+
+def _append_audit_events(db_path: Path, monkeypatch, count: int = 2) -> None:
+    from backend.app import agents as agents_module
+
+    monkeypatch.setenv("GREYWATCH_DB", str(db_path))
+    for index in range(count):
+        agents_module._audit_log(f"cli_event_{index}", actor="test")
+
+
+def test_audit_verify_valid_chain(current_db: Path, monkeypatch):
+    _append_audit_events(current_db, monkeypatch)
+
+    result = _run_cli("audit-verify", current_db)
+
+    assert result.returncode == 0
+    assert result.stderr == ""
+    assert result.stdout.startswith("OK: audit chain at ")
+    assert "(2 records)" in result.stdout
+
+
+def test_audit_verify_empty_chain(current_db: Path):
+    result = _run_cli("audit-verify", current_db)
+
+    assert result.returncode == 0
+    assert result.stderr == ""
+    assert "(0 records)" in result.stdout
+
+
+def test_audit_verify_detects_tampering(current_db: Path, monkeypatch):
+    _append_audit_events(current_db, monkeypatch)
+
+    conn = sqlite3.connect(current_db)
+    try:
+        conn.execute(
+            "UPDATE audit_log SET detail = ? WHERE event_type = ?",
+            ('{"tampered":true}', "cli_event_0"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = _run_cli("audit-verify", current_db)
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr.startswith("FAILED: audit chain at ")
+    assert "chain_hash mismatch" in result.stderr
+
+
+def test_audit_verify_missing_database_reports_error(tmp_path: Path):
+    missing = tmp_path / "missing-audit.db"
+
+    result = _run_cli("audit-verify", missing)
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr.startswith("ERROR: cannot verify audit chain: ")

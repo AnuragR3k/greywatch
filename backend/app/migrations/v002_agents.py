@@ -114,10 +114,13 @@ def up(connection) -> None:
         connection.execute(
             "ALTER TABLE events ADD COLUMN agent_id INTEGER REFERENCES agents(id) ON DELETE SET NULL"
         )
-    if "agent_id" not in columns:
-        connection.execute(
-            "CREATE INDEX IF NOT EXISTS idx_events_agent_id ON events(agent_id)"
-        )
+
+    # Ensure the supporting index independently of the column snapshot above.
+    # A previous or partial migration may have added agent_id without creating
+    # its index; CREATE INDEX IF NOT EXISTS makes this safe to rerun.
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_agent_id ON events(agent_id)"
+    )
 
 
 def down() -> None:

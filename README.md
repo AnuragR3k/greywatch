@@ -57,7 +57,7 @@ Expected response:
 {
   "status": "ok",
   "service": "greywatch-api",
-  "version": "0.1.0"
+  "version": "0.2.0"
 }
 ```
 
@@ -196,7 +196,23 @@ or:
 X-API-Key: YOUR_TOKEN
 ```
 
-Requests with missing or invalid credentials are rejected.
+The supplied Caddy deployment keeps the token out of the browser and injects
+it server-side as `X-Greywatch-Token` on dashboard `/api/*` requests. The
+backend accepts that proxy-injected header as an equivalent shared-token
+credential. Requests with missing or invalid credentials are rejected.
+
+Agent API keys (`gw_...`) are accepted through `X-API-Key` or
+`Authorization: Bearer` for `POST /api/v1/events/ingest` only. They are created
+and managed through the admin agent/key endpoints and are subject to the
+per-agent rate limiter. When either header carries a `gw_...` value, that agent
+key is the **exclusive** credential: an invalid, expired, or revoked key
+returns `401` and is never downgraded to shared-token authentication, even if
+a valid shared token is also present. A valid agent key used on any other
+endpoint (including `/api/v1/admin/*`) returns `403`.
+
+See [`docs/ADMIN_API.md`](docs/ADMIN_API.md) for the full agent/API-key
+administration endpoint reference, authentication rules, lifecycle procedures,
+audit inspection, and security warnings.
 
 ### Request body limits
 
@@ -229,42 +245,63 @@ GET requests and the public endpoints ``/`` and ``/health`` are unaffected.
 
 ### API rate limiting
 
-To prevent a single client from issuing an excessive number of requests,
-Greywatch rate limits protected API endpoints using a token-bucket algorithm.
-Rate limiting is enforced **after** API authentication, so failed-auth
-responses (401/403) never consume rate-limit tokens.
+Greywatch has three independent token-bucket limiters, all enforced in-process:
 
-The limiter is controlled by the ``GREYWATCH_RATE_LIMIT_*`` environment
-variables:
+| Limiter | Applies to | Configuration |
+|---------|------------|---------------|
+| Pre-auth agent | Every request presenting a `gw_*` agent credential, before authentication and audit writes | `GREYWATCH_PREAUTH_RATE_*`, `GREYWATCH_TRUSTED_PROXIES` |
+| Global | Every non-public HTTP route; one bucket per client identity (one shared bucket in token mode) | `GREYWATCH_RATE_LIMIT_*` |
+| Per-agent | Requests authenticated with an agent API key; currently only `POST /api/v1/events/ingest` is reachable with those keys | `GREYWATCH_AGENT_RATE_*` |
+
+All three return HTTP **429 Too Many Requests** with a numeric `Retry-After`
+header. The global and per-agent limiters run after authentication, so a failed
+authentication (401/403) never consumes their tokens. The pre-auth limiter runs
+first and counts every agent-key attempt so that invalid-key floods cannot force
+PBKDF2 work or write an `auth_failure` audit row per request. The public
+endpoints `/` and `/health` are never rate limited.
+
+Key environment variables:
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| ``GREYWATCH_RATE_LIMIT_ENABLED`` | ``1`` | ``0``/``false``/``no`` disables rate limiting (explicit operator choice) |
-| ``GREYWATCH_RATE_LIMIT_INGESTION`` | ``60`` | requests/min for ``POST /api/v1/events/ingest`` |
-| ``GREYWATCH_RATE_LIMIT_READS`` | ``120`` | requests/min for GET events/alerts/status endpoints |
-| ``GREYWATCH_RATE_LIMIT_COLLECTOR`` | ``30`` | requests/min for journal/suricata collect endpoints |
-| ``GREYWATCH_RATE_LIMIT_ALERT_CLOSE`` | ``30`` | requests/min for ``POST /api/v1/alerts/{id}/close`` |
-| ``GREYWATCH_RATE_LIMIT_BURST_MULTIPLIER`` | ``2`` | burst capacity = limit × multiplier |
+| `GREYWATCH_PREAUTH_RATE_LIMIT_ENABLED` | `1` | Pre-auth agent-key limiter on/off |
+| `GREYWATCH_PREAUTH_RATE_LIMIT` | `120` | Agent-key attempts/min per client identity |
+| `GREYWATCH_PREAUTH_RATE_BURST_MULTIPLIER` | `2` | Pre-auth burst = limit × multiplier |
+| `GREYWATCH_PREAUTH_RATE_MAX_ENTRIES` | `10000` | Maximum identities retained (LRU eviction) |
+| `GREYWATCH_TRUSTED_PROXIES` | `127.0.0.1/32,::1/128` | Peers whose forwarding headers are trusted |
+| `GREYWATCH_RATE_LIMIT_ENABLED` | `1` | Global limiter on/off |
+| `GREYWATCH_RATE_LIMIT_INGESTION` | `60` | req/min for `POST /api/v1/events/ingest` |
+| `GREYWATCH_RATE_LIMIT_READS` | `120` | req/min for reads and other uncategorized routes |
+| `GREYWATCH_RATE_LIMIT_COLLECTOR` | `30` | req/min for journal/Suricata collect endpoints |
+| `GREYWATCH_RATE_LIMIT_ALERT_CLOSE` | `30` | req/min for alert close |
+| `GREYWATCH_RATE_LIMIT_BURST_MULTIPLIER` | `2` | Global burst = limit × multiplier |
+| `GREYWATCH_AGENT_RATE_LIMIT_ENABLED` | `1` | Per-agent limiter on/off |
+| `GREYWATCH_AGENT_RATE_INGESTION` | `60` | req/min per agent for ingestion |
+| `GREYWATCH_AGENT_RATE_BURST` | `1.5` | Per-agent burst multiplier |
 
-Requests whose rate exceeds the limit are rejected with HTTP **429 Too Many
-Requests**, a JSON body ``{"detail": "Rate limit exceeded"}``, and a
-``Retry-After`` header indicating seconds to wait before the next request is
-allowed.
+Numeric values fall back to the documented defaults when invalid; disabling a
+limiter must be explicit. See
+[docs/RATE_LIMITING.md](docs/RATE_LIMITING.md) for the complete per-limiter
+scope and bucket behavior.
 
-Invalid or non-positive values fall back to the documented safe defaults and
-never silently disable rate limiting; disabling must be an explicit operator
-choice.
+Client identity for the pre-auth limiter is the immediate peer by default.
+Forwarding headers are trusted only when the peer is in
+`GREYWATCH_TRUSTED_PROXIES` (loopback by default); the supplied `Caddyfile`
+sets `X-Greywatch-Client-IP` and a host-only `X-Forwarded-For` on every proxy
+route.
 
-Client identity is derived solely from the ASGI peer (``scope["client"]``) or,
-in token mode (``GREYWATCH_API_TOKEN`` set), the shared token value itself.
-Forwarding headers (``X-Forwarded-For``, etc.) are **never** consulted for
-client identity, so they cannot be spoofed to evade rate limiting.
+Buckets are process-local: multiple workers or replicas enforce independent
+limits, so effective limits can multiply. There is no distributed (Redis-backed)
+coordination.
 
-The public endpoints ``/`` and ``/health`` are never rate limited.
+The per-agent `reads`, `collector`, and `alert_close` values are configurable
+but are **not currently enforced**; only per-agent ingestion is active.
 
 ### Dashboard deployment
 
 The static JavaScript dashboard cannot safely store a server-side secret. Remote dashboard access therefore requires an authentication-terminating reverse proxy and appropriate deployment configuration.
+
+The supplied `Caddyfile` protects the dashboard shell and all dashboard `/api/*` routes with `basic_auth`, and injects `GREYWATCH_API_TOKEN` server-side in `X-Greywatch-Token`. It does not overwrite `Authorization`, so agent credentials are preserved. Dedicated routes for `POST /api/v1/events/ingest` accept remote ingestion-only agents using `X-API-Key: gw_...` or `Authorization: Bearer gw_...` without dashboard `basic_auth`; those routes do not receive the shared token. Every admin and read route remains behind dashboard `basic_auth` and is not reachable with an agent key. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the full proxy architecture and verification checklist.
 
 Do not expose Greywatch directly to an untrusted network without deliberate authentication and network-security controls.
 
@@ -409,6 +446,7 @@ These checks validate the automated test suite and frontend code/build. They do 
 - Optional systemd journal collection
 - Optional Suricata EVE JSON collection
 - API trust-boundary enforcement
+- Global and per-agent API rate limiting
 - React dashboard
 - Automated backend tests and frontend checks
 
