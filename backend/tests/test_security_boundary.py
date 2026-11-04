@@ -8,9 +8,16 @@ in two modes:
     unknown peers -> 403. The peer is the ASGI connection
     (``request.client.host``); forwarding headers are NOT consulted, so they
     cannot spoof loopback.
-  * Token (``GREYWATCH_API_TOKEN`` set): a valid ``Authorization: Bearer`` or
-    ``X-API-Key`` header (constant-time ``hmac.compare_digest``) is required
-    for any non-public endpoint; anything else -> 401.
+  * Token (``GREYWATCH_API_TOKEN`` set): a valid ``Authorization: Bearer``,
+    ``X-Greywatch-Token`` (proxy-injected), or ``X-API-Key`` credential
+    (constant-time ``hmac.compare_digest``) is required for any non-public
+    endpoint; anything else -> 401.
+
+Agent API keys (``gw_...``) are an exclusive credential kind: if either
+``Authorization`` or ``X-API-Key`` carries one, only agent authentication is
+attempted. A failed, expired, or revoked agent key returns 401 and never falls
+back to the shared token -- including when the shipped Caddy deployment also
+supplies the shared token.
 
 A denied request is short-circuited by the middleware, so failed auth never
 invokes a collection / ingest / read backend.
@@ -24,9 +31,12 @@ path).
 import pytest
 
 from backend.app import main
+from backend.app.agents import create_agent, create_api_key, revoke_api_key
 from backend.app.collector import CollectResult
 
 TOKEN = "test-secret-token-123"
+INGEST_PATH = "/api/v1/events/ingest"
+ADMIN_AGENTS_PATH = "/api/v1/admin/agents"
 
 # (label, method, path, json_body) for every protected (non-public) endpoint,
 # covering writes/mutations AND the read endpoints that expose raw_message /
@@ -102,6 +112,38 @@ def _token_env(monkeypatch):
     monkeypatch.setenv("GREYWATCH_API_TOKEN", TOKEN)
     monkeypatch.setenv("GREYWATCH_API_LOOPBACK_ONLY", "1")
     yield
+
+
+@pytest.fixture
+def _cheap_key_hashing(monkeypatch):
+    """Keep PBKDF2 cheap; agent auth and creation use the same count."""
+    monkeypatch.setenv("GREYWATCH_KEY_HASH_ITERATIONS", "1000")
+    yield
+
+
+@pytest.fixture
+def _ingest_must_not_run(monkeypatch):
+    """Fail the test if a denied agent credential reaches the ingest backend."""
+
+    def _explode(*args, **kwargs):
+        raise AssertionError("ingest backend ran for a failed agent credential")
+
+    monkeypatch.setattr(main, "ingest_lines", _explode)
+    yield
+
+
+def _new_agent_key(name: str):
+    agent = create_agent(name)
+    key = create_api_key(agent.id)
+    return agent, key
+
+
+def _caddy_dual_headers(agent_key: str, shared_token: str = TOKEN) -> dict[str, str]:
+    """Reproduce the legacy Caddy shape: shared token + agent key at once."""
+    return {
+        "Authorization": f"Bearer {shared_token}",
+        "X-API-Key": agent_key,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -283,3 +325,169 @@ def test_is_loopback_host_classification(host, expected):
     from backend.app.main import _is_loopback_host
 
     assert _is_loopback_host(host) is expected
+
+
+# --------------------------------------------------------------------------- #
+# Agent API keys through the supplied Caddy deployment
+# --------------------------------------------------------------------------- #
+
+
+def test_agent_key_with_shared_authorization_authenticates(
+    api_client, _token_env, _cheap_key_hashing, monkeypatch
+):
+    """Valid X-API-Key + shared Authorization authenticates as the agent.
+
+    This is the exact dual-credential shape produced by the old Caddy config:
+    the proxy overwrote nothing but *added* a shared Bearer credential while
+    the client supplied an agent key. The agent credential must win, and the
+    ingest backend must receive the agent id for attribution.
+    """
+    calls: list[int | None] = []
+
+    def fake_ingest(lines, event_ids=None, agent_id=None):
+        calls.append(agent_id)
+        return {
+            "received": len(lines),
+            "parsed": 0,
+            "ignored": len(lines),
+            "events": [],
+            "alerts": [],
+        }
+
+    monkeypatch.setattr(main, "ingest_lines", fake_ingest)
+    agent, key = _new_agent_key("caddy-dual-header")
+
+    response = api_client.post(
+        INGEST_PATH,
+        json={"lines": ["test event"]},
+        headers=_caddy_dual_headers(key.plaintext_key),
+    )
+
+    assert response.status_code == 200, response.text
+    assert calls == [agent.id]
+
+
+def test_invalid_agent_key_does_not_fall_back_to_shared_token(
+    api_client, _token_env, _ingest_must_not_run
+):
+    """An unknown gw_* key is rejected even with a valid shared token present."""
+    response = api_client.post(
+        INGEST_PATH,
+        json={"lines": ["test event"]},
+        headers=_caddy_dual_headers("gw_this-key-does-not-exist"),
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid or revoked agent API key"
+
+
+def test_duplicate_header_cannot_hide_agent_key_from_backend(
+    api_client, _token_env, _ingest_must_not_run
+):
+    """A shared first value must not mask a later gw_* value.
+
+    Caddy's header matcher inspects every duplicate header value and would
+    route this request to the agent-ingest handle. The backend must inspect
+    every value too, otherwise it would read only the shared token and
+    silently downgrade the request to legacy auth.
+    """
+    response = api_client.post(
+        INGEST_PATH,
+        json={"lines": ["test event"]},
+        headers=[
+            ("X-API-Key", TOKEN),
+            ("X-API-Key", "gw_this-key-does-not-exist"),
+        ],
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid or revoked agent API key"
+
+
+def test_revoked_agent_key_does_not_fall_back_to_shared_token(
+    api_client, _token_env, _cheap_key_hashing, _ingest_must_not_run
+):
+    """A revoked agent key is rejected even with a valid shared token present."""
+    _, key = _new_agent_key("revoked-through-caddy")
+    assert revoke_api_key(key.id, reason="test revocation") is True
+
+    response = api_client.post(
+        INGEST_PATH,
+        json={"lines": ["test event"]},
+        headers=_caddy_dual_headers(key.plaintext_key),
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid or revoked agent API key"
+
+
+def test_expired_agent_key_does_not_fall_back_to_shared_token(
+    api_client, _token_env, _cheap_key_hashing, _ingest_must_not_run
+):
+    """An expired agent key is rejected even with a valid shared token present."""
+    agent = create_agent("expired-through-caddy")
+    key = create_api_key(agent.id, expires_at="2000-01-01T00:00:00Z")
+
+    response = api_client.post(
+        INGEST_PATH,
+        json={"lines": ["test event"]},
+        headers=_caddy_dual_headers(key.plaintext_key),
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid or revoked agent API key"
+
+
+def test_agent_key_is_forbidden_on_admin_endpoint(
+    api_client, _token_env, _cheap_key_hashing
+):
+    """A valid agent key cannot read admin routes, with or without the token.
+
+    The second assertion is the downgrade guard: the presence of a valid
+    shared credential must not turn an agent-key admin request into legacy
+    shared-token access.
+    """
+    _, key = _new_agent_key("admin-attempt")
+
+    only_agent = api_client.get(
+        ADMIN_AGENTS_PATH, headers={"X-API-Key": key.plaintext_key}
+    )
+    assert only_agent.status_code == 403
+    assert "restricted to ingestion" in only_agent.json()["detail"]
+
+    dual = api_client.get(
+        ADMIN_AGENTS_PATH, headers=_caddy_dual_headers(key.plaintext_key)
+    )
+    assert dual.status_code == 403
+    assert "restricted to ingestion" in dual.json()["detail"]
+
+
+def test_legacy_proxy_injected_token_authenticates(
+    api_client, _token_env, _stub_backends
+):
+    """The Caddy-injected X-Greywatch-Token header is a valid legacy credential."""
+    response = api_client.get(
+        "/api/v1/journal/status", headers={"X-Greywatch-Token": TOKEN}
+    )
+    assert response.status_code == 200
+
+
+def test_invalid_proxy_injected_token_is_rejected(
+    api_client, _token_env, _stub_backends
+):
+    """A wrong X-Greywatch-Token alone never authenticates (fail closed)."""
+    response = api_client.get(
+        "/api/v1/journal/status", headers={"X-Greywatch-Token": "wrong"}
+    )
+    assert response.status_code == 401
+
+
+def test_legacy_token_still_authenticates_without_agent_key(
+    api_client, _token_env, _stub_backends
+):
+    """Legacy Authorization Bearer shared-token auth is unchanged."""
+    response = api_client.get(
+        "/api/v1/journal/status",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    )
+    assert response.status_code == 200

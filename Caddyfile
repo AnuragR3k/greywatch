@@ -8,8 +8,13 @@
 #   * Caddy basicauth on the dashboard shell (/) authenticates the human user
 #     before the SPA can load.
 #   * Caddy injects the upstream API credential (GREYWATCH_API_TOKEN) server-side
-#     when proxying /api/* to the backend. The browser NEVER sees the API token.
+#     in the X-Greywatch-Token header when proxying /api/* to the backend.
+#     Authorization is left untouched so an agent API key is never overwritten.
 #   * The backend validates the token on every non-public endpoint (token mode).
+#   * Agent API keys (gw_...) use a dedicated ingestion route that does not
+#     require dashboard basicauth and does not receive the shared token. The
+#     backend authenticates the key itself; invalid/expired/revoked keys are
+#     rejected and never fall back to shared-token authentication.
 #   * /docs and /openapi.json are not proxied by Caddy and return 404.
 #
 # Usage:
@@ -70,11 +75,70 @@ https://{REPLACE_ME_WITH_DOMAIN} {
 	}
 
 	# ------------------------------------------------------------------
+	# Agent ingestion ingress — remote ingestion-only agents authenticate
+	# with their own API key (gw_...), so these routes intentionally bypass
+	# the dashboard basic_auth gate. They are limited to the single ingest
+	# endpoint and the exact key shapes the backend understands; every other
+	# path still falls through to the basic_auth-protected /api/* handle.
+	#
+	# The shared token is NOT injected here (and any inbound X-Greywatch-Token
+	# is stripped). The backend authenticates the agent key itself and never
+	# downgrades a failed key to shared-token auth.
+	# ------------------------------------------------------------------
+	@agent_ingest_api_key {
+		method POST
+		path /api/v1/events/ingest
+		header_regexp X-API-Key ^gw_[A-Za-z0-9_-]+$
+	}
+
+	handle @agent_ingest_api_key {
+		reverse_proxy 127.0.0.1:8000 {
+			header_up -X-Greywatch-Token
+			header_up Host {upstream_hostport}
+			header_up X-Forwarded-Proto {scheme}
+			# Overwrite (do not append to) any client-supplied XFF so the
+			# backend sees exactly one hop. Both headers are only trusted by
+			# the backend when the immediate peer is a configured trusted
+			# proxy (loopback by default). X-Greywatch-Client-IP is the
+			# primary key for the pre-auth agent-key limiter.
+			header_up X-Greywatch-Client-IP {http.request.remote.host}
+			header_up X-Forwarded-For {http.request.remote.host}
+		}
+	}
+
+	@agent_ingest_bearer {
+		method POST
+		path /api/v1/events/ingest
+		header_regexp Authorization "^Bearer\s+gw_[A-Za-z0-9_-]+$"
+	}
+
+	handle @agent_ingest_bearer {
+		reverse_proxy 127.0.0.1:8000 {
+			header_up -X-Greywatch-Token
+			header_up Host {upstream_hostport}
+			header_up X-Forwarded-Proto {scheme}
+			# Overwrite (do not append to) any client-supplied XFF so the
+			# backend sees exactly one hop. Both headers are only trusted by
+			# the backend when the immediate peer is a configured trusted
+			# proxy (loopback by default). X-Greywatch-Client-IP is the
+			# primary key for the pre-auth agent-key limiter.
+			header_up X-Greywatch-Client-IP {http.request.remote.host}
+			header_up X-Forwarded-For {http.request.remote.host}
+		}
+	}
+
+	# ------------------------------------------------------------------
 	# API proxy -> FastAPI uvicorn on loopback only.
 	# basicauth is required BEFORE the upstream token is injected, so an
 	# unauthenticated request never reaches the backend with Caddy's
 	# privileged credential. The browser NEVER sees the token.
 	# The backend validates the token on every non-public endpoint.
+	#
+	# The shared token travels in X-Greywatch-Token, NOT Authorization:
+	# overwriting Authorization would replace an agent API key with the
+	# shared token and silently downgrade a revoked/expired key to legacy
+	# auth. Authorization is deliberately forwarded untouched so the backend
+	# can detect a gw_* agent key on a non-ingest path and reject it with 403.
 	#
 	# NOTE: use `handle` (not `handle_path`) so the URL path prefix is NOT
 	# stripped before forwarding to the backend. `handle_path` would strip
@@ -86,10 +150,16 @@ https://{REPLACE_ME_WITH_DOMAIN} {
 			{REPLACE_ME_WITH_DASHBOARD_USER} $2y$10${REPLACE_ME_WITH_BCRYPT_HASH}
 		}
 		reverse_proxy 127.0.0.1:8000 {
-			header_up Authorization "Bearer {env.GREYWATCH_API_TOKEN}"
+			header_up X-Greywatch-Token {env.GREYWATCH_API_TOKEN}
 			header_up Host {upstream_hostport}
 			header_up X-Forwarded-Proto {scheme}
-			header_up X-Forwarded-For {remote}
+			# Overwrite (do not append to) any client-supplied XFF so the
+			# backend sees exactly one hop. Both headers are only trusted by
+			# the backend when the immediate peer is a configured trusted
+			# proxy (loopback by default). X-Greywatch-Client-IP is the
+			# primary key for the pre-auth agent-key limiter.
+			header_up X-Greywatch-Client-IP {http.request.remote.host}
+			header_up X-Forwarded-For {http.request.remote.host}
 		}
 	}
 
