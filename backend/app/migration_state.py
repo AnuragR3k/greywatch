@@ -84,12 +84,14 @@ State semantics
 
 .. note::
 
-   Versioned schema descriptors are not available: Greywatch's only schema
-   definition is the *current* one in ``siem.initialize_database()``. The
-   inspector therefore compares the application tables against the current
-   expected schema and, per C3, fail-closes (INCONSISTENT) when a ledger claims
-   applied migrations that the schema does not satisfy. A future task that
-   ships historical schema DDLs can wire them in here.
+   Schema expectations are versioned in :mod:`backend.app.migration_schema`.
+   A database whose ledger claims version N is compared against the cumulative
+   vN schema, including the v2 agent/API-key/audit tables and the v3
+   audit-chain columns/index. A ledger entry is never accepted on its own: any
+   missing or incompatible object makes the database INCONSISTENT, and the
+   report's ``detail`` names the missing table, column, or index. Legacy
+   databases without a ledger (or with an empty ledger) are compared against
+   the v1 baseline so they remain migratable.
 """
 
 from __future__ import annotations
@@ -125,9 +127,12 @@ from .migration_schema import (
     ADDABLE_COLUMNS,
     ADDABLE_INDEXES,
     APP_TABLES,
+    EXPECTED_SCHEMA,
     LEDGER_TABLE,
     SchemaDifferences,
     compare_schema,
+    describe_differences,
+    expected_schema_for_version,
     table_names,
 )
 
@@ -191,28 +196,8 @@ class DatabaseReport:
 
 
 def _describe_differences(diffs: SchemaDifferences) -> str:
-    parts: list[str] = []
-    if diffs.missing_tables:
-        parts.append(f"missing table(s): {', '.join(diffs.missing_tables)}")
-    for table, columns in diffs.missing_columns.items():
-        parts.append(f"{table} missing column(s): {', '.join(columns)}")
-    for table, issues in diffs.incompatible_columns.items():
-        for column, reason in issues:
-            parts.append(f"{table}.{column}: incompatible ({reason})")
-    for table, indexes in diffs.missing_indexes.items():
-        parts.append(f"{table} missing index(es): {', '.join(indexes)}")
-    for table, issues in diffs.incompatible_indexes.items():
-        for name, reason in issues:
-            parts.append(f"{table}.{name}: incompatible ({reason})")
-    for table, fks in diffs.missing_foreign_keys.items():
-        for from_col, to_table, to_col in fks:
-            parts.append(f"{table} missing foreign key {from_col} -> {to_table}.{to_col}")
-    for table, fks in diffs.incompatible_foreign_keys.items():
-        for from_col, reason in fks:
-            parts.append(f"{table} FK {from_col}: incompatible ({reason})")
-    for table, opts in diffs.incompatible_table_options.items():
-        parts.append(f"{table} table options incompatible ({'; '.join(opts)})")
-    return "; ".join(parts)
+    """Backwards-compatible wrapper around the public formatter."""
+    return describe_differences(diffs)
 
 
 def _material_schema_incompatibility(diffs: SchemaDifferences) -> bool:
@@ -657,7 +642,22 @@ def inspect_connection(
 
     # ---- Application tables present (partial or complete) ---------------- #
     report.applied_version = applied_version
-    report.differences = compare_schema(connection)
+
+    # M3: the expected schema is version-aware. A ledger that claims version N
+    # must satisfy the cumulative schema introduced through N. Only the shipped
+    # registry has version-specific descriptors; custom registries used by
+    # callers/tests fall back to the v1 baseline they are built on.
+    comparison_schema = EXPECTED_SCHEMA
+    if applied_version >= 1 and tuple(ordered) == MIGRATIONS:
+        try:
+            comparison_schema = expected_schema_for_version(applied_version)
+        except ValueError as exc:
+            report.state = DatabaseState.INCONSISTENT
+            report.detail = str(exc)
+            report.error = exc
+            return report
+
+    report.differences = compare_schema(connection, expected=comparison_schema)
     diffs = report.differences
 
     # A ledger claiming applied migrations that the schema does not satisfy is
@@ -665,8 +665,9 @@ def inspect_connection(
     if applied_version >= 1 and not diffs.complete:
         report.state = DatabaseState.INCONSISTENT
         report.detail = (
-            f"ledger claims applied version {applied_version} but the schema is "
-            f"incomplete/incompatible: {_describe_differences(diffs)}"
+            f"ledger claims applied version {applied_version} but the schema "
+            f"does not match the expected v{applied_version} schema: "
+            f"{_describe_differences(diffs)}"
         )
         return report
 

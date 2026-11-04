@@ -139,6 +139,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "baseline"),
     Migration(2, "agents_and_api_keys"),
     Migration(3, "audit_log_integrity"),
+    Migration(4, "audit_chain_order"),
 )
 
 

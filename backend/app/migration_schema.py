@@ -1,9 +1,25 @@
 """Read-only structural schema descriptors and comparison for Greywatch.
 
-This module describes the *expected* current schema of Greywatch's five
-application tables (``events``, ``alerts``, ``incidents``,
-``incident_events``, ``collector_state``), inspects a live SQLite connection
-through PRAGMA introspection, and reports structural differences.
+This module describes the expected schema for **every supported migration
+version** and reports structural differences against a live SQLite connection
+through PRAGMA introspection.
+
+The expected schemas are cumulative:
+
+* v1 (``baseline``) -- five core tables (``events``, ``alerts``,
+  ``incidents``, ``incident_events``, ``collector_state``).
+* v2 (``agents_and_api_keys``) -- adds ``agents``, ``api_keys`` and
+  ``audit_log``, ``events.agent_id`` (with its FK and index), and the agent /
+  API-key / audit-log indexes.
+* v3 (``audit_log_integrity``) -- adds ``audit_log.prev_hash``,
+  ``audit_log.chain_hash`` and ``idx_audit_log_chain``.
+* v4 (``audit_chain_order``) -- data-only rebuild; its schema is identical to
+  v3.
+
+A ledger entry alone is never treated as proof that the schema exists. The
+inspector compares the database against the schema expected at the *validated
+ledger version*, so a database claiming v4 without the agent or audit-chain
+objects is reported as inconsistent.
 
 It performs **no writes**: no ``CREATE``/``ALTER``/``DROP``, no PRAGMA writes,
 and no call to ``create_schema_migrations_table()``. Database lifecycle
@@ -35,13 +51,16 @@ import re
 from collections import OrderedDict
 from types import MappingProxyType
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from .migration_ledger import SCHEMA_MIGRATIONS_TABLE
 
 __all__ = [
     "APP_TABLES",
+    "AGENT_TABLES",
+    "CURRENT_APP_TABLES",
     "LEDGER_TABLE",
+    "SCHEMA_VERSIONS",
     "ADDABLE_COLUMNS",
     "ADDABLE_INDEXES",
     "ColumnInfo",
@@ -51,15 +70,30 @@ __all__ = [
     "SchemaDifferences",
     "ExpectedSchema",
     "EXPECTED_SCHEMA",
+    "EXPECTED_SCHEMAS",
+    "EXPECTED_CURRENT_SCHEMA",
+    "expected_schema_for_version",
     "column_affinity",
     "schema_fingerprint",
     "compare_schema",
+    "describe_differences",
     "inspect_table",
     "table_exists",
     "table_names",
 ]
 
+#: Core application tables introduced by the v1 baseline.
 APP_TABLES = ("events", "alerts", "incidents", "incident_events", "collector_state")
+
+#: Agent and audit-chain tables introduced by migration v2.
+AGENT_TABLES = ("agents", "api_keys", "audit_log")
+
+#: Every application table required by the current (v4) schema.
+CURRENT_APP_TABLES = APP_TABLES + AGENT_TABLES
+
+#: Migration versions that have a registered expected schema descriptor.
+SCHEMA_VERSIONS = (1, 2, 3, 4)
+
 LEDGER_TABLE = SCHEMA_MIGRATIONS_TABLE
 
 # Columns/indexes introduced by the legacy migration path
@@ -304,11 +338,12 @@ def _opts(autoinc: bool = False, without_rowid: bool = False, strict: bool = Fal
 
 
 def _build_expected_schema() -> "OrderedDict[str, TableDescriptor]":
-    """Build the expected *current* schema descriptors.
+    """Build the expected **v1 baseline** schema descriptors.
 
     This mirrors ``siem.initialize_database()`` plus the columns/indexes added by
-    ``_migrate_alerts_table`` / ``_migrate_events_table`` (i.e. the schema a
-    freshly-initialized database has today).
+    ``_migrate_alerts_table`` / ``_migrate_events_table``. It deliberately does
+    not include the v2+ agent/audit tables: legacy databases and the legacy
+    initializer are valid at v1.
     """
     events = TableDescriptor(
         name="events",
@@ -440,8 +475,130 @@ def _build_expected_schema() -> "OrderedDict[str, TableDescriptor]":
     )
 
 
+def _build_expected_schema_v2() -> "OrderedDict[str, TableDescriptor]":
+    """Build the expected schema after migration v2.
+
+    v2 creates ``agents``, ``api_keys`` and ``audit_log``, adds nullable
+    ``events.agent_id`` with its foreign key and index, and creates the named
+    agent/API-key/audit indexes. Column order matches the migration DDL because
+    SQLite reports it via ``PRAGMA table_info``.
+    """
+    base = _build_expected_schema()
+
+    events_base = base["events"]
+    events = replace(
+        events_base,
+        columns=events_base.columns + (_int("agent_id", notnull=False),),
+        indexes=events_base.indexes + (_idx("idx_events_agent_id", ("agent_id",)),),
+        foreign_keys=events_base.foreign_keys
+        + (_fk("agent_id", "agents", "id", on_delete="SET NULL"),),
+    )
+
+    agents = TableDescriptor(
+        name="agents",
+        columns=(
+            _int("id", pk=1),
+            _txt("name"),
+            _txt("display_name", notnull=False),
+            _txt("description", notnull=False),
+            _txt("status", default="'active'"),
+            _txt("created_at"),
+            _txt("updated_at"),
+            _txt("last_seen_at", notnull=False),
+            _txt("deactivated_at", notnull=False),
+            _txt("deactivated_reason", notnull=False),
+        ),
+        indexes=(
+            _idx("idx_agents_status", ("status",)),
+            _idx("idx_agents_last_seen", ("last_seen_at",)),
+        ),
+        options=_opts(autoinc=True),
+    )
+
+    api_keys = TableDescriptor(
+        name="api_keys",
+        columns=(
+            _int("id", pk=1),
+            _int("agent_id"),
+            _txt("key_hash"),
+            _txt("key_prefix"),
+            _txt("name", notnull=False),
+            _txt("status", default="'active'"),
+            _txt("created_at"),
+            _txt("expires_at", notnull=False),
+            _txt("revoked_at", notnull=False),
+            _txt("revoked_reason", notnull=False),
+            _txt("last_used_at", notnull=False),
+        ),
+        indexes=(
+            _idx("idx_api_keys_agent_id", ("agent_id",)),
+            _idx("idx_api_keys_key_prefix", ("key_prefix",)),
+            _idx("idx_api_keys_status", ("status",)),
+        ),
+        foreign_keys=(_fk("agent_id", "agents", "id", on_delete="CASCADE"),),
+        options=_opts(autoinc=True),
+    )
+
+    audit_log = TableDescriptor(
+        name="audit_log",
+        columns=(
+            _int("id", pk=1),
+            _txt("timestamp"),
+            _txt("event_type"),
+            _int("agent_id", notnull=False),
+            _int("api_key_id", notnull=False),
+            _txt("actor", notnull=False),
+            _txt("detail", notnull=False),
+        ),
+        indexes=(
+            _idx("idx_audit_log_timestamp", ("timestamp",)),
+            _idx("idx_audit_log_agent_id", ("agent_id",)),
+            _idx("idx_audit_log_event_type", ("event_type",)),
+        ),
+        foreign_keys=(
+            _fk("agent_id", "agents", "id", on_delete="SET NULL"),
+            _fk("api_key_id", "api_keys", "id", on_delete="SET NULL"),
+        ),
+        options=_opts(autoinc=True),
+    )
+
+    return OrderedDict(
+        [
+            ("events", events),
+            ("alerts", base["alerts"]),
+            ("incidents", base["incidents"]),
+            ("incident_events", base["incident_events"]),
+            ("collector_state", base["collector_state"]),
+            ("agents", agents),
+            ("api_keys", api_keys),
+            ("audit_log", audit_log),
+        ]
+    )
+
+
+def _build_expected_schema_v3() -> "OrderedDict[str, TableDescriptor]":
+    """Build the expected schema after migration v3 (audit hash chain)."""
+    base = _build_expected_schema_v2()
+
+    audit_base = base["audit_log"]
+    audit_log = replace(
+        audit_base,
+        columns=audit_base.columns
+        + (
+            _txt("prev_hash", notnull=False),
+            _txt("chain_hash", notnull=False),
+        ),
+        indexes=audit_base.indexes
+        + (_idx("idx_audit_log_chain", ("chain_hash",)),),
+    )
+
+    result = OrderedDict(base)
+    result["audit_log"] = audit_log
+    return result
+
+
 class ExpectedSchema:
-    """Container for the expected current schema descriptors.
+    """Container for the expected schema of one migration version.
 
     The descriptor mapping is exposed read-only via :attr:`tables` (a
     :class:`types.MappingProxyType`) so callers cannot mutate the expected
@@ -473,8 +630,41 @@ class ExpectedSchema:
         return self._tables[name]
 
 
-#: Singleton description of the expected current schema (immutable).
-EXPECTED_SCHEMA = ExpectedSchema()
+#: Immutable expected schema for each supported migration version.
+EXPECTED_SCHEMAS = MappingProxyType(
+    {
+        1: ExpectedSchema(_build_expected_schema()),
+        2: ExpectedSchema(_build_expected_schema_v2()),
+        3: ExpectedSchema(_build_expected_schema_v3()),
+        # v4 is data-only (chain rebuild); it introduces no schema objects.
+        4: ExpectedSchema(_build_expected_schema_v3()),
+    }
+)
+
+#: Backwards-compatible alias for the v1 baseline descriptor.
+#:
+#: ``siem.initialize_database()`` and legacy databases are v1-shaped, so this
+#: remains the default for callers that do not specify a migration version.
+EXPECTED_SCHEMA = EXPECTED_SCHEMAS[1]
+
+#: Expected schema at the latest supported migration version.
+EXPECTED_CURRENT_SCHEMA = EXPECTED_SCHEMAS[SCHEMA_VERSIONS[-1]]
+
+
+def expected_schema_for_version(version: int) -> ExpectedSchema:
+    """Return the immutable expected schema for ``version``.
+
+    Raises :class:`ValueError` for an unsupported version. Callers that
+    validate a ledger must not fall back to a different version: doing so
+    could silently accept a schema that lacks objects the ledger claims.
+    """
+    try:
+        return EXPECTED_SCHEMAS[version]
+    except KeyError as exc:
+        raise ValueError(
+            f"no expected schema is registered for migration version {version!r}; "
+            f"supported versions: {', '.join(str(v) for v in SCHEMA_VERSIONS)}"
+        ) from exc
 
 
 @dataclass(slots=True)
@@ -507,6 +697,36 @@ class SchemaDifferences:
             or self.incompatible_foreign_keys
             or self.incompatible_table_options
         )
+
+
+def describe_differences(diffs: SchemaDifferences) -> str:
+    """Return an actionable, human-readable summary of schema differences.
+
+    Names every missing table, column, index and foreign key so an operator or
+    startup log identifies the exact object that failed verification.
+    """
+    parts: list[str] = []
+    if diffs.missing_tables:
+        parts.append(f"missing table(s): {', '.join(diffs.missing_tables)}")
+    for table, columns in diffs.missing_columns.items():
+        parts.append(f"{table} missing column(s): {', '.join(columns)}")
+    for table, issues in diffs.incompatible_columns.items():
+        for column, reason in issues:
+            parts.append(f"{table}.{column}: incompatible ({reason})")
+    for table, indexes in diffs.missing_indexes.items():
+        parts.append(f"{table} missing index(es): {', '.join(indexes)}")
+    for table, issues in diffs.incompatible_indexes.items():
+        for name, reason in issues:
+            parts.append(f"{table}.{name}: incompatible ({reason})")
+    for table, fks in diffs.missing_foreign_keys.items():
+        for from_col, to_table, to_col in fks:
+            parts.append(f"{table} missing foreign key {from_col} -> {to_table}.{to_col}")
+    for table, fks in diffs.incompatible_foreign_keys.items():
+        for from_col, reason in fks:
+            parts.append(f"{table} FK {from_col}: incompatible ({reason})")
+    for table, opts in diffs.incompatible_table_options.items():
+        parts.append(f"{table} table options incompatible ({'; '.join(opts)})")
+    return "; ".join(parts)
 
 
 # --------------------------------------------------------------------------- #
@@ -837,7 +1057,7 @@ def compare_schema(
     diffs: SchemaDifferences = SchemaDifferences()
     actual_tables = {t.lower() for t in table_names(connection)}
 
-    for table_name in APP_TABLES:
+    for table_name in expected.tables:
         descriptor = expected[table_name]
         if table_name.lower() not in actual_tables:
             diffs.missing_tables.append(table_name)
@@ -952,21 +1172,27 @@ def compare_schema(
     return diffs
 
 
-def schema_fingerprint(connection: sqlite3.Connection) -> str:
+def schema_fingerprint(
+    connection: sqlite3.Connection,
+    expected: ExpectedSchema | None = None,
+) -> str:
     """Return a deterministic fingerprint of the Greywatch *application* schema.
 
-    Only the five application tables (``APP_TABLES``) are included -- unrelated
-    tables and the migration ledger are deliberately excluded so the fingerprint
-    reflects the application's own structure. The fingerprint encodes every
-    property checked by :func:`compare_schema` (columns with affinity / PK
-    position / NOT NULL / default, indexes with columns / collation / order /
-    unique / partial / where-predicate, foreign keys with target and actions,
-    and table options)
-    so equivalent schemas produce identical fingerprints and materially
-    different schemas produce different ones.
+    Only the tables described by ``expected`` are included -- unrelated tables
+    and the migration ledger are deliberately excluded so the fingerprint
+    reflects the application's own structure. By default this is the v1
+    baseline (``EXPECTED_SCHEMA``); pass a version-specific descriptor to
+    fingerprint the full schema at that migration version. The fingerprint
+    encodes every property checked by :func:`compare_schema` (columns with
+    affinity / PK position / NOT NULL / default, indexes with columns /
+    collation / order / unique / partial / where-predicate, foreign keys with
+    target and actions, and table options) so equivalent schemas produce
+    identical fingerprints and materially different schemas produce different
+    ones.
     """
+    expected = expected if expected is not None else EXPECTED_SCHEMA
     parts: list[str] = []
-    for table_name in APP_TABLES:
+    for table_name in expected.tables:
         if table_name.lower() not in {t.lower() for t in table_names(connection)}:
             parts.append(f"missing:{table_name}")
             continue

@@ -86,16 +86,18 @@ def test_empty_registry_is_valid():
 
 
 def test_default_registry_contains_baseline():
-    """The shipped registry contains migrations: version 1 'baseline', version 2 'agents_and_api_keys', version 3 'audit_log_integrity'."""
-    assert len(MIGRATIONS) == 3
+    """The shipped registry contains migrations v1 through v4."""
+    assert len(MIGRATIONS) == 4
     assert MIGRATIONS[0].version == 1
     assert MIGRATIONS[0].name == "baseline"
     assert MIGRATIONS[1].version == 2
     assert MIGRATIONS[1].name == "agents_and_api_keys"
     assert MIGRATIONS[2].version == 3
     assert MIGRATIONS[2].name == "audit_log_integrity"
+    assert MIGRATIONS[3].version == 4
+    assert MIGRATIONS[3].name == "audit_chain_order"
     assert validate_registry(MIGRATIONS) == MIGRATIONS
-    assert latest_version() == 3
+    assert latest_version() == 4
 
 
 def test_valid_registry_is_returned_sorted_by_version():
@@ -820,7 +822,7 @@ def test_default_empty_migrations_with_non_empty_ledger(tmp_path):
     and is rejected as a future migration rather than silently accepted."""
     connection = _ledger_db(tmp_path)
     try:
-        _insert_versions(connection, 1, 2, 3, 4)  # Ledger has v4, registry only has v1,v2,v3
+        _insert_versions(connection, 1, 2, 3, 4, 5)  # Ledger has v5, registry only has v1-v4
         with pytest.raises(FutureMigrationError):
             validate_ledger(connection, MIGRATIONS)
     finally:
