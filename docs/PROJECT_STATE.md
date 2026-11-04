@@ -14,7 +14,7 @@
 Greywatch is an open-source Security Information and Event Management (SIEM) platform. It collects Linux SSH authentication logs, normalizes them into structured security events, detects brute-force attacks using a threshold-based sliding window rule, surfaces detected activity as actionable security alerts, and presents them in a light, soft-grey React SOC dashboard (teal gradient telemetry panel) with alert evidence drill-down for analyst investigation.
 
 ### Current Maturity
-The project is **experimental and under active development**. Core ingestion, normalization, detection, storage, alert management, and investigation interfaces are implemented and operational. No authentication, role-based access control, or rate limiting is currently enforced on any API endpoint.
+The project is **experimental and under active development**. Core ingestion, normalization, detection, storage, alert management, and investigation interfaces are implemented and operational. Request rate limiting is enforced by independent global and per-agent token-bucket limiters; see §2.15.
 
 ### Technology Stack
 - **Backend:** Python 3.14, FastAPI, Pydantic, Uvicorn, SQLite3 (embedded)
@@ -231,29 +231,6 @@ Only features verified in the codebase are documented below:
   outside (before) the body-limit middleware, so unauthorized requests are
   rejected before their bodies are read.
 
-- `RateLimitMiddleware` ASGI middleware enforces a per-client request rate
-  limit using a token bucket, running **after** the trust boundary so auth
-  failures (401/403) never consume rate-limit tokens. Configured via
-  `GREYWATCH_RATE_LIMIT_*` environment variables:
-  - `GREYWATCH_RATE_LIMIT_ENABLED` (default `1`): `0`/`false`/`no` disables;
-    invalid values fall back to enabled (never silently disabled).
-  - `GREYWATCH_RATE_LIMIT_INGESTION` (default `60`): req/min for
-    `POST /api/v1/events/ingest`.
-  - `GREYWATCH_RATE_LIMIT_READS` (default `120`): req/min for read endpoints.
-  - `GREYWATCH_RATE_LIMIT_COLLECTOR` (default `30`): req/min for journal and
-    Suricata collect endpoints.
-  - `GREYWATCH_RATE_LIMIT_ALERT_CLOSE` (default `30`): req/min for alert close.
-  - `GREYWATCH_RATE_LIMIT_BURST_MULTIPLIER` (default `2`): burst = limit ×
-    multiplier.
-  - Overshoot returns HTTP `429 Too Many Requests` with `{"detail": "Rate
-    limit exceeded"}` and a `Retry-After` header computed from an injectable
-    monotonic clock.
-  - Client identity is the ASGI peer host, or the shared token value in token
-    mode; forwarding headers are never consulted.
-  - The bucket store is bounded by `max_entries` (default 10,000) with LRU
-    eviction, capping memory growth.
-  - Public endpoints `/` and `/health` are never rate limited.
-
 ### 2.14 Event Retention & Database Lifecycle Management
 
 Greywatch now includes a **safe, configurable event-retention system** for its
@@ -298,6 +275,34 @@ deleted.
 Operational procedures and scheduling (daily dry-run preview, weekly execute,
 monthly VACUUM during downtime) are documented in `docs/DEPLOYMENT.md`
 (§"Event retention and database maintenance").
+
+### 2.15 API Rate Limiting (`backend/app/main.py`, `backend/app/agents.py`)
+
+Greywatch has two independent token-bucket limiters. Both keep buckets in
+process memory; multiple workers or replicas therefore enforce separate limits,
+and there is no distributed coordination.
+
+- **Global** (`RateLimitMiddleware`): applies to every non-public HTTP path
+  after the trust boundary; `/` and `/health` are exempt. Paths map to
+  `ingestion` (`60` req/min), `reads` (`120`), `collector` (`30`), or
+  `alert_close` (`30`); uncategorized non-public paths use `reads`. One bucket
+  is kept per client identity (ASGI peer host, or one shared bucket keyed by
+  `GREYWATCH_API_TOKEN` in token mode), with a default burst multiplier of `2`.
+  A 429 response uses `{"detail": "Rate limit exceeded"}` and sets
+  `Retry-After`.
+- **Per-agent** (`check_agent_rate_limit`): applies only to agent API-key
+  requests. Agent keys are restricted to `POST /api/v1/events/ingest`, so only
+  `ingestion` is enforced (`GREYWATCH_AGENT_RATE_INGESTION`, default `60`);
+  `reads` (`120`), `collector` (`10`), and `alert_close` (`30`) are configured
+  but not integrated. Buckets are keyed by `(agent_id, category)`; the burst
+  default is `1.5`. A 429 response uses
+  `{"detail": "Agent rate limit exceeded"}` and sets `Retry-After`.
+- Failed authentication does not consume either limiter's tokens. Both can be
+  disabled independently (`GREYWATCH_RATE_LIMIT_ENABLED=0` and
+  `GREYWATCH_AGENT_RATE_LIMIT_ENABLED=0`).
+- Canonical documentation, including all environment variables, bucket
+  behavior, and deployment guidance:
+  [`docs/RATE_LIMITING.md`](RATE_LIMITING.md).
 
 ---
 
@@ -409,8 +414,12 @@ re-verified.
 1. **README discrepancies:**
    - `README.md` lists PostgreSQL as a technology, but the project uses SQLite exclusively (`data/greywatch.db`). No PostgreSQL code or libraries are present.
    - `README.md` lists Docker, but no `Dockerfile` or `docker-compose.yml` exists in the repository.
-2. **Missing authentication and authorization:**
-   - All backend API routes (`/api/v1/*`, `/health`) are unauthenticated. Anyone with network access can ingest logs, read alerts, or resolve alerts.
+2. **Authorization limitations:**
+   - Authentication is enforced, but there is no per-user role-based access
+     control. Loopback access is trusted, the shared `GREYWATCH_API_TOKEN`
+     grants access to all non-public routes, and agent API keys are restricted
+     to ingestion. Anyone holding the shared token can read or modify all API
+     data.
 3. **Duplicate untracked `vite.config.js`:**
    - An untracked `vite.config.js` exists at the root of the project with a slightly different proxy syntax than `frontend/vite.config.js`.
 4. **Generic HTML title:**
@@ -484,8 +493,10 @@ A prioritized list of near-term engineering tasks:
    - Fix the uncolored event-category badges: `categorizeEventType` assigns `teal`/`orange`/`purple`/`grey` tones to the Events-table badges, but `App.css` only defined `.badge` color rules for severities (`high`/`medium`/`low`/`info`) and statuses (`open`/`closed`). Added `.badge.teal`/`.orange`/`.purple`/`.grey` (using the existing accent-color palette) so category badges render with their intended fill. Verified `npm run lint` (0 errors) and `npm run build` (passing).
 4. **Generalize alert evidence engine:**
    - Refactor `get_alert_detail()` to support dynamic rule definitions rather than hardcoding `ssh_login_failed`.
-5. **Basic authentication & security controls:**
-   - Implement API key or HTTP basic authentication on `/api/v1/*` endpoints.
+5. **Role-based access control:**
+   - Shared-token and ingestion-only agent API-key authentication are
+     implemented. Remaining work: per-user roles/scopes and replacing the shared
+     beta token where appropriate.
 6. **Containerization:**
    - Add a `Dockerfile` and `docker-compose.yml` that builds the React frontend, packages the FastAPI backend, and serves them together.
 7. **Continuous log streaming / collector:**

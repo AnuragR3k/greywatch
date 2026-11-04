@@ -26,17 +26,18 @@ maintenance windows.
 3. [Database status inspection](#database-status-inspection)
 4. [Migration plan preview](#migration-plan-preview)
 5. [Database verification](#database-verification)
-6. [Backup creation before migration](#backup-creation-before-migration)
-7. [Running a migration interactively](#running-a-migration-interactively)
-8. [Running with `--yes`](#running-with---yes)
-9. [Dry-run behavior](#dry-run-behavior)
-10. [Failure behavior and transactional rollback](#failure-behavior-and-transactional-rollback)
-11. [Recovery by restoring a verified backup](#recovery-by-restoring-a-verified-backup)
-12. [Why automatic downgrade is unsupported](#why-automatic-downgrade-is-unsupported)
-13. [Concurrent startup behavior](#concurrent-startup-behavior)
-14. [Legacy initialization guard](#legacy-initialization-guard)
-15. [Recovery instructions](#recovery-instructions)
-16. [Operational limitations](#operational-limitations)
+6. [Schema requirements by migration version](#schema-requirements-by-migration-version)
+7. [Backup creation before migration](#backup-creation-before-migration)
+8. [Running a migration interactively](#running-a-migration-interactively)
+9. [Running with `--yes`](#running-with---yes)
+10. [Dry-run behavior](#dry-run-behavior)
+11. [Failure behavior and transactional rollback](#failure-behavior-and-transactional-rollback)
+12. [Recovery by restoring a verified backup](#recovery-by-restoring-a-verified-backup)
+13. [Why automatic downgrade is unsupported](#why-automatic-downgrade-is-unsupported)
+14. [Concurrent startup behavior](#concurrent-startup-behavior)
+15. [Legacy initialization guard](#legacy-initialization-guard)
+16. [Recovery instructions](#recovery-instructions)
+17. [Operational limitations](#operational-limitations)
 
 ---
 
@@ -48,8 +49,12 @@ transactional write path:
 | Component | Responsibility |
 |-----------|----------------|
 | `backend/app/migration_state.py` | Read-only database inspection and state classification. |
-| `backend/app/migration_registry.py` | Ordered migration registry (`v1: baseline`) and ledger/version validation. |
+| `backend/app/migration_schema.py` | Version-aware expected schema descriptors and structural comparison. |
+| `backend/app/migration_registry.py` | Ordered migration registry (`v1: baseline` … `v4: audit_chain_order`) and ledger/version validation. |
 | `backend/app/migrations/v001_baseline.py` | Baseline schema creation and permitted additive legacy changes. |
+| `backend/app/migrations/v002_agents.py` | Agent, API-key, and audit-log tables plus `events.agent_id`. |
+| `backend/app/migrations/v003_audit_log_integrity.py` | Audit hash-chain columns and `idx_audit_log_chain`. |
+| `backend/app/migrations/v004_audit_chain_order.py` | Data-only rebuild of audit-chain ordering (no schema changes). |
 | `backend/app/migrations/runner.py` | Transactional `status`, `plan`, `verify`, and `migrate` operations. |
 | `backend/app/migration_ledger.py` | The `schema_migrations` ledger table. |
 | `scripts/gw_migrate` | Operator-facing CLI wrapper around the runner. |
@@ -250,9 +255,17 @@ management in production.
    ```
 3. If migration failed due to lock/contention, retry startup (the lock is
    released on failure).
-4. If the database is in an unknown/inconsistent state (`inconsistent`,
-   `newer`, `corrupt`), do not attempt manual `ALTER`/`DROP`. Restore a
-   verified backup.
+4. If the database is `inconsistent`, `newer`, or `corrupt`, inspect it
+   read-only and record the detail before restoring:
+   ```bash
+   sudo -u greywatch ./scripts/gw_migrate status ./data/greywatch.db
+   ```
+   The `Detail:` line names the missing or incompatible table, column, index,
+   foreign key, or table option. Do **not** attempt manual `ALTER`/`DROP`,
+   ledger edits, or hand-created indexes. Verification never repairs a schema,
+   and neither should an operator. Restore a verified backup (see
+   [Recovery by restoring a verified backup](#recovery-by-restoring-a-verified-backup))
+   taken before the failed migration.
 
 **Orphaned temporary files:** Files matching `.<dbname>.init.*.tmp` in the
 database directory are from crashed initializations. They are harmless and can
@@ -309,19 +322,24 @@ Example output on a database that has not been migrated:
 ```text
 State: fresh
 Applied version: 0
-Latest version: 1
+Latest version: 4
 Ledger present: no
 ```
 
-Example output on a migrated database:
+Example output on a fully migrated database:
 
 ```text
 State: current
-Tables: alerts, collector_state, events, incident_events, incidents, schema_migrations
-Applied version: 1
-Latest version: 1
+Tables: agents, alerts, api_keys, audit_log, collector_state, events, incident_events, incidents, schema_migrations
+Applied version: 4
+Latest version: 4
 Ledger present: yes
 ```
+
+`Tables` lists the tables that exist, not the tables the ledger claims. A
+database can therefore be `inconsistent` while still showing all expected
+tables if a required column or index is missing; the `Detail:` line names the
+missing or incompatible object.
 
 Common states:
 
@@ -329,10 +347,10 @@ Common states:
 |-------|---------|
 | `fresh` | Valid SQLite database with no application tables. |
 | `ledger_only` | Migration ledger exists but the application schema does not. |
-| `pending` | Schema is complete but the ledger is behind the registry. |
-| `current` | Schema is complete and the ledger matches the latest version. |
+| `pending` | Schema matches the applied ledger version, but the ledger is behind the registry. |
+| `current` | Schema matches the latest version and the ledger matches it. |
 | `legacy_ready` | All application tables exist but need additive column/index changes. |
-| `inconsistent` | Ledger/schema disagreement, gaps, duplicates, or an invalid ledger. |
+| `inconsistent` | Ledger/schema disagreement (a missing or incompatible table, column, index, foreign key, or table option), gaps, duplicates, or an invalid ledger. |
 | `newer` | Ledger version is newer than this Greywatch release supports. |
 | `unrelated` | Valid SQLite database containing no Greywatch tables. |
 | `corrupt` | SQLite integrity/schema validation failed. |
@@ -365,8 +383,11 @@ sudo -u greywatch ./scripts/gw_migrate plan ./data/greywatch.db
 Example:
 
 ```text
-Pending migrations (1):
+Pending migrations (4):
   v1: baseline
+  v2: agents_and_api_keys
+  v3: audit_log_integrity
+  v4: audit_chain_order
 ```
 
 A current database prints:
@@ -415,6 +436,93 @@ service and as a post-migration check.
 
 ---
 
+## Schema requirements by migration version
+
+The migration ledger records what was applied; it is not proof that the schema
+exists. Verification is **version-aware and cumulative**: a database whose
+validated ledger reports version *N* must contain every object introduced by
+versions 1 through *N*.
+
+| Ledger version | Required schema |
+|----------------|-----------------|
+| v1 `baseline` | `events`, `alerts`, `incidents`, `incident_events`, `collector_state` with all baseline columns and indexes. |
+| v2 `agents_and_api_keys` | Everything in v1 plus `agents`, `api_keys`, and `audit_log`; nullable `events.agent_id` with `REFERENCES agents(id) ON DELETE SET NULL`; indexes `idx_events_agent_id`, `idx_agents_status`, `idx_agents_last_seen`, `idx_api_keys_agent_id`, `idx_api_keys_key_prefix`, `idx_api_keys_status`, `idx_audit_log_timestamp`, `idx_audit_log_agent_id`, and `idx_audit_log_event_type`. |
+| v3 `audit_log_integrity` | Everything in v2 plus `audit_log.prev_hash`, `audit_log.chain_hash`, and `idx_audit_log_chain`. |
+| v4 `audit_chain_order` | Same schema as v3. v4 rebuilds chain ordering data only; it adds no tables, columns, or indexes. |
+
+Consequences operators should know:
+
+- **No ledger or an empty ledger** is compared against the v1 baseline. A
+  pre-agent legacy database (five core tables, no agent/audit tables) is
+  therefore `pending`, not `inconsistent`, and remains migratable.
+- **A v3-shaped database with a v1–v4 ledger is `current`**, because v4 adds no
+  schema objects.
+- **A v4-shaped database with a v1–v3 ledger is `pending`**, because the ledger
+  is behind even though the extra objects are harmless.
+- **A ledger version with no registered descriptor fails closed** as
+  `inconsistent`; verification never falls back to a different version.
+- **Extra objects are tolerated.** The check is "at least the expected schema",
+  so a later schema with an older ledger is reported as pending rather than
+  corrupted.
+
+### What an inconsistent report looks like
+
+`status`, `verify`, migration refusal, and startup logs all use the same
+structural report. The `Detail:` line names every missing or incompatible
+object, for example:
+
+```text
+State: inconsistent
+Tables: alerts, collector_state, events, incident_events, incidents, schema_migrations
+Applied version: 4
+Latest version: 4
+Ledger present: yes
+Detail: ledger claims applied version 4 but the schema does not match the expected v4 schema: missing table(s): agents, api_keys, audit_log; events missing column(s): agent_id; events missing index(es): idx_events_agent_id; events missing foreign key agent_id -> agents.id
+```
+
+The runner refuses to migrate such a database and leaves the file byte-for-byte
+unchanged:
+
+```text
+ERROR: database in incompatible state: inconsistent: ledger claims applied version 4 but the schema does not match the expected v4 schema: missing table(s): agents, ...
+```
+
+If post-migration verification fails, the entire transaction — schema changes
+and the ledger row — is rolled back, and the error names the missing object:
+
+```text
+ERROR: schema incomplete after migration v2: agents missing index(es): idx_agents_status
+```
+
+### Read-only inspection
+
+All verification is read-only. It uses `PRAGMA table_info`, `index_list`,
+`index_xinfo`, `foreign_key_list`, and `table_list` against a read-only
+connection. It never runs `CREATE`, `ALTER`, `DROP`, `INSERT`, `UPDATE`, or
+`DELETE`, and it never "repairs" a missing object or stamps the ledger.
+
+To inspect a database by hand without risking a write, use SQLite's read-only
+URI mode:
+
+```bash
+sqlite3 'file:./data/greywatch.db?mode=ro' '.tables'
+sqlite3 'file:./data/greywatch.db?mode=ro' 'PRAGMA table_info(events);'
+sqlite3 'file:./data/greywatch.db?mode=ro' 'PRAGMA index_list(agents);'
+sqlite3 'file:./data/greywatch.db?mode=ro' \
+    'SELECT version, name, applied_at FROM schema_migrations ORDER BY version;'
+```
+
+If SQLite cannot open a WAL-mode database read-only because its `-shm` file is
+absent or not writable, use `gw_migrate status` (it inspects a private copy) or
+copy the database and its `-wal`/`-shm` sidecars to a scratch directory and
+inspect that copy.
+
+Do not use `sqlite3` in read-write mode to "fix" an inconsistent database.
+Adding a missing table, column, or index by hand can leave the ledger and schema
+in a state the runner cannot validate. Restore a verified backup instead.
+
+---
+
 ## Backup creation before migration
 
 Create a verified backup before any migration. The backup CLI is
@@ -429,6 +537,34 @@ sudo python3 ./scripts/gw_db_backup.py backup \
     ./data/greywatch.db \
     /var/backups/greywatch
 ```
+
+### Migration backup preflight (v0.2+)
+
+The migration runner enforces a verified backup before **any** schema migration
+— whether triggered by application startup or the manual `gw_migrate migrate`
+CLI. This is the production-safe default: the database is never modified unless
+a valid backup exists.
+
+**Policy variables (read from environment):**
+
+| Variable | Production default | Behavior |
+|----------|-------------------|----------|
+| `GREYWATCH_REQUIRE_BACKUP` | **unset (required)** | Unset = require a verified backup. Explicit `0/false/no/off` = development opt-out. Any other value = configuration error. |
+| `GREYWATCH_BACKUP_DIR` | `/var/backups/greywatch` | Directory containing `greywatch.db.*` backups. Required when backup is required. |
+| `GREYWATCH_MAX_BACKUP_AGE_HOURS` | `24` | Newest backup must be this fresh or newer. Positive integer only. |
+
+**Preflight steps (run before any write):**
+1. Resolve policy from environment.
+2. If development opt-out (`GREYWATCH_REQUIRE_BACKUP=0`), skip preflight.
+3. Validate `GREYWATCH_BACKUP_DIR` exists and is a directory.
+4. Select the newest `greywatch.db.*` backup by mtime.
+5. Reject if that backup is the live database (same file, hardlink, or symlink).
+6. Reject if backup age exceeds `GREYWATCH_MAX_BACKUP_AGE_HOURS`.
+7. Verify backup with `PRAGMA integrity_check` + `foreign_key_check`.
+8. On any failure: abort before opening a write connection; database is untouched.
+
+The operator-facing wrapper `scripts/gw_db_backup.sh` reads these same
+environment variables and is the recommended way to create backups in production.
 
 The CLI synopsis is:
 
@@ -618,9 +754,10 @@ Error messages are written to stderr:
 ```text
 ERROR: cannot access database: ...
 ERROR: database is not a Greywatch database
-ERROR: database in incompatible state: inconsistent
+ERROR: database in incompatible state: inconsistent: <missing/incompatible objects>
 ERROR: ledger validation failed: ...
-ERROR: schema incomplete after migration
+ERROR: schema incomplete after migration vN: <missing/incompatible objects>
+ERROR: schema verification failed before ledger stamp: <missing/incompatible objects>
 ```
 
 Exit codes:
@@ -646,6 +783,55 @@ backup instead.
 If a migration fails or the result is not acceptable, restore the backup taken
 before the migration. Restore requires downtime because it replaces the
 database file and its sidecars:
+
+**⚠️ STOP WRITERS BEFORE MIGRATION OR RESTORE**
+
+The Greywatch API service (`greywatch-api`) and any collector processes
+(`greywatch-collector`, `suricata`, etc.) **must be stopped** before running a
+migration or a restore. Writers that are running concurrently can:
+- Extend the `-wal` file during backup, making the backup larger than necessary
+- Cause the backup to capture a mid-transaction state (though the online backup
+  API ensures consistency, the age policy applies to the backup's mtime)
+- Corrupt the database if they write during a restore's atomic replacement
+- Race with the migration runner's write lock, causing spurious lock timeouts
+
+Always stop the service and collectors before any maintenance window:
+
+```bash
+sudo systemctl stop greywatch-api
+# If running collectors, stop them too:
+# sudo systemctl stop greywatch-collector
+# sudo systemctl stop suricata
+```
+
+Then create and verify the backup:
+
+```bash
+# Create backup
+sudo -u greywatch GREYWATCH_DB=/var/lib/greywatch/greywatch.db \
+  GREYWATCH_BACKUP_DIR=/var/backups/greywatch \
+  /opt/greywatch/scripts/gw_db_backup.sh backup
+
+# Verify the backup before using it.
+sudo python3 ./scripts/gw_db_backup.py verify \
+    /var/backups/greywatch/greywatch.db.<timestamp>
+```
+
+**⚠️ NEVER RUN PRE-v4 BINARIES AGAINST A v4 DATABASE**
+
+A database that has been migrated to v4 (`audit_chain_order` ledger stamp) has
+an audit chain rebuilt in canonical insertion order (`id ASC`). Any binary
+older than v0.2 (which expects timestamp-order verification) will report the
+chain as **invalid** and may refuse to start or operate incorrectly.
+
+If you must roll back the application version:
+1. Stop the service.
+2. Restore a pre-v4 backup (one taken before the v4 migration ran).
+3. Verify the restored database with `gw_migrate verify`.
+4. Start the older binary.
+
+Do **not** run a pre-v4 binary against a v4 database expecting it to work — the
+audit chain order changed and cannot be reconciled without a restore.
 
 ```bash
 sudo systemctl stop greywatch-api
@@ -684,7 +870,23 @@ sudo systemctl start greywatch-api
 A restored backup may predate the migration and therefore report `fresh`,
 `ledger_only`, or `pending` rather than `current`. That is expected if the
 backup was taken before the migration ran; do not treat it as a restore
-failure.
+failure. Verification of the restored file uses the schema required by *its own*
+ledger version — a valid v2 backup is checked against the v2 schema, not against
+v4 — so an older backup is not misreported as inconsistent simply for lacking
+later objects. Starting the service will then migrate it forward through the
+remaining versions.
+
+If the restored backup reports `inconsistent`, the backup itself is incomplete
+or was taken from an already-damaged database. Do not try to repair it. Choose an
+earlier backup, verify it, and restore again:
+
+```bash
+sudo python3 ./scripts/gw_db_backup.py verify \
+    /var/backups/greywatch/greywatch.db.<earlier-timestamp>
+sudo python3 ./scripts/gw_db_backup.py restore \
+    /var/backups/greywatch/greywatch.db.<earlier-timestamp> \
+    ./data/greywatch.db --yes
+```
 
 If restore itself fails, the original database should still be in place. Look
 for `greywatch.db.pre-restore.<timestamp>` in the database directory, verify
