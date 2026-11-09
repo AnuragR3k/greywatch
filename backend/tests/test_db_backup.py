@@ -249,6 +249,97 @@ def test_restore_preserves_backup_data(tmp_path):
     assert _sidecars(src) == []
 
 
+def test_pre_restore_copy_is_0600_at_creation(tmp_path, monkeypatch):
+    """BAK-003: the pre-restore copy is private from the moment it exists.
+
+    The destination must be created by mkstemp (0600) rather than by
+    sqlite3.connect() under the process umask, which would leave a readable
+    window before chmod. The spy below stats the destination *before* the
+    copy runs, so the old implementation fails with FileNotFoundError.
+    """
+    src = tmp_path / "live.db"
+    backup_dir = tmp_path / "backups"
+    _make_db(src, value="current")
+    backup = gw.backup_database(str(src), str(backup_dir))
+
+    observed: list[tuple[str, str, int]] = []
+    real_online_copy = gw._online_copy
+
+    def spying_online_copy(src_path: str, dst_path: str) -> None:
+        observed.append((src_path, dst_path, os.stat(dst_path).st_mode & 0o777))
+        real_online_copy(src_path, dst_path)
+
+    monkeypatch.setattr(gw, "_online_copy", spying_online_copy)
+
+    summary = gw.restore_database(backup, str(src), confirm=True)
+
+    # The first _online_copy call is the pre-restore copy of the live DB.
+    pre_copy_calls = [
+        entry
+        for entry in observed
+        if os.path.realpath(entry[0]) == os.path.realpath(str(src))
+    ]
+    assert len(pre_copy_calls) == 1, observed
+    _, dst, mode = pre_copy_calls[0]
+    assert mode == 0o600, f"pre-copy {dst} was mode {mode:04o} when created"
+
+    # The published copy also keeps the private mode.
+    published = Path(summary["pre_restore_copy"])
+    assert published.is_file()
+    assert published.stat().st_mode & 0o777 == 0o600
+
+
+def test_restore_rollback_guard_prevents_unverified_pre_copy_overwrite(
+    tmp_path, monkeypatch
+):
+    """BAK-004: rollback must not overwrite live DB with unverified pre-copy.
+
+    The pre_copy_verified guard ensures that if pre-copy verification fails,
+    the exception handler does not restore the live DB from the unverified
+    pre-copy. Instead it cleans up the unverified pre-copy and leaves the
+    original live DB untouched.
+    """
+    import hashlib
+
+    src = tmp_path / "live.db"
+    backup_dir = tmp_path / "backups"
+    _make_db(src, value="original")
+    backup = gw.backup_database(str(src), str(backup_dir))
+
+    # Capture the live DB's SHA-256 before restore
+    before_hash = hashlib.sha256(src.read_bytes()).hexdigest()
+
+    # Monkeypatch verify_database to fail ONLY for the pre-restore copy
+    real_verify = gw.verify_database
+
+    def failing_verify(path, *, what="database"):
+        if what == "pre-restore copy":
+            raise gw.BackupError("injected pre-copy verification failure")
+        return real_verify(path, what=what)
+
+    monkeypatch.setattr(gw, "verify_database", failing_verify)
+
+    # Restore should raise and leave live DB unchanged
+    with pytest.raises(gw.BackupError, match="injected pre-copy verification failure"):
+        gw.restore_database(backup, str(src), confirm=True)
+
+    # (a) Live DB is byte-identical to before
+    after_hash = hashlib.sha256(src.read_bytes()).hexdigest()
+    assert after_hash == before_hash, "live DB was modified by failed restore"
+
+    # (b) Live DB still opens and passes verify_database
+    gw.verify_database(str(src), what="live")
+
+    # (c) No leftover *.pre-restore.* file (unverified pre-copy cleaned up)
+    pre_restore_files = list(src.parent.glob(f".{src.name}.pre-restore.*"))
+    assert len(pre_restore_files) == 0, f"leftover pre-copy files: {pre_restore_files}"
+
+    # (d) Backup and destination unchanged
+    assert _read_value(src) == "original"
+    assert Path(backup).is_file()
+    gw.verify_database(str(backup), what="backup")
+
+
 def test_restore_rejects_corrupt_backup_and_preserves_destination(tmp_path):
     src = tmp_path / "live.db"
     _make_db(src, value="keep me")

@@ -339,9 +339,9 @@ class TestBackupOrdering:
             assert resp.json()["schema_ready"] is True
             assert resp.json()["migration_applied"] == 0
 
-    def test_migratable_db_requires_backup(self, fresh_db, tmp_path, monkeypatch):
-        """FRESH database requires backup when GREYWATCH_REQUIRE_BACKUP=1."""
-        monkeypatch.setenv("GREYWATCH_DB", str(fresh_db))
+    def test_migratable_db_requires_backup(self, legacy_ready_db, tmp_path, monkeypatch):
+        """LEGACY_READY database requires backup when GREYWATCH_REQUIRE_BACKUP=1."""
+        monkeypatch.setenv("GREYWATCH_DB", str(legacy_ready_db))
         monkeypatch.setenv("GREYWATCH_REQUIRE_BACKUP", "1")
         # Create the backup directory but leave it empty (no backup files)
         backup_dir = tmp_path / "backups"
@@ -353,16 +353,28 @@ class TestBackupOrdering:
             with TestClient(app):
                 pass
 
-    def test_backup_verified_before_migration(self, fresh_db, tmp_path, monkeypatch):
+    def test_fresh_db_exempt_from_backup_check(self, fresh_db, tmp_path, monkeypatch):
+        """FRESH database is exempt from backup requirement (bootstrap scenario)."""
+        monkeypatch.setenv("GREYWATCH_DB", str(fresh_db))
+        monkeypatch.setenv("GREYWATCH_REQUIRE_BACKUP", "1")
+        monkeypatch.delenv("GREYWATCH_BACKUP_DIR", raising=False)
+
+        from backend.app.main import app
+        with TestClient(app) as client:
+            resp = client.get("/health")
+            assert resp.json()["schema_ready"] is True
+            assert resp.json()["migration_applied"] == 1
+
+    def test_backup_verified_before_migration(self, legacy_ready_db, tmp_path, monkeypatch):
         """Backup is verified before migration runs."""
         from scripts.gw_db_backup import backup_database
 
         backup_dir = tmp_path / "backups"
         backup_dir.mkdir()
 
-        backup_path = backup_database(str(fresh_db), str(backup_dir))
+        backup_path = backup_database(str(legacy_ready_db), str(backup_dir))
 
-        monkeypatch.setenv("GREYWATCH_DB", str(fresh_db))
+        monkeypatch.setenv("GREYWATCH_DB", str(legacy_ready_db))
         monkeypatch.setenv("GREYWATCH_REQUIRE_BACKUP", "1")
         monkeypatch.setenv("GREYWATCH_BACKUP_DIR", str(backup_dir))
 
@@ -492,59 +504,60 @@ class TestMigrationFailurePreventsStartup:
             os.chmod(db_path, 0o644)
 
     def test_migration_failure_rolls_back_transaction(self, tmp_path, monkeypatch):
-        """Migration failure after BEGIN IMMEDIATE rolls back; DB state is consistent.
+        """A failure inside a migration up() rolls back all partial writes.
 
-        This test simulates a migration that starts a transaction, makes some
-        changes, then fails before commit. The database must remain in a
-        consistent state (no partial migration applied).
+        Injects a failure into migration v3 after it has written a probe
+        table, then asserts the database is left exactly pre-migration:
+        LEGACY_READY, no ledger, and none of v1/v2's schema changes. Once
+        the fault is removed, the same database migrates cleanly.
         """
-        from backend.app.migrations.runner import migrate, MigrationError
-        from backend.app.migration_state import inspect_path, DatabaseState
-        from unittest import mock
+        from backend.app.migrations import runner
+        from backend.app.migration_state import DatabaseState, inspect_path
 
-        # Create a FRESH database
-        db_path = tmp_path / "migration_rollback.db"
-        conn = sqlite3.connect(str(db_path))
-        conn.execute("PRAGMA user_version=0")
-        conn.commit()
-        conn.close()
-
-        # Verify initial state is FRESH
-        report = inspect_path(db_path)
-        assert report.state == DatabaseState.FRESH
-        assert "events" not in report.tables
-
-        # Mock the migration's up_migration to fail after making changes
-        # We'll use a real migration but patch it to fail at a specific point
-        original_up = migrate
-
-        def failing_migrate(db_path, *, dry_run=False):
-            # First, run the normal migration to set up tables
-            result = original_up(db_path, dry_run=dry_run)
-            # Now simulate a failure during a subsequent migration step
-            # by directly corrupting the database state
-            if not dry_run:
-                conn = sqlite3.connect(db_path)
-                # Simulate a failed migration that partially applied
-                conn.execute("CREATE TABLE IF NOT EXISTS migration_test_fail (id INTEGER)")
-                conn.commit()
-                conn.close()
-                # Now raise an error to simulate failure
-                raise MigrationError("Simulated migration failure after partial changes")
-            return result
-
-        # Test that the failure is properly handled
+        db_path = _create_legacy_ready_db(tmp_path / "rollback.db")
         monkeypatch.setenv("GREYWATCH_DB", str(db_path))
+        monkeypatch.setenv("GREYWATCH_REQUIRE_BACKUP", "0")
 
-        # The migration should fail
-        with pytest.raises(MigrationError, match="Simulated migration failure"):
-            failing_migrate(str(db_path), dry_run=False)
+        original_up_v3 = runner.MIGRATION_UPS[3]
 
-        # Verify database state is consistent - it should still be migratable
-        # (the transaction should have rolled back)
+        def failing_up_v3(conn):
+            conn.execute("CREATE TABLE partial_rollback_probe (id INTEGER)")
+            conn.execute("INSERT INTO partial_rollback_probe (id) VALUES (1)")
+            raise sqlite3.OperationalError("injected migration failure")
+
+        monkeypatch.setitem(runner.MIGRATION_UPS, 3, failing_up_v3)
+
+        with pytest.raises(runner.MigrationError, match="injected migration failure"):
+            runner.migrate(str(db_path), dry_run=False)
+
+        # The whole transaction rolled back, including v1 and v2.
         report = inspect_path(db_path)
-        # The database should not be left in an inconsistent state
-        # Note: This test verifies the migration runner's transaction handling
+        assert report.state == DatabaseState.LEGACY_READY
+        assert report.applied_version == 0
+        assert report.ledger_present is False
+        assert "agents" not in report.tables
+        assert "audit_log" not in report.tables
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                )
+            }
+            assert "partial_rollback_probe" not in tables
+            assert "schema_migrations" not in tables
+            assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+        finally:
+            conn.close()
+
+        # Removing the fault leaves the database fully migratable.
+        monkeypatch.setitem(runner.MIGRATION_UPS, 3, original_up_v3)
+        result = runner.migrate(str(db_path), dry_run=False)
+        assert result["applied"] == 4
+        assert inspect_path(db_path).state == DatabaseState.CURRENT
 
     def test_migration_failure_during_startup_fails_closed(self, tmp_path, monkeypatch):
         """Startup fails closed when migration fails, database remains consistent.
@@ -625,10 +638,14 @@ def pending_db(current_db):
     return current_db
 
 
-@pytest.fixture
-def legacy_ready_db(tmp_path):
-    """All core tables + indexes present, only addable columns missing (LEGACY_READY)."""
-    db_path = tmp_path / "legacy_ready.db"
+def _create_legacy_ready_db(db_path: Path) -> Path:
+    """Create a database in LEGACY_READY state and return its path.
+
+    All core tables and indexes are present; only migration-addable columns
+    are missing, so the migration runner can add them.
+    """
+    from backend.app.migration_state import DatabaseState, inspect_path
+
     conn = sqlite3.connect(str(db_path))
     conn.executescript("""
         CREATE TABLE events (
@@ -690,7 +707,15 @@ def legacy_ready_db(tmp_path):
     """)
     conn.commit()
     conn.close()
+
+    assert inspect_path(db_path).state == DatabaseState.LEGACY_READY
     return db_path
+
+
+@pytest.fixture
+def legacy_ready_db(tmp_path):
+    """All core tables + indexes present, only addable columns missing (LEGACY_READY)."""
+    return _create_legacy_ready_db(tmp_path / "legacy_ready.db")
 
 
 class TestForeignKeyEnforcement:
@@ -791,22 +816,17 @@ class TestBackupAgeValidation:
         """Startup fails when latest backup exceeds GREYWATCH_MAX_BACKUP_AGE_HOURS."""
         import time
         import os
-        from backend.app.migration_state import inspect_path, DatabaseState
-        from scripts.gw_db_backup import verify_database
+        import shutil
 
-        # Create a database in FRESH state
+        # Create a database in LEGACY_READY state (not FRESH, so backup is required)
         db_path = tmp_path / "backup_age.db"
-        conn = sqlite3.connect(str(db_path))
-        conn.execute("PRAGMA user_version=0")
-        conn.commit()
-        conn.close()
+        _create_legacy_ready_db(db_path)
 
         # Create a backup directory
         backup_dir = tmp_path / "backups"
         backup_dir.mkdir()
 
         # Create a backup file (copy the DB)
-        import shutil
         backup_path = backup_dir / "greywatch.db.backup"
         shutil.copy2(db_path, backup_path)
 
@@ -833,12 +853,9 @@ class TestBackupAgeValidation:
         import os
         import shutil
 
-        # Create a database in FRESH state
+        # Create a database in LEGACY_READY state (not FRESH, so backup is required)
         db_path = tmp_path / "backup_age_ok.db"
-        conn = sqlite3.connect(str(db_path))
-        conn.execute("PRAGMA user_version=0")
-        conn.commit()
-        conn.close()
+        _create_legacy_ready_db(db_path)
 
         # Create a backup directory
         backup_dir = tmp_path / "backups_ok"
@@ -871,12 +888,9 @@ class TestBackupAgeValidation:
         import os
         import shutil
 
-        # Create a database in FRESH state
+        # Create a database in LEGACY_READY state (not FRESH, so backup is required)
         db_path = tmp_path / "backup_custom_age.db"
-        conn = sqlite3.connect(str(db_path))
-        conn.execute("PRAGMA user_version=0")
-        conn.commit()
-        conn.close()
+        _create_legacy_ready_db(db_path)
 
         # Create a backup directory
         backup_dir = tmp_path / "backups_custom"
@@ -915,10 +929,7 @@ class TestBackupDirValidation:
     def test_require_backup_without_backup_dir_fails(self, tmp_path, monkeypatch):
         """Startup fails when GREYWATCH_REQUIRE_BACKUP=1 but GREYWATCH_BACKUP_DIR is not set."""
         db_path = tmp_path / "no_backup_dir.db"
-        conn = sqlite3.connect(str(db_path))
-        conn.execute("PRAGMA user_version=0")
-        conn.commit()
-        conn.close()
+        _create_legacy_ready_db(db_path)
 
         monkeypatch.setenv("GREYWATCH_DB", str(db_path))
         monkeypatch.setenv("GREYWATCH_REQUIRE_BACKUP", "1")
@@ -932,10 +943,7 @@ class TestBackupDirValidation:
     def test_require_backup_with_empty_backup_dir_fails(self, tmp_path, monkeypatch):
         """Startup fails when GREYWATCH_BACKUP_DIR is set to empty string."""
         db_path = tmp_path / "empty_backup_dir.db"
-        conn = sqlite3.connect(str(db_path))
-        conn.execute("PRAGMA user_version=0")
-        conn.commit()
-        conn.close()
+        _create_legacy_ready_db(db_path)
 
         monkeypatch.setenv("GREYWATCH_DB", str(db_path))
         monkeypatch.setenv("GREYWATCH_REQUIRE_BACKUP", "1")
@@ -949,10 +957,7 @@ class TestBackupDirValidation:
     def test_require_backup_with_nonexistent_dir_fails(self, tmp_path, monkeypatch):
         """Startup fails when GREYWATCH_BACKUP_DIR points to a nonexistent directory."""
         db_path = tmp_path / "nonexistent_backup_dir.db"
-        conn = sqlite3.connect(str(db_path))
-        conn.execute("PRAGMA user_version=0")
-        conn.commit()
-        conn.close()
+        _create_legacy_ready_db(db_path)
 
         nonexistent_dir = tmp_path / "does_not_exist"
         # Don't create it
@@ -969,10 +974,7 @@ class TestBackupDirValidation:
     def test_require_backup_with_file_not_dir_fails(self, tmp_path, monkeypatch):
         """Startup fails when GREYWATCH_BACKUP_DIR points to a file instead of directory."""
         db_path = tmp_path / "file_backup_dir.db"
-        conn = sqlite3.connect(str(db_path))
-        conn.execute("PRAGMA user_version=0")
-        conn.commit()
-        conn.close()
+        _create_legacy_ready_db(db_path)
 
         # Create a file at the backup dir path
         backup_file = tmp_path / "not_a_dir"
@@ -994,10 +996,7 @@ class TestBackupDirValidation:
         import shutil
 
         db_path = tmp_path / "valid_backup_dir.db"
-        conn = sqlite3.connect(str(db_path))
-        conn.execute("PRAGMA user_version=0")
-        conn.commit()
-        conn.close()
+        _create_legacy_ready_db(db_path)
 
         backup_dir = tmp_path / "valid_backups"
         backup_dir.mkdir()
@@ -1031,10 +1030,7 @@ class TestBackupVerificationExceptions:
         import shutil
 
         db_path = tmp_path / "corrupt_backup.db"
-        conn = sqlite3.connect(str(db_path))
-        conn.execute("PRAGMA user_version=0")
-        conn.commit()
-        conn.close()
+        _create_legacy_ready_db(db_path)
 
         backup_dir = tmp_path / "corrupt_backups"
         backup_dir.mkdir()
@@ -1059,10 +1055,7 @@ class TestBackupVerificationExceptions:
         import shutil
 
         db_path = tmp_path / "inaccessible_backup.db"
-        conn = sqlite3.connect(str(db_path))
-        conn.execute("PRAGMA user_version=0")
-        conn.commit()
-        conn.close()
+        _create_legacy_ready_db(db_path)
 
         backup_dir = tmp_path / "inaccessible_backups"
         backup_dir.mkdir()
@@ -1098,10 +1091,7 @@ class TestBackupVerificationExceptions:
         from unittest import mock
 
         db_path = tmp_path / "unexpected_exc.db"
-        conn = sqlite3.connect(str(db_path))
-        conn.execute("PRAGMA user_version=0")
-        conn.commit()
-        conn.close()
+        _create_legacy_ready_db(db_path)
 
         backup_dir = tmp_path / "unexpected_backups"
         backup_dir.mkdir()
