@@ -864,3 +864,77 @@ def test_all_missing_versions_listed_in_gap_error():
         validate_registry(_registry(1, 5))
     message = str(excinfo.value)
     assert "missing version(s): 2, 3, 4" in message
+
+
+def test_ledger_null_name_rejected(tmp_path):
+    """MIG-001: A ledger row with explicit NULL name must be rejected as mismatch.
+
+    If the ledger has a name column but it's NULL (e.g., schema corrupted or
+    constraint bypassed), this indicates a tampered ledger entry. The validation
+    must fail rather than silently skipping the name check.
+
+    This test simulates a corrupted ledger by constructing rows with None name
+    directly, since the DB schema normally prevents NULL names.
+    """
+    from collections.abc import Mapping
+    from backend.app.migration_registry import (
+        validate_applied_versions,
+        MigrationNameMismatchError,
+    )
+
+    def _registry(*versions: int):
+        from backend.app.migration_registry import Migration
+        return tuple(Migration(version, f"migration_{version}") for version in versions)
+
+    # Simulate a sqlite3.Row with version=1 and name=None
+    # We use a dict (Mapping) to simulate a row that has a "name" key with None value
+    class MockRow(dict, Mapping):
+        def __getitem__(self, key):
+            if key == "version":
+                return 1
+            if key == "name":
+                return None
+            raise KeyError(key)
+        def keys(self):
+            return ["version", "name"]
+        def __contains__(self, key):
+            return key in ("version", "name")
+
+    rows = [MockRow()]
+    with pytest.raises(MigrationNameMismatchError) as excinfo:
+        validate_applied_versions(rows, _registry(1, 2))
+
+    assert "None" in str(excinfo.value)
+    assert "migration_1" in str(excinfo.value)
+
+
+def test_ledger_null_name_rejected_via_tuple():
+    """MIG-001: Tuple rows with None as second element also rejected."""
+    from backend.app.migration_registry import (
+        validate_applied_versions,
+        MigrationNameMismatchError,
+    )
+
+    def _registry(*versions: int):
+        from backend.app.migration_registry import Migration
+        return tuple(Migration(version, f"migration_{version}") for version in versions)
+
+    # Tuple row with explicit None name: (version, name)
+    rows = [(1, None)]
+    with pytest.raises(MigrationNameMismatchError) as excinfo:
+        validate_applied_versions(rows, _registry(1, 2))
+
+    assert "None" in str(excinfo.value)
+    assert "migration_1" in str(excinfo.value)
+
+
+def test_bare_integer_no_name_validation():
+    """Bare integer applied versions don't validate names (backward compat)."""
+    from backend.app.migration_registry import validate_applied_versions
+
+    def _registry(*versions: int):
+        from backend.app.migration_registry import Migration
+        return tuple(Migration(version, f"migration_{version}") for version in versions)
+
+    # Bare integer 1 - no name field, so no name validation
+    assert validate_applied_versions((1,), _registry(1, 2)) == 1

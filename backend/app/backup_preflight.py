@@ -254,6 +254,67 @@ def _newest_backup(backup_dir: Path) -> Path:
     return candidates[0][2]
 
 
+def _check_backup_provenance(live_db: Path, candidate: Path) -> None:
+    """Verify the backup database is related to the live database.
+
+    Checks that the backup contains the expected Greywatch tables (schema
+    provenance). This prevents accepting an unrelated SQLite database that
+    happens to pass integrity_check and foreign_key_check.
+
+    Skips the check for fresh/empty live databases (no tables yet).
+
+    Raises BackupPreflightError if the backup schema does not match.
+    """
+    # Expected core tables for a valid Greywatch database (both v1 and migrated)
+    expected_tables = {
+        "events",
+        "alerts",
+        "incidents",
+        "incident_events",
+        "collector_state",
+        # Post-migration tables
+        "agents",
+        "api_keys",
+        "audit_log",
+        "schema_migrations",
+    }
+
+    def get_tables(path: Path) -> set[str]:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+            return {row[0] for row in rows}
+        finally:
+            conn.close()
+
+    live_tables = get_tables(live_db)
+    backup_tables = get_tables(candidate)
+
+    # If live database has no tables (fresh/empty), skip provenance check.
+    # A fresh database has no backup to verify against.
+    if not live_tables:
+        return
+
+    # Must have all expected tables that the live DB has
+    missing = (expected_tables & live_tables) - backup_tables
+    if missing:
+        raise _invalid_backup(
+            f"Backup '{candidate}' is missing required tables: {sorted(missing)}. "
+            "This does not appear to be a valid Greywatch database backup."
+        )
+
+    # Must not have unexpected extra tables (could indicate wrong database)
+    # Allow sqlite_sequence and tables that exist in live DB
+    unexpected = backup_tables - live_tables - {"sqlite_sequence"}
+    if unexpected:
+        raise _invalid_backup(
+            f"Backup '{candidate}' contains unexpected tables: {sorted(unexpected)}. "
+            "This does not appear to be a valid Greywatch database backup."
+        )
+
+
 def run_backup_preflight(
     db_path: str | os.PathLike[str],
     *,
@@ -308,5 +369,8 @@ def run_backup_preflight(
         raise _invalid_backup(
             f"Cannot verify backup '{candidate}': {exc}."
         ) from exc
+
+    # Provenance check: verify backup schema matches live database
+    _check_backup_provenance(live_db, candidate)
 
     return candidate

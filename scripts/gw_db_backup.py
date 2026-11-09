@@ -366,6 +366,15 @@ def restore_database(
     if backup_real == dest_real:
         raise BackupError("backup and destination are the same file")
 
+    # Refuse if backup is a hardlink or symlink to the live database.
+    # os.path.samefile detects inode identity (catches hardlinks).
+    try:
+        if os.path.samefile(backup_real, dest_real):
+            raise BackupError("backup and destination are the same file (hardlink)")
+    except OSError:
+        # If either file doesn't exist or other error, fall through to other checks
+        pass
+
     dest_dir = os.path.dirname(dest_real) or "."
     if not os.path.isdir(dest_dir):
         raise BackupError(f"destination directory does not exist: {dest_dir}")
@@ -383,23 +392,39 @@ def restore_database(
 
     try:
         # 1. Recoverable online copy of the current database (handles WAL).
+        pre_copy_verified = False
         if dest_existed:
-            pre_copy = _unique_path(dest_dir, f"{basename}.pre-restore.")
+            # Create the pre-copy destination with mkstemp so it is mode 0600
+            # from the instant it exists. Using _unique_path + _online_copy
+            # would let sqlite3.connect() create the file under the process
+            # umask, exposing a readable window before chmod.
+            fd, pre_copy_tmp = tempfile.mkstemp(
+                dir=dest_dir,
+                prefix=f".{basename}.pre-restore.",
+                suffix=".tmp",
+            )
+            os.close(fd)
+            pre_copy = pre_copy_tmp
             _online_copy(dest_real, pre_copy)
+            # Publish the completed copy under its stable, non-hidden name.
+            # Same-directory rename is atomic and keeps the 0600 mode.
+            final_pre_copy = _unique_path(dest_dir, f"{basename}.pre-restore.")
+            os.replace(pre_copy, final_pre_copy)
+            pre_copy = final_pre_copy
             os.chmod(pre_copy, BACKUP_FILE_MODE)
             verify_database(pre_copy, what="pre-restore copy")
+            pre_copy_verified = True
 
         # 2. Stage the replacement next to the destination, then verify it.
+        # Use _online_copy for WAL-safe restore (copies WAL frames into main file).
         fd, stage = tempfile.mkstemp(
             dir=dest_dir,
             prefix=f".{basename}.restore.",
             suffix=".tmp",
         )
         os.close(fd)
-        shutil.copyfile(backup_real, stage)
+        _online_copy(backup_real, stage)
         os.chmod(stage, BACKUP_FILE_MODE)
-        with open(stage, "rb") as fh:
-            os.fsync(fh.fileno())
         verify_database(stage, what="staged database")
 
         # 3. Move stale WAL/SHM sidecars aside (recoverable, not deleted).
@@ -426,12 +451,15 @@ def restore_database(
                 os.replace(saved, sidecar)
             except OSError:
                 pass
-        if pre_copy and dest_existed and os.path.exists(pre_copy):
+        if pre_copy_verified and dest_existed and os.path.exists(pre_copy):
             try:
                 os.replace(pre_copy, dest_real)
                 _apply_ownership(dest_real, None, prev_stat)
             except OSError:
                 pass
+        elif pre_copy and os.path.exists(pre_copy):
+            # Pre-copy was created but verification failed; clean it up.
+            _unlink_quietly(pre_copy)
         _unlink_quietly(stage)
         raise
 
