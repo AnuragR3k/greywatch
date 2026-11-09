@@ -470,7 +470,8 @@ class TestRunnerPreflight:
     def test_failed_preflight_leaves_database_bytes_unchanged(
         self, tmp_path, monkeypatch
     ):
-        db = _fresh_db(tmp_path / "db.sqlite")
+        # Use LEGACY_READY to test backup requirement (FRESH is exempt)
+        db = _legacy_ready_db(tmp_path / "legacy.sqlite")
         backup_dir = tmp_path / "backups"
         backup_dir.mkdir()
         before = _sha256(db)
@@ -482,7 +483,19 @@ class TestRunnerPreflight:
 
         assert _sha256(db) == before
         assert _ledger_versions(db) == []
-        assert inspect_path(db).state == DatabaseState.FRESH
+        assert inspect_path(db).state == DatabaseState.LEGACY_READY
+
+    def test_fresh_database_migrates_without_backup(self, tmp_path, monkeypatch):
+        """FRESH databases are exempt from backup preflight (bootstrap scenario)."""
+        db = _fresh_db(tmp_path / "db.sqlite")
+        monkeypatch.setenv("GREYWATCH_REQUIRE_BACKUP", "1")
+        monkeypatch.delenv("GREYWATCH_BACKUP_DIR", raising=False)
+
+        result = migrate(str(db), dry_run=False)
+
+        assert result["applied"] == 4
+        assert inspect_path(db).state == DatabaseState.CURRENT
+        assert _ledger_versions(db) == [1, 2, 3, 4]
 
     def test_valid_backup_allows_migration(self, tmp_path, monkeypatch):
         db = _fresh_db(tmp_path / "db.sqlite")
@@ -564,7 +577,8 @@ class TestStartupPreflight:
     def test_startup_fails_without_backup(self, tmp_path, monkeypatch):
         from starlette.testclient import TestClient
 
-        db = _fresh_db(tmp_path / "db.sqlite")
+        # Use LEGACY_READY to test backup requirement (FRESH is exempt)
+        db = _legacy_ready_db(tmp_path / "legacy.sqlite")
         backup_dir = tmp_path / "backups"
         backup_dir.mkdir()
         monkeypatch.setenv("GREYWATCH_DB", str(db))
@@ -579,7 +593,24 @@ class TestStartupPreflight:
             with TestClient(app):
                 pass
         assert _ledger_versions(db) == []
-        assert inspect_path(db).state == DatabaseState.FRESH
+        assert inspect_path(db).state == DatabaseState.LEGACY_READY
+
+    def test_startup_fresh_succeeds_without_backup(self, tmp_path, monkeypatch):
+        """FRESH database can start without backup (bootstrap scenario)."""
+        from starlette.testclient import TestClient
+
+        db = _fresh_db(tmp_path / "db.sqlite")
+        monkeypatch.setenv("GREYWATCH_DB", str(db))
+        monkeypatch.setenv("GREYWATCH_REQUIRE_BACKUP", "1")
+        monkeypatch.delenv("GREYWATCH_BACKUP_DIR", raising=False)
+
+        from backend.app.main import app
+
+        with TestClient(app) as client:
+            body = client.get("/health").json()
+        assert body["schema_ready"] is True
+        assert body["migration_applied"] >= 1
+        assert inspect_path(db).state == DatabaseState.CURRENT
 
     def test_startup_succeeds_with_valid_backup(self, tmp_path, monkeypatch):
         from starlette.testclient import TestClient
@@ -602,7 +633,8 @@ class TestStartupPreflight:
     def test_startup_default_requires_backup(self, tmp_path, monkeypatch):
         from starlette.testclient import TestClient
 
-        db = _fresh_db(tmp_path / "db.sqlite")
+        # Use LEGACY_READY to test default backup requirement (FRESH is exempt)
+        db = _legacy_ready_db(tmp_path / "legacy.sqlite")
         monkeypatch.setenv("GREYWATCH_DB", str(db))
         monkeypatch.delenv("GREYWATCH_REQUIRE_BACKUP", raising=False)
         monkeypatch.delenv("GREYWATCH_BACKUP_DIR", raising=False)
@@ -613,6 +645,7 @@ class TestStartupPreflight:
             with TestClient(app):
                 pass
         assert _ledger_versions(db) == []
+        assert inspect_path(db).state == DatabaseState.LEGACY_READY
 
 
 # --------------------------------------------------------------------------- #
@@ -622,7 +655,8 @@ class TestStartupPreflight:
 
 class TestManualCliPreflight:
     def test_cli_fails_without_backup_and_leaves_db_unchanged(self, tmp_path):
-        db = _fresh_db(tmp_path / "db.sqlite")
+        # Use LEGACY_READY to test backup requirement (FRESH is exempt)
+        db = _legacy_ready_db(tmp_path / "legacy.sqlite")
         backup_dir = tmp_path / "backups"
         backup_dir.mkdir()
         before = _sha256(db)
@@ -638,7 +672,7 @@ class TestManualCliPreflight:
         assert _ledger_versions(db) == []
 
     def test_cli_succeeds_with_valid_backup(self, tmp_path):
-        db = _fresh_db(tmp_path / "db.sqlite")
+        db = _legacy_ready_db(tmp_path / "legacy.sqlite")
         backup_dir = tmp_path / "backups"
         _backup(db, backup_dir)
 
@@ -652,7 +686,8 @@ class TestManualCliPreflight:
         assert inspect_path(db).state == DatabaseState.CURRENT
 
     def test_cli_default_fails_closed_when_backup_unset(self, tmp_path):
-        db = _fresh_db(tmp_path / "db.sqlite")
+        # Use LEGACY_READY to test default backup requirement (FRESH is exempt)
+        db = _legacy_ready_db(tmp_path / "legacy.sqlite")
 
         result = _run_cli(
             ["migrate", str(db), "--yes"],
@@ -662,9 +697,11 @@ class TestManualCliPreflight:
         assert result.returncode == 1
         assert "defaults to required" in result.stderr
         assert _ledger_versions(db) == []
+        assert inspect_path(db).state == DatabaseState.LEGACY_READY
 
     def test_cli_stale_backup_fails_and_leaves_db_unchanged(self, tmp_path):
-        db = _fresh_db(tmp_path / "db.sqlite")
+        # Use LEGACY_READY to test stale backup rejection (FRESH is exempt)
+        db = _legacy_ready_db(tmp_path / "legacy.sqlite")
         backup_dir = tmp_path / "backups"
         backup = _backup(db, backup_dir)
         _set_backup_mtime(backup, 48)
@@ -679,6 +716,7 @@ class TestManualCliPreflight:
         assert "exceeds GREYWATCH_MAX_BACKUP_AGE_HOURS" in result.stderr
         assert _sha256(db) == before
         assert _ledger_versions(db) == []
+        assert inspect_path(db).state == DatabaseState.LEGACY_READY
 
     def test_cli_dry_run_is_exempt_from_backup(self, tmp_path):
         db = _fresh_db(tmp_path / "db.sqlite")

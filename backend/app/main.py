@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import re
+import threading
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
@@ -688,6 +689,7 @@ class PreAuthAgentRateLimitMiddleware:
         self.config = config
         self.clock = clock or time.monotonic
         self._buckets: OrderedDict[str, list[float]] = OrderedDict()
+        self._lock = threading.Lock()
 
     def _evict(self, max_entries: int) -> None:
         while len(self._buckets) > max(1, int(max_entries)):
@@ -713,48 +715,50 @@ class PreAuthAgentRateLimitMiddleware:
         refill_per_sec = limit / 60.0
         capacity = float(limit * cfg.burst_multiplier)
 
-        bucket = self._buckets.pop(identity, None)
-        if bucket is None:
-            tokens = capacity
-        else:
-            tokens = min(
-                capacity,
-                bucket[0] + max(0.0, now - bucket[1]) * refill_per_sec,
-            )
+        with self._lock:
+            bucket = self._buckets.pop(identity, None)
+            if bucket is None:
+                tokens = capacity
+            else:
+                tokens = min(
+                    capacity,
+                    bucket[0] + max(0.0, now - bucket[1]) * refill_per_sec,
+                )
 
-        if tokens < 1.0:
-            retry_after = max(1, math.ceil((1.0 - tokens) / refill_per_sec))
-            _log_denied_request(
-                reason="agent_auth_rate_limit_exceeded",
-                method=scope.get("method", ""),
-                path=scope.get("path", "/"),
-                status_code=429,
-                peer=_client_peer(scope),
-            )
-            # Keep the bucket (including the refill already accounted for) so
-            # repeated rejections cannot reset the window.
-            self._buckets[identity] = [tokens, now]
+            if tokens < 1.0:
+                retry_after = max(1, math.ceil((1.0 - tokens) / refill_per_sec))
+                _log_denied_request(
+                    reason="agent_auth_rate_limit_exceeded",
+                    method=scope.get("method", ""),
+                    path=scope.get("path", "/"),
+                    status_code=429,
+                    peer=_client_peer(scope),
+                )
+                # Keep the bucket (including the refill already accounted for) so
+                # repeated rejections cannot reset the window.
+                self._buckets[identity] = [tokens, now]
+                self._evict(cfg.max_entries)
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 429,
+                        "headers": [
+                            [b"content-type", b"application/json"],
+                            [b"retry-after", str(retry_after).encode("ascii")],
+                        ],
+                    }
+                )
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": b'{"detail":"Agent authentication rate limit exceeded"}',
+                    }
+                )
+                return
+
+            self._buckets[identity] = [tokens - 1.0, now]
             self._evict(cfg.max_entries)
-            await send(
-                {
-                    "type": "http.response.start",
-                    "status": 429,
-                    "headers": [
-                        [b"content-type", b"application/json"],
-                        [b"retry-after", str(retry_after).encode("ascii")],
-                    ],
-                }
-            )
-            await send(
-                {
-                    "type": "http.response.body",
-                    "body": b'{"detail":"Agent authentication rate limit exceeded"}',
-                }
-            )
-            return
 
-        self._buckets[identity] = [tokens - 1.0, now]
-        self._evict(cfg.max_entries)
         await self.app(scope, receive, send)
 
 

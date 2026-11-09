@@ -234,3 +234,82 @@ def test_default_iteration_count_is_not_weakened(monkeypatch):
     assert agents_module.DEFAULT_KEY_HASH_ITERATIONS == 600_000
     generated = agents_module._hash_key("gw_iterations")
     assert generated.split("$")[1] == "600000"
+
+
+# --------------------------------------------------------------------------- #
+# AUTH-002: PBKDF2 iteration ceiling (regression tests)
+# --------------------------------------------------------------------------- #
+
+
+def test_verify_key_rejects_excessive_iterations_before_hashing(monkeypatch):
+    """AUTH-002: ceiling check short-circuits before PBKDF2 is invoked.
+
+    A stored hash with iterations > MAX_KEY_HASH_ITERATIONS must be rejected
+    without calling hashlib.pbkdf2_hmac. This prevents a maliciously stored
+    hash from forcing unbounded CPU work.
+    """
+    import hashlib
+
+    # Build a valid-format hash with iterations above the ceiling
+    salt = "a" * 32  # 16 bytes hex
+    hash_val = "b" * 64  # 32 bytes hex
+    excessive_iterations = agents_module.MAX_KEY_HASH_ITERATIONS + 1
+    malicious_hash = f"pbkdf2_sha256${excessive_iterations}${salt}${hash_val}"
+
+    # Spy on pbkdf2_hmac to prove it's never called
+    calls: list = []
+    real_pbkdf2 = hashlib.pbkdf2_hmac
+
+    def spy_pbkdf2(*args, **kwargs):
+        calls.append(args)
+        return real_pbkdf2(*args, **kwargs)
+
+    monkeypatch.setattr(hashlib, "pbkdf2_hmac", spy_pbkdf2)
+
+    verified, iters = agents_module._verify_key("any-key", malicious_hash)
+
+    assert verified is False
+    assert iters is None
+    assert calls == [], "pbkdf2_hmac must not be called for excessive iterations"
+
+
+def test_verify_key_rejects_malformed_iteration_field(monkeypatch):
+    """AUTH-002: non-numeric iteration field fails closed without hashing."""
+    import hashlib
+
+    # Build a hash with a non-numeric iteration component
+    salt = "a" * 32
+    hash_val = "b" * 64
+    malicious_hash = f"pbkdf2_sha256$not-a-number${salt}${hash_val}"
+
+    calls: list = []
+    real_pbkdf2 = hashlib.pbkdf2_hmac
+
+    def spy_pbkdf2(*args, **kwargs):
+        calls.append(args)
+        return real_pbkdf2(*args, **kwargs)
+
+    monkeypatch.setattr(hashlib, "pbkdf2_hmac", spy_pbkdf2)
+
+    verified, iters = agents_module._verify_key("any-key", malicious_hash)
+
+    assert verified is False
+    assert iters is None
+    assert calls == [], "pbkdf2_hmac must not be called for malformed iterations"
+
+
+def test_verify_key_normal_hash_still_verifies():
+    """AUTH-002 regression: normal hashes still verify correctly."""
+    # Use the real _hash_key to create a valid hash at default iterations
+    valid_hash = agents_module._hash_key("test-key", iterations=1000)
+
+    verified, iters = agents_module._verify_key("test-key", valid_hash)
+
+    assert verified is True
+    assert iters == 1000
+
+    # Wrong key should fail
+    verified_wrong, iters_wrong = agents_module._verify_key("wrong-key", valid_hash)
+
+    assert verified_wrong is False
+    assert iters_wrong is None

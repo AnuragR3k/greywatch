@@ -84,6 +84,11 @@ KEY_PREFIX_LENGTH = 8  # "gw_" + 5 chars = 8 chars for identification
 # Configurable via GREYWATCH_KEY_HASH_ITERATIONS for operational flexibility.
 DEFAULT_KEY_HASH_ITERATIONS = 600_000
 
+# Maximum iterations accepted when verifying a stored hash.
+# Prevents a malicious or corrupted hash from forcing unbounded CPU.
+# CVE-2026-xxxx mitigation: stored iteration counts above this are rejected.
+MAX_KEY_HASH_ITERATIONS = 10_000_000
+
 # Rate limit categories for agents
 AGENT_RATE_LIMIT_CATEGORIES = ("ingestion", "reads", "collector", "alert_close")
 
@@ -142,14 +147,43 @@ class RateLimitConfig:
     enabled: bool = True
 
 
+def _env_positive_int(name: str, default: int) -> int:
+    """Parse a positive integer from environment, failing closed on garbage."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip()
+    if not value.isdigit():
+        raise ValueError(f"Invalid {name}={raw!r}: must be a positive integer")
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError(f"Invalid {name}={raw!r}: must be a positive integer")
+    return parsed
+
+
+def _env_positive_float(name: str, default: float) -> float:
+    """Parse a positive float from environment, failing closed on garbage."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip()
+    try:
+        parsed = float(value)
+    except ValueError:
+        raise ValueError(f"Invalid {name}={raw!r}: must be a positive number")
+    if parsed <= 0:
+        raise ValueError(f"Invalid {name}={raw!r}: must be a positive number")
+    return parsed
+
+
 def get_agent_rate_limit_config() -> RateLimitConfig:
     """Get per-agent rate limit configuration from environment."""
     return RateLimitConfig(
-        ingestion=int(os.environ.get("GREYWATCH_AGENT_RATE_INGESTION", "60")),
-        reads=int(os.environ.get("GREYWATCH_AGENT_RATE_READS", "120")),
-        collector=int(os.environ.get("GREYWATCH_AGENT_RATE_COLLECTOR", "10")),
-        alert_close=int(os.environ.get("GREYWATCH_AGENT_RATE_ALERT_CLOSE", "30")),
-        burst_multiplier=float(os.environ.get("GREYWATCH_AGENT_RATE_BURST", "1.5")),
+        ingestion=_env_positive_int("GREYWATCH_AGENT_RATE_INGESTION", 60),
+        reads=_env_positive_int("GREYWATCH_AGENT_RATE_READS", 120),
+        collector=_env_positive_int("GREYWATCH_AGENT_RATE_COLLECTOR", 10),
+        alert_close=_env_positive_int("GREYWATCH_AGENT_RATE_ALERT_CLOSE", 30),
+        burst_multiplier=_env_positive_float("GREYWATCH_AGENT_RATE_BURST", 1.5),
         enabled=os.environ.get("GREYWATCH_AGENT_RATE_LIMIT_ENABLED", "1").lower() in ("1", "true", "yes", "on"),
     )
 
@@ -224,6 +258,11 @@ def _verify_key(plaintext_key: str, stored_hash: str) -> tuple[bool, Optional[in
         Tuple of (verified: bool, iterations: Optional[int]).
         Iterations is returned to enable rehash-on-auth when the stored hash
         uses fewer iterations than the current default.
+
+    Security:
+        Rejects iteration counts above MAX_KEY_HASH_ITERATIONS to prevent
+        resource exhaustion via a maliciously stored hash. Catches OverflowError
+        from excessively large iteration counts.
     """
     try:
         parts = stored_hash.split("$")
@@ -231,12 +270,23 @@ def _verify_key(plaintext_key: str, stored_hash: str) -> tuple[bool, Optional[in
             return False, None
 
         iterations = int(parts[1])
+        if iterations > MAX_KEY_HASH_ITERATIONS:
+            # Stored hash requests an unsafe iteration count; reject it.
+            # This prevents a corrupted/malicious hash from forcing unbounded CPU.
+            return False, None
         salt = bytes.fromhex(parts[2])
         expected_hash = bytes.fromhex(parts[3])
 
-        computed_hash = hashlib.pbkdf2_hmac(
-            "sha256", plaintext_key.encode("utf-8"), salt, iterations
-        )
+        try:
+            computed_hash = hashlib.pbkdf2_hmac(
+                "sha256", plaintext_key.encode("utf-8"), salt, iterations
+            )
+        except OverflowError:
+            # Iteration count too large for the platform's PBKDF2 implementation.
+            # Treat as verification failure (log and return False).
+            logger.error("PBKDF2 OverflowError during verification (iterations=%d)", iterations)
+            return False, None
+
         verified = hmac.compare_digest(computed_hash, expected_hash)
         return verified, iterations if verified else None
     except (ValueError, IndexError):

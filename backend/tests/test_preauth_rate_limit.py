@@ -638,3 +638,99 @@ def test_response_body_is_documented_shape(isolated_db):
     assert response.json() == {
         "detail": "Agent authentication rate limit exceeded"
     }
+
+
+def test_preauth_limiter_thread_safety():
+    """Concurrent requests from multiple threads must not corrupt the bucket store.
+
+    This is a regression test for AUTH-001: the pre-auth limiter's
+    ``_buckets`` OrderedDict was accessed without a lock in a context that
+    could be executed concurrently (e.g. via threadpool or multiple workers).
+    """
+    import threading
+
+    from backend.app.main import (
+        PreAuthAgentRateLimitMiddleware,
+        PreAuthRateLimitConfig,
+    )
+
+    clock = FrozenClock()
+    config = PreAuthRateLimitConfig(
+        enabled=True, limit=100, burst_multiplier=1, max_entries=1000
+    )
+
+    # Test the middleware directly without the trust boundary
+    # (which requires a database). Use the unit-test helper pattern.
+    class _OkApp:
+        def __init__(self):
+            self.calls = 0
+
+        async def __call__(self, scope, receive, send):
+            self.calls += 1
+            await send(
+                {"type": "http.response.start", "status": 200, "headers": []}
+            )
+            await send({"type": "http.response.body", "body": b"ok"})
+
+    middleware = PreAuthAgentRateLimitMiddleware(
+        _OkApp(),
+        config=config,
+        clock=clock,
+    )
+
+    results = {"success": 0, "rate_limited": 0, "errors": 0, "details": []}
+    results_lock = threading.Lock()
+
+    def make_request():
+        try:
+            scope = {
+                "type": "http",
+                "method": "POST",
+                "path": INGEST_PATH,
+                "query_string": b"",
+                "headers": [(b"authorization", f"Bearer {INVALID_KEY}".encode("latin-1"))],
+                "client": ("198.51.100.1", 50000),
+            }
+
+            async def receive():
+                return {"type": "http.request", "body": b"", "more_body": False}
+
+            sent = []
+
+            async def send(message):
+                sent.append(message)
+
+            import anyio
+            anyio.run(middleware, scope, receive, send)
+
+            status = next(m["status"] for m in sent if m["type"] == "http.response.start")
+            with results_lock:
+                if status == 200:
+                    results["success"] += 1
+                elif status == 429:
+                    results["rate_limited"] += 1
+                else:
+                    results["errors"] += 1
+                    results["details"].append(f"status={status}")
+        except Exception as e:
+            with results_lock:
+                results["errors"] += 1
+                results["details"].append(f"exception={e}")
+
+    # Fire 50 concurrent requests from 5 threads (10 each)
+    threads = []
+    for _ in range(5):
+        t = threading.Thread(target=lambda: [make_request() for _ in range(10)])
+        threads.append(t)
+        t.start()
+
+    for t in threads:
+        t.join()
+
+    # Debug output
+    print(f"Results: {results}")
+
+    # All 50 requests should be allowed (limit=100)
+    assert results["success"] == 50
+    assert results["rate_limited"] == 0
+    assert results["errors"] == 0

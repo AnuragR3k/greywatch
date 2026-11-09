@@ -332,8 +332,15 @@ def migrate(path: str | os.PathLike[str], *, dry_run: bool = False) -> dict[str,
 
     # Phase 2.5: Backup preflight.  Runs for both startup and the manual CLI
     # before any write connection is opened, so a failed preflight leaves the
-    # database untouched.  CURRENT/no-op states returned above and are exempt.
-    run_backup_preflight(resolved)
+    # database untouched.
+    #
+    # Exempt FRESH databases: a brand-new empty database has no backup to
+    # verify, and requiring one would break first-run bootstrap.  The FRESH
+    # state is explicitly classified as migratable (see _classify_result).
+    # Other states (LEDGER_ONLY, PENDING, LEGACY_READY) still require a backup
+    # because they have existing data that would be lost on migration failure.
+    if report.state != DatabaseState.FRESH:
+        run_backup_preflight(resolved)
 
     # Phase 3: Open write connection and acquire lock
     conn = None

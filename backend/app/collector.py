@@ -442,6 +442,17 @@ def _state_key_last_error_at() -> str:
     return "journal_last_error_at"
 
 
+def _state_key_last_valid_cursor_end_ts() -> str:
+    """Timestamp of the last event that was successfully checkpointed.
+
+    Used to bound the fallback window: on cursor invalidation, we must not
+    re-read further back than the last successfully checkpointed event,
+    otherwise a crash mid-fallback can permanently lose events between the
+    invalid cursor and the fallback window.
+    """
+    return "journal_last_valid_cursor_end_ts"
+
+
 def _get_cursor() -> str | None:
     return siem.get_collector_setting(_state_key_last_cursor())
 
@@ -506,6 +517,10 @@ def _get_last_error_at() -> str | None:
     return siem.get_collector_setting(_state_key_last_error_at())
 
 
+def _get_last_valid_cursor_end_ts() -> str | None:
+    return siem.get_collector_setting(_state_key_last_valid_cursor_end_ts())
+
+
 def _count_journal_events(connection: sqlite3.Connection) -> int:
     """Count stored journal-sourced events on an existing connection.
 
@@ -523,6 +538,7 @@ def _set_state(connection: sqlite3.Connection, **values: str | None) -> None:
     mapping = {
         _state_key_last_cursor(): values.get("cursor"),
         _state_key_last_event_ts(): values.get("event_ts"),
+        _state_key_last_valid_cursor_end_ts(): values.get("last_valid_cursor_end_ts"),
         _state_key_events_ingested(): values.get("events_ingested"),
         _state_key_last_run_at(): values.get("run_at"),
         _state_key_attempts(): values.get("attempts"),
@@ -699,7 +715,23 @@ def collect_once(config: CollectorConfig | None = None) -> CollectResult:
         # lookback window anchored on the last ingested event time.
         if cursor and "Failed to seek" in str(exc):
             result.fallback_used = True
+            # CHK-002 fix: bound the fallback window by the last successfully
+            # checkpointed event timestamp, not just the last_event_ts. This
+            # prevents data loss if a crash occurs mid-fallback.
+            last_valid_ts = _get_last_valid_cursor_end_ts()
             clock_base = last_event_ts or _now_iso()
+            if last_valid_ts:
+                # Use the earlier of the two timestamps to ensure we don't
+                # miss events between the invalid cursor and the fallback window.
+                from datetime import datetime, timezone, timedelta
+                try:
+                    valid_dt = datetime.fromisoformat(last_valid_ts)
+                    fallback_dt = datetime.fromisoformat(clock_base) - timedelta(seconds=FALLBACK_REWIND_SECONDS)
+                    if valid_dt < fallback_dt:
+                        clock_base = last_valid_ts
+                except (TypeError, ValueError):
+                    # If parsing fails, fall back to the original clock_base
+                    pass
             try:
                 records = run_journalctl(
                     _build_fallback_args(config, clock_base), command=config.command
@@ -836,6 +868,9 @@ def collect_once(config: CollectorConfig | None = None) -> CollectResult:
             connection,
             cursor=advanced_cursor or cursor,
             event_ts=advanced_ts or last_event_ts,
+            # Track the timestamp of the last successfully checkpointed event
+            # to bound the fallback window on cursor invalidation (CHK-002).
+            last_valid_cursor_end_ts=advanced_ts or last_event_ts,
             events_ingested=str(_count_journal_events(connection)),
             run_at=_now_iso(),
             attempts=str(attempts),

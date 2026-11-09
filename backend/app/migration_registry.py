@@ -619,12 +619,27 @@ def validate_applied_versions(
     applied_rows = list(iterator)
 
     applied: list[int] = []
-    applied_names: dict[int, str] = {}
+    applied_names: dict[int, str | None] = {}
+    # Track versions that had a name field (to distinguish bare integers from
+    # rows with explicit NULL names for MIG-001). A row "has a name field" if
+    # it's a sqlite3.Row with "name" in keys, a Mapping with "name" key, or
+    # a tuple/list with len >= 2.
+    versions_with_name_field: set[int] = set()
     for index, row in enumerate(applied_rows):
         version = _extract_applied_version(row, index)
         applied.append(version)
         name = _extract_applied_name(row, index)
-        if name is not None:
+        # Check if the row type carries name information (not a bare integer).
+        has_name_field = False
+        if isinstance(row, sqlite3.Row):
+            has_name_field = "name" in row.keys()
+        elif isinstance(row, Mapping):
+            has_name_field = "name" in row
+        elif isinstance(row, (tuple, list)):
+            has_name_field = len(row) >= 2
+        if has_name_field:
+            versions_with_name_field.add(version)
+            # Include NULL names to detect mismatches (MIG-001).
             applied_names[version] = name
 
     if not applied:
@@ -657,10 +672,13 @@ def validate_applied_versions(
         )
 
     # M3: a version's recorded name must match its registered name.
+    # Treat NULL (None) applied_name as mismatch when registered name exists,
+    # but only for rows that actually had a name field (not bare integers).
     mismatches = sorted(
         version for version, applied_name in applied_names.items()
         if version in registered_names
-        and applied_name != registered_names[version]
+        and version in versions_with_name_field
+        and (applied_name is None or applied_name != registered_names[version])
     )
     if mismatches:
         first = mismatches[0]
